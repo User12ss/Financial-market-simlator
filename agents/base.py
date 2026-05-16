@@ -45,6 +45,48 @@ ANALYSIS_TOOL: dict = {
     },
 }
 
+DELIBERATION_TOOL: dict = {
+    "name": "submit_revised_analysis",
+    "description": "Submit your revised analysis after reviewing other agents' positions.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agreements": {
+                "type": "string",
+                "description": "Which other agents' conclusions align with yours and reinforce your analysis (1-2 sentences)",
+            },
+            "disagreements": {
+                "type": "string",
+                "description": "Where you disagree with other agents and why your domain expertise leads to a different conclusion (1-2 sentences). Say 'None' if no disagreements.",
+            },
+            "revised_immediate_impact": {
+                "type": "string",
+                "description": "Your updated 0-1 week analysis incorporating other agents' signals (2-4 sentences)",
+            },
+            "revised_medium_term_impact": {
+                "type": "string",
+                "description": "Your updated 3-12 month analysis incorporating other agents' signals (2-4 sentences)",
+            },
+            "revised_cross_domain_effects": {
+                "type": "string",
+                "description": "Updated spillover effects now that you see the full picture (2-4 sentences)",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["low", "moderate", "high"],
+            },
+        },
+        "required": [
+            "agreements",
+            "disagreements",
+            "revised_immediate_impact",
+            "revised_medium_term_impact",
+            "revised_cross_domain_effects",
+            "confidence",
+        ],
+    },
+}
+
 
 class BaseAgent(ABC):
     """Abstract base for all financial market simulation agents."""
@@ -119,4 +161,62 @@ MAGNITUDE: {scenario.magnitude}
             medium_term_impact=data.get("medium_term_impact", ""),
             cross_domain_effects=data.get("cross_domain_effects", ""),
             confidence=data.get("confidence", "moderate"),
+        )
+
+    def deliberate(
+        self,
+        scenario: Scenario,
+        own_analysis: AgentAnalysis,
+        all_analyses_context: str,
+    ) -> AgentAnalysis:
+        """Review other agents' analyses and revise own position where warranted."""
+        system = f"""You are the {self.name}. You already submitted your initial analysis for a policy scenario. Now you can see what ALL other agents concluded.
+
+YOUR DOMAIN: {self.domain}
+
+Your task:
+1. Read every other agent's analysis carefully.
+2. Identify where their conclusions REINFORCE yours (agreement strengthens confidence).
+3. Identify where their conclusions CONTRADICT yours — and decide whether to revise.
+   - If another agent's domain expertise reveals something you missed, UPDATE your analysis.
+   - If you have strong domain-specific reasons to hold your position, KEEP it and explain why.
+4. Look for EMERGENT effects: causal chains that only become visible when you see the full picture
+   (e.g., central bank tightening + fiscal expansion + commodity shock create a specific pattern
+   that no single agent would predict alone).
+
+Do NOT simply agree with everyone. Defend your domain expertise where it matters.
+Submit your revised analysis using the provided tool."""
+
+        user_msg = f"""SCENARIO: {scenario.description or scenario.raw_input}
+ECONOMY: {scenario.base_economy}
+MAGNITUDE: {scenario.magnitude}
+
+YOUR INITIAL ANALYSIS:
+- Immediate: {own_analysis.immediate_impact}
+- Short-term: {own_analysis.short_term_impact}
+- Medium-term: {own_analysis.medium_term_impact}
+- Cross-domain: {own_analysis.cross_domain_effects}
+- Confidence: {own_analysis.confidence}
+
+ALL OTHER AGENTS' ANALYSES:
+{all_analyses_context}"""
+
+        data = self.llm.complete_tool(
+            system_prompt=system,
+            user_message=user_msg,
+            tool_schema=DELIBERATION_TOOL,
+            max_tokens=TOKEN_BUDGET.get("deliberation", 1536),
+            temperature=0.3,
+            cache=True,
+        )
+
+        return AgentAnalysis(
+            agent_id=self.id,
+            agent_name=self.name,
+            domain=self.domain,
+            immediate_impact=data.get("revised_immediate_impact", own_analysis.immediate_impact),
+            short_term_impact=own_analysis.short_term_impact,
+            medium_term_impact=data.get("revised_medium_term_impact", own_analysis.medium_term_impact),
+            cross_domain_effects=data.get("revised_cross_domain_effects", own_analysis.cross_domain_effects),
+            confidence=data.get("confidence", own_analysis.confidence),
         )

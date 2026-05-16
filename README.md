@@ -4,67 +4,88 @@ An AI-powered multi-agent system that simulates how financial markets react to m
 
 ## Architecture
 
-The orchestrator is a **LangGraph `StateGraph`** with 9 nodes and 3 conditional decision points. Each node does one job, reads from shared state, and returns a partial update.
+The orchestrator is a **LangGraph `StateGraph`** with 11 nodes and 4 conditional decision points. Each node does one job, reads from shared state, and returns a partial update.
 
 ```mermaid
 graph TD
     START((START)) --> parse_scenario
 
-    parse_scenario["parse_scenario<br/><i>Haiku · 1,024 tokens</i>"]
+    parse_scenario["parse_scenario<br/><i>Haiku · 1,024t</i>"]
     parse_scenario --> route_agents
 
-    route_agents["route_agents<br/><i>Classify policy type, assign tiers</i>"]
+    route_agents["route_agents<br/><i>Assign tiers, mark skips</i>"]
     route_agents -->|has tier1| run_tier1
     route_agents -->|no tier1| run_tier2
-    route_agents -->|no agents| draft_synthesis
+    route_agents -->|no agents| check_disagreements
 
-    run_tier1["run_tier1<br/><i>Sonnet · 2,048 tokens</i><br/>Upstream agents in parallel"]
+    run_tier1["run_tier1<br/><i>Sonnet · 2,048t · parallel</i>"]
     run_tier1 --> build_context
 
     build_context["build_context<br/><i>Compress tier1 outputs</i>"]
     build_context -->|has tier2| run_tier2
-    build_context -->|no tier2| draft_synthesis
+    build_context -->|no tier2| check_disagreements
 
-    run_tier2["run_tier2<br/><i>Sonnet · 1,536 tokens</i><br/>Downstream agents + context"]
-    run_tier2 --> draft_synthesis
+    run_tier2["run_tier2<br/><i>Sonnet · 1,536t · parallel</i><br/>Receives tier1 context"]
+    run_tier2 --> check_disagreements
 
-    draft_synthesis["draft_synthesis<br/><i>Sonnet · 4,096 tokens</i><br/>Merge all agent outputs"]
+    check_disagreements["check_disagreements<br/><i>Haiku · scan for conflicts</i>"]
+    check_disagreements -->|"agents agree"| draft_synthesis
+    check_disagreements -->|"agents conflict"| deliberate
+
+    deliberate["deliberate<br/><i>Sonnet · 1,536t · parallel</i><br/>Each agent sees all others,<br/>revises or defends position"]
+    deliberate --> draft_synthesis
+
+    draft_synthesis["draft_synthesis<br/><i>Sonnet · 4,096t</i>"]
     draft_synthesis --> critic_review
 
-    critic_review["critic_review<br/><i>Haiku · 2,048 tokens</i><br/>Check contradictions & gaps"]
+    critic_review["critic_review<br/><i>Haiku · 2,048t</i>"]
     critic_review -->|accept| build_report
     critic_review -->|issues found| revise_synthesis
 
-    revise_synthesis["revise_synthesis<br/><i>Sonnet · 4,096 tokens</i><br/>Fix contradictions & gaps"]
+    revise_synthesis["revise_synthesis<br/><i>Sonnet · 4,096t</i>"]
     revise_synthesis --> build_report
 
-    build_report["build_report<br/><i>Merge draft + critique</i>"]
+    build_report["build_report"]
     build_report --> END((END))
 
     style START fill:#2d9,stroke:#333,color:#fff
     style END fill:#2d9,stroke:#333,color:#fff
     style route_agents fill:#f90,stroke:#333,color:#fff
     style build_context fill:#f90,stroke:#333,color:#fff
+    style check_disagreements fill:#f90,stroke:#333,color:#fff
     style critic_review fill:#f90,stroke:#333,color:#fff
+    style deliberate fill:#48f,stroke:#333,color:#fff
     style revise_synthesis fill:#e55,stroke:#333,color:#fff
 ```
 
-### 3 Decision Points
+### 4 Decision Points
 
-| Node | Question | Paths |
-|------|----------|-------|
-| **route_agents** | Are there tier1 upstream agents for this policy type? | `run_tier1` / `run_tier2` / `draft_synthesis` |
-| **build_context** | Are there tier2 downstream agents to run? | `run_tier2` / `draft_synthesis` |
-| **critic_review** | Did the critic find contradictions + missing links, or lower confidence? | `revise_synthesis` / `build_report` |
+| Decision Node | Question | Paths |
+|--------------|----------|-------|
+| **route_agents** | Are there tier1 agents for this policy type? | `run_tier1` / `run_tier2` / `check_disagreements` |
+| **build_context** | Are there tier2 agents to run? | `run_tier2` / `check_disagreements` |
+| **check_disagreements** | Do agents contradict each other on direction? | `deliberate` / `draft_synthesis` |
+| **critic_review** | Did the critic find contradictions + gaps, or lower confidence? | `revise_synthesis` / `build_report` |
 
-Revision triggers when the critic both finds contradictions AND identifies missing causal links, or when it lowers confidence. Minor issues are appended as notes without re-synthesis.
+### Agent Interaction Model
+
+The system has **three levels** of inter-agent communication:
+
+1. **Tier1 → Tier2 context passing**: Upstream agents (central bank, fiscal) produce signals that downstream agents (equities, forex) receive as input. The fixed income agent *knows* the central bank's rate path conclusion instead of guessing independently.
+
+2. **Deliberation round** (conditional): After all agents run, Haiku scans for material directional conflicts (e.g., one agent says "risk-on" while another says "risk-off"). If conflicts exist, every agent sees every other agent's full analysis and can revise its position or defend it with domain-specific reasoning. This runs in parallel.
+
+3. **Synthesis + critic**: The synthesis merges all (potentially revised) analyses. The critic catches anything the agents themselves didn't resolve.
+
+The deliberation round only fires when agents actually disagree — if everyone is aligned, the graph skips it and saves the API calls.
 
 ### Why LangGraph?
 
-- **Decision logic is in the graph**, not hidden inside functions. You can see the branching at the architecture level.
-- **Self-correcting**: The critic → revise conditional loop catches errors that a single-pass synthesis misses.
-- **Skip paths save tokens**: A regulatory scenario skips tier1 entirely — the graph routes around it.
-- **Extensible**: Adding a node (e.g., fact-checking) means one `add_node` + one `add_edge`.
+- **Decision logic is in the graph**, not hidden inside functions. You see all 4 branch points at the architecture level.
+- **Agent interaction is a graph node**, not a side effect. Deliberation is an explicit step that can be traced and debugged.
+- **Self-correcting**: Two feedback mechanisms — agent deliberation (before synthesis) and critic revision (after synthesis).
+- **Skip paths save tokens**: Aligned agents skip deliberation. Regulatory scenarios skip tier1. Clean drafts skip revision.
+- **Extensible**: Adding a node means one `add_node` + one `add_edge`.
 
 ## Optimizations
 
@@ -86,16 +107,22 @@ After parsing the scenario, the orchestrator classifies it by policy type and ac
 ### 3. Model Tiering
 Scenario parsing and the critic pass use Haiku (fast, cheap). Agent analysis and draft synthesis use Sonnet (full reasoning). Token budgets are right-sized per call type.
 
-| Call Type       | Model  | Max Tokens |
-|----------------|--------|------------|
-| Scenario parse | Haiku  | 1,024      |
-| Tier 1 agents  | Sonnet | 2,048      |
-| Tier 2 agents  | Sonnet | 1,536      |
-| Draft synthesis| Sonnet | 4,096      |
-| Critic pass    | Haiku  | 2,048      |
+| Call Type           | Model  | Max Tokens | When it runs |
+|--------------------|--------|------------|--------------|
+| Scenario parse     | Haiku  | 1,024      | Always       |
+| Disagreement check | Haiku  | 8          | Always (yes/no response) |
+| Tier 1 agents      | Sonnet | 2,048      | If tier1 agents assigned |
+| Tier 2 agents      | Sonnet | 1,536      | If tier2 agents assigned |
+| Deliberation round | Sonnet | 1,536      | Only if agents conflict |
+| Draft synthesis    | Sonnet | 4,096      | Always       |
+| Critic pass        | Haiku  | 2,048      | Always       |
+| Revision pass      | Sonnet | 4,096      | Only if critic finds issues |
 
-### 4. Two-Pass Synthesis with Critic
-Instead of one overloaded synthesis call, the system runs a draft pass (merge analyses, build scenario matrix) followed by a critic pass (check for contradictions, missing causal links, unsupported claims). The critic's revisions are merged into the final report.
+### 4. Agent Deliberation (conditional)
+After all agents run independently, Haiku scans for material directional conflicts. If agents contradict each other (e.g., risk-on vs risk-off), each agent enters a deliberation round where it sees all other agents' full analyses and can revise its position or defend it. This runs in parallel and only fires when needed.
+
+### 5. Two-Pass Synthesis with Critic
+The draft synthesis merges all analyses into a unified report. The critic pass checks for contradictions, missing causal links, and unsupported claims. If the critic finds serious issues, the graph routes through a revision pass before building the final report.
 
 ### Additional: Structured Output via Tool Use
 All LLM calls that expect JSON use Anthropic's `tool_use` feature instead of prompt-based JSON generation. This guarantees valid structured output and eliminates parse failures. System prompts are cached via `cache_control` for 90% savings on repeated calls.

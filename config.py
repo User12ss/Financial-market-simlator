@@ -20,6 +20,7 @@ TIME_HORIZONS: list[str] = ["immediate (0-1 week)", "short-term (1-3 months)", "
 TOKEN_BUDGET: dict[str, int] = {
     "tier1": 2048,
     "tier2": 1536,
+    "deliberation": 1536,
     "synthesis_draft": 4096,
     "synthesis_critic": 2048,
     "scenario_parse": 1024,

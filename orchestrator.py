@@ -39,6 +39,9 @@ class SimulationState(TypedDict, total=False):
     tier1_results: list        # list[AgentAnalysis]
     tier2_results: list        # list[AgentAnalysis]
     tier1_context: str
+    all_initial_analyses: list # list[AgentAnalysis] — pre-deliberation
+    deliberated_analyses: list # list[AgentAnalysis] — post-deliberation
+    has_disagreements: bool
     draft: dict
     critique: dict
     was_revised: bool
@@ -151,6 +154,8 @@ class Orchestrator:
         graph.add_node("run_tier1", self._node_tier1)
         graph.add_node("build_context", self._node_build_context)
         graph.add_node("run_tier2", self._node_tier2)
+        graph.add_node("check_disagreements", self._node_check_disagreements)
+        graph.add_node("deliberate", self._node_deliberate)
         graph.add_node("draft_synthesis", self._node_draft_synthesis)
         graph.add_node("critic_review", self._node_critic)
         graph.add_node("revise_synthesis", self._node_revise)
@@ -167,7 +172,7 @@ class Orchestrator:
             {
                 "run_tier1": "run_tier1",
                 "skip_to_tier2": "run_tier2",
-                "skip_all": "draft_synthesis",
+                "skip_all": "check_disagreements",
             },
         )
 
@@ -179,14 +184,26 @@ class Orchestrator:
             self._should_run_tier2,
             {
                 "run_tier2": "run_tier2",
+                "skip_to_check": "check_disagreements",
+            },
+        )
+
+        graph.add_edge("run_tier2", "check_disagreements")
+
+        # Decision 3: After all agents run, check if deliberation is needed
+        graph.add_conditional_edges(
+            "check_disagreements",
+            self._should_deliberate,
+            {
+                "deliberate": "deliberate",
                 "skip_to_synthesis": "draft_synthesis",
             },
         )
 
-        graph.add_edge("run_tier2", "draft_synthesis")
+        graph.add_edge("deliberate", "draft_synthesis")
         graph.add_edge("draft_synthesis", "critic_review")
 
-        # Decision 3: After critic, accept or revise
+        # Decision 4: After critic, accept or revise
         graph.add_conditional_edges(
             "critic_review",
             self._should_revise,
@@ -219,7 +236,13 @@ class Orchestrator:
         """After tier 1 completes, decide whether tier 2 is needed."""
         if len(state.get("tier2_agent_ids", [])) > 0:
             return "run_tier2"
-        return "skip_to_synthesis"
+        return "skip_to_check"
+
+    def _should_deliberate(self, state: SimulationState) -> str:
+        """After all agents run, check if their analyses conflict enough to warrant deliberation."""
+        if not state.get("has_disagreements", False):
+            return "skip_to_synthesis"
+        return "deliberate"
 
     def _should_revise(self, state: SimulationState) -> str:
         """After critic review, decide whether the draft needs revision."""
@@ -337,9 +360,108 @@ class Orchestrator:
         )
         return {"tier2_results": results}
 
+    def _node_check_disagreements(self, state: SimulationState) -> dict:
+        """Check if agents produced conflicting signals that warrant a deliberation round.
+
+        Uses Haiku to quickly scan for contradictions across all agent outputs.
+        If agents disagree on direction (e.g., one says risk-on, another says risk-off),
+        the graph routes through deliberation so agents can revise.
+        """
+        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+
+        if len(all_analyses) < 2:
+            return {"all_initial_analyses": all_analyses, "has_disagreements": False}
+
+        summaries = self._compress_for_synthesis(all_analyses)
+
+        system = """You are a conflict detector for a multi-agent financial simulation. Scan the agent analyses and determine if there are MATERIAL disagreements — cases where agents contradict each other on the DIRECTION of impact (not just magnitude).
+
+Examples of material disagreements:
+- One agent says "risk-on" while another says "risk-off"
+- One agent says "currency strengthens" while another says "capital outflows" (which weakens currency)
+- One agent says "yields rise" while another's logic implies they should fall
+
+Minor differences in magnitude or confidence are NOT disagreements.
+
+Respond with ONLY "yes" or "no" — nothing else."""
+
+        response = self.llm.complete(
+            system_prompt=system,
+            user_message=f"AGENT ANALYSES:\n{summaries}",
+            max_tokens=8,
+            temperature=0.0,
+            cache=True,
+            use_fast_model=True,
+        )
+
+        has_disagreements = response.strip().lower().startswith("yes")
+        return {"all_initial_analyses": all_analyses, "has_disagreements": has_disagreements}
+
+    def _node_deliberate(self, state: SimulationState) -> dict:
+        """Deliberation round: each agent sees all others' analyses and can revise.
+
+        This is where real inter-agent interaction happens. Each agent:
+        1. Reads every other agent's conclusions
+        2. Identifies agreements and disagreements
+        3. Revises its own analysis where warranted
+        4. Defends its position where its domain expertise justifies it
+
+        Runs in parallel — each agent deliberates independently but simultaneously.
+        """
+        all_analyses = state["all_initial_analyses"]
+        scenario: Scenario = state["scenario"]
+
+        analyses_by_id = {a.agent_id: a for a in all_analyses}
+        all_agent_ids = list(analyses_by_id.keys())
+
+        def _deliberate_one(agent_id: str) -> AgentAnalysis:
+            agent = self.agents[agent_id]
+            own = analyses_by_id[agent_id]
+
+            others = [a for a in all_analyses if a.agent_id != agent_id]
+            other_lines = []
+            for o in others:
+                other_lines.append(f"[{o.agent_name} | Confidence: {o.confidence}]")
+                other_lines.append(f"  Immediate: {o.immediate_impact}")
+                other_lines.append(f"  Medium-term: {o.medium_term_impact}")
+                other_lines.append(f"  Cross-domain: {o.cross_domain_effects}")
+                other_lines.append("")
+            others_context = "\n".join(other_lines)
+
+            if self._on_agent_start:
+                self._on_agent_start(f"{agent.name} (deliberation)")
+            result = agent.deliberate(scenario, own, others_context)
+            if self._on_agent_done:
+                self._on_agent_done(f"{agent.name} (deliberation)")
+            return result
+
+        parallel = state.get("parallel", True)
+
+        if parallel and len(all_agent_ids) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_agent_ids)) as pool:
+                futures = {pool.submit(_deliberate_one, aid): aid for aid in all_agent_ids}
+                revised = []
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        revised.append(future.result())
+                    except Exception as e:
+                        aid = futures[future]
+                        print(f"  WARNING: {aid} deliberation failed, keeping original")
+                        revised.append(analyses_by_id[aid])
+        else:
+            revised = []
+            for aid in all_agent_ids:
+                try:
+                    revised.append(_deliberate_one(aid))
+                except Exception as e:
+                    print(f"  WARNING: {aid} deliberation failed, keeping original")
+                    revised.append(analyses_by_id[aid])
+
+        return {"deliberated_analyses": revised}
+
     def _node_draft_synthesis(self, state: SimulationState) -> dict:
         """Phase 3a: Merge all agent outputs into a draft synthesis (Sonnet)."""
-        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
         agent_summaries = self._compress_for_synthesis(all_analyses)
         scenario: Scenario = state["scenario"]
 
@@ -373,7 +495,7 @@ AGENT ANALYSES:
 
     def _node_critic(self, state: SimulationState) -> dict:
         """Phase 3b: Critic pass — catch contradictions and gaps (Haiku)."""
-        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
         agent_summaries = self._compress_for_synthesis(all_analyses)
         draft = state["draft"]
 
@@ -410,7 +532,7 @@ Synthesis: {draft.get('synthesis', '')}"""
 
     def _node_revise(self, state: SimulationState) -> dict:
         """Phase 3c: Re-synthesize incorporating critic feedback (Sonnet)."""
-        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
         agent_summaries = self._compress_for_synthesis(all_analyses)
         draft = state["draft"]
         critique = state["critique"]
@@ -457,7 +579,7 @@ AGENT ANALYSES (source of truth):
         draft = state["draft"]
         critique = state.get("critique", {})
         was_revised = state.get("was_revised", False)
-        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
 
         if was_revised:
             final_synthesis = draft.get("synthesis", "")
