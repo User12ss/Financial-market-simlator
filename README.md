@@ -1,54 +1,70 @@
 # Financial Market Simulation — Multi-Agent Framework
 
-An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API with tiered execution, selective agent activation, model tiering, and two-pass synthesis.
+An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API with a **LangGraph** state-machine pipeline, tiered execution, selective agent activation, model tiering, and two-pass synthesis.
 
 ## Architecture
 
+The orchestrator is a **LangGraph `StateGraph`** with 9 nodes and 3 conditional decision points. Each node does one job, reads from shared state, and returns a partial update.
+
+```mermaid
+graph TD
+    START((START)) --> parse_scenario
+
+    parse_scenario["parse_scenario<br/><i>Haiku · 1,024 tokens</i>"]
+    parse_scenario --> route_agents
+
+    route_agents["route_agents<br/><i>Classify policy type, assign tiers</i>"]
+    route_agents -->|has tier1| run_tier1
+    route_agents -->|no tier1| run_tier2
+    route_agents -->|no agents| draft_synthesis
+
+    run_tier1["run_tier1<br/><i>Sonnet · 2,048 tokens</i><br/>Upstream agents in parallel"]
+    run_tier1 --> build_context
+
+    build_context["build_context<br/><i>Compress tier1 outputs</i>"]
+    build_context -->|has tier2| run_tier2
+    build_context -->|no tier2| draft_synthesis
+
+    run_tier2["run_tier2<br/><i>Sonnet · 1,536 tokens</i><br/>Downstream agents + context"]
+    run_tier2 --> draft_synthesis
+
+    draft_synthesis["draft_synthesis<br/><i>Sonnet · 4,096 tokens</i><br/>Merge all agent outputs"]
+    draft_synthesis --> critic_review
+
+    critic_review["critic_review<br/><i>Haiku · 2,048 tokens</i><br/>Check contradictions & gaps"]
+    critic_review -->|accept| build_report
+    critic_review -->|issues found| revise_synthesis
+
+    revise_synthesis["revise_synthesis<br/><i>Sonnet · 4,096 tokens</i><br/>Fix contradictions & gaps"]
+    revise_synthesis --> build_report
+
+    build_report["build_report<br/><i>Merge draft + critique</i>"]
+    build_report --> END((END))
+
+    style START fill:#2d9,stroke:#333,color:#fff
+    style END fill:#2d9,stroke:#333,color:#fff
+    style route_agents fill:#f90,stroke:#333,color:#fff
+    style build_context fill:#f90,stroke:#333,color:#fff
+    style critic_review fill:#f90,stroke:#333,color:#fff
+    style revise_synthesis fill:#e55,stroke:#333,color:#fff
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Orchestrator                        │
-│  Phase 0: Parse & Route (Haiku — cheap extraction)      │
-│  Phase 1: Tier 1 upstream agents (parallel)             │
-│  Phase 2: Tier 2 downstream agents + context (parallel) │
-│  Phase 3: Draft synthesis + Critic review               │
-└──────────┬──────────────────────────────┬───────────────┘
-           │                              │
-   ┌───────▼───────────┐       ┌──────────▼──────────┐
-   │  Tier 1 (Upstream) │       │  Tier 2 (Downstream) │
-   │  Run first, no     │──────▶│  Receive Tier 1      │
-   │  context needed    │ ctx   │  signals as context   │
-   └───────┬───────────┘       └──────────┬──────────┘
-           │                              │
-  ┌────────▼──────────────────────────────▼────────┐
-  │  7 Specialized Agents (4-7 activated per run)   │
-  │                                                 │
-  │  TIER 1 — Primary signal producers:             │
-  │  ┌──────────┐ ┌──────────┐ ┌────────────────┐  │
-  │  │ Central  │ │  Fiscal  │ │ Commodities &  │  │
-  │  │  Bank    │ │  Policy  │ │   Inflation    │  │
-  │  └──────────┘ └──────────┘ └────────────────┘  │
-  │                                                 │
-  │  TIER 2 — React to upstream signals:            │
-  │  ┌──────────┐ ┌──────────┐ ┌────────┐          │
-  │  │  Fixed   │ │  Forex   │ │ Equity │          │
-  │  │  Income  │ │          │ │ Market │          │
-  │  └──────────┘ └──────────┘ └────────┘          │
-  │  ┌──────────┐                                   │
-  │  │Sentiment │                                   │
-  │  │& Behav.  │                                   │
-  │  └──────────┘                                   │
-  └─────────────────────────────────────────────────┘
-           │
-  ┌────────▼────────────────────────────────────────┐
-  │  Two-Pass Synthesis                              │
-  │  ┌──────────────┐    ┌─────────────────────┐    │
-  │  │ Draft Pass   │───▶│ Critic Pass (Haiku)  │   │
-  │  │ (Sonnet)     │    │ Catches errors,      │   │
-  │  │ Merges all   │    │ contradictions,       │   │
-  │  │ agent output │    │ missing links         │   │
-  │  └──────────────┘    └─────────────────────┘    │
-  └─────────────────────────────────────────────────┘
-```
+
+### 3 Decision Points
+
+| Node | Question | Paths |
+|------|----------|-------|
+| **route_agents** | Are there tier1 upstream agents for this policy type? | `run_tier1` / `run_tier2` / `draft_synthesis` |
+| **build_context** | Are there tier2 downstream agents to run? | `run_tier2` / `draft_synthesis` |
+| **critic_review** | Did the critic find contradictions + missing links, or lower confidence? | `revise_synthesis` / `build_report` |
+
+Revision triggers when the critic both finds contradictions AND identifies missing causal links, or when it lowers confidence. Minor issues are appended as notes without re-synthesis.
+
+### Why LangGraph?
+
+- **Decision logic is in the graph**, not hidden inside functions. You can see the branching at the architecture level.
+- **Self-correcting**: The critic → revise conditional loop catches errors that a single-pass synthesis misses.
+- **Skip paths save tokens**: A regulatory scenario skips tier1 entirely — the graph routes around it.
+- **Extensible**: Adding a node (e.g., fact-checking) means one `add_node` + one `add_edge`.
 
 ## Optimizations
 
@@ -107,7 +123,7 @@ cd financial-market-sim
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# 3. Install dependencies
+# 3. Install dependencies (includes langgraph, anthropic, streamlit, rich)
 pip install -r requirements.txt
 
 # 4. Set your API key
@@ -194,7 +210,7 @@ Edit `config.py` or set environment variables:
 ```
 financial-market-sim/
 ├── config.py              # API keys, model config, routing rules, token budgets
-├── orchestrator.py        # Tiered execution, routing, two-pass synthesis
+├── orchestrator.py        # LangGraph StateGraph pipeline (8 nodes)
 ├── main.py                # CLI entry point (Rich terminal UI)
 ├── app.py                 # Streamlit web UI
 ├── requirements.txt       # Python dependencies
