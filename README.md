@@ -1,55 +1,106 @@
 # Financial Market Simulation — Multi-Agent Framework
 
-An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API.
+An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API with tiered execution, selective agent activation, model tiering, and two-pass synthesis.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Orchestrator                    │
-│         (parses input, coordinates agents,       │
-│          merges outputs, builds report)          │
-└──────────┬──────────────────────┬───────────────┘
-           │                      │
-   ┌───────▼───────┐    ┌────────▼────────┐
-   │  Phase 1:      │    │  Phase 2:        │
-   │  Independent   │    │  Cross-Domain    │
-   │  Agent Runs    │    │  Synthesis       │
-   └───────┬───────┘    └────────┬────────┘
-           │                      │
-  ┌────────▼──────────────────────▼────────┐
-  │  7 Specialized Agents                   │
-  │  ┌──────────┐ ┌──────────┐ ┌────────┐ │
-  │  │ Central  │ │  Fiscal  │ │ Equity │ │
-  │  │  Bank    │ │  Policy  │ │ Market │ │
-  │  └──────────┘ └──────────┘ └────────┘ │
-  │  ┌──────────┐ ┌──────────┐ ┌────────┐ │
-  │  │  Fixed   │ │  Forex   │ │Commod. │ │
-  │  │  Income  │ │          │ │& Infl. │ │
-  │  └──────────┘ └──────────┘ └────────┘ │
-  │  ┌──────────┐                          │
-  │  │Sentiment │                          │
-  │  │& Behav.  │                          │
-  │  └──────────┘                          │
-  └────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                     Orchestrator                        │
+│  Phase 0: Parse & Route (Haiku — cheap extraction)      │
+│  Phase 1: Tier 1 upstream agents (parallel)             │
+│  Phase 2: Tier 2 downstream agents + context (parallel) │
+│  Phase 3: Draft synthesis + Critic review               │
+└──────────┬──────────────────────────────┬───────────────┘
+           │                              │
+   ┌───────▼───────────┐       ┌──────────▼──────────┐
+   │  Tier 1 (Upstream) │       │  Tier 2 (Downstream) │
+   │  Run first, no     │──────▶│  Receive Tier 1      │
+   │  context needed    │ ctx   │  signals as context   │
+   └───────┬───────────┘       └──────────┬──────────┘
+           │                              │
+  ┌────────▼──────────────────────────────▼────────┐
+  │  7 Specialized Agents (4-7 activated per run)   │
+  │                                                 │
+  │  TIER 1 — Primary signal producers:             │
+  │  ┌──────────┐ ┌──────────┐ ┌────────────────┐  │
+  │  │ Central  │ │  Fiscal  │ │ Commodities &  │  │
+  │  │  Bank    │ │  Policy  │ │   Inflation    │  │
+  │  └──────────┘ └──────────┘ └────────────────┘  │
+  │                                                 │
+  │  TIER 2 — React to upstream signals:            │
+  │  ┌──────────┐ ┌──────────┐ ┌────────┐          │
+  │  │  Fixed   │ │  Forex   │ │ Equity │          │
+  │  │  Income  │ │          │ │ Market │          │
+  │  └──────────┘ └──────────┘ └────────┘          │
+  │  ┌──────────┐                                   │
+  │  │Sentiment │                                   │
+  │  │& Behav.  │                                   │
+  │  └──────────┘                                   │
+  └─────────────────────────────────────────────────┘
+           │
+  ┌────────▼────────────────────────────────────────┐
+  │  Two-Pass Synthesis                              │
+  │  ┌──────────────┐    ┌─────────────────────┐    │
+  │  │ Draft Pass   │───▶│ Critic Pass (Haiku)  │   │
+  │  │ (Sonnet)     │    │ Catches errors,      │   │
+  │  │ Merges all   │    │ contradictions,       │   │
+  │  │ agent output │    │ missing links         │   │
+  │  └──────────────┘    └─────────────────────┘    │
+  └─────────────────────────────────────────────────┘
 ```
+
+## Optimizations
+
+### 1. Tiered Execution with Context Passing
+Upstream agents (central bank, fiscal policy, commodities) run first and produce primary signals. Their outputs are compressed and passed as context to downstream agents (fixed income, equities, forex, sentiment), so downstream agents build on real upstream conclusions instead of guessing independently.
+
+### 2. Selective Agent Activation
+After parsing the scenario, the orchestrator classifies it by policy type and activates only the relevant agents. A regulatory scenario runs 4 agents; a monetary scenario runs 6; a mixed scenario runs all 7. This saves 20-40% of API calls without losing quality.
+
+| Policy Type  | Agents Run | Skipped            |
+|-------------|------------|--------------------|
+| monetary    | 6          | fiscal_policy      |
+| fiscal      | 5          | forex, commodities |
+| trade       | 6          | (none)             |
+| regulatory  | 4          | central_bank, forex, commodities |
+| supply_shock| 6          | fiscal_policy      |
+| mixed       | 7          | (none)             |
+
+### 3. Model Tiering
+Scenario parsing and the critic pass use Haiku (fast, cheap). Agent analysis and draft synthesis use Sonnet (full reasoning). Token budgets are right-sized per call type.
+
+| Call Type       | Model  | Max Tokens |
+|----------------|--------|------------|
+| Scenario parse | Haiku  | 1,024      |
+| Tier 1 agents  | Sonnet | 2,048      |
+| Tier 2 agents  | Sonnet | 1,536      |
+| Draft synthesis| Sonnet | 4,096      |
+| Critic pass    | Haiku  | 2,048      |
+
+### 4. Two-Pass Synthesis with Critic
+Instead of one overloaded synthesis call, the system runs a draft pass (merge analyses, build scenario matrix) followed by a critic pass (check for contradictions, missing causal links, unsupported claims). The critic's revisions are merged into the final report.
+
+### Additional: Structured Output via Tool Use
+All LLM calls that expect JSON use Anthropic's `tool_use` feature instead of prompt-based JSON generation. This guarantees valid structured output and eliminates parse failures. System prompts are cached via `cache_control` for 90% savings on repeated calls.
 
 ## Agents
 
-| Agent | Domain | Key Outputs |
-|-------|--------|-------------|
-| Central Bank | Monetary policy, rates, QE/QT | Rate path, liquidity conditions |
-| Fiscal Policy | Gov spending, taxes, deficits | Demand impact, debt trajectory |
-| Equity Market | Stock sectors, valuations | Sector rotation, P/E shifts |
-| Fixed Income | Bonds, yield curve, spreads | Yield moves, curve shape |
-| Forex | Exchange rates, capital flows | Currency direction, carry trade |
-| Commodities & Inflation | Prices, CPI/PPI | Inflation path, commodity moves |
-| Sentiment & Behavioral | Psychology, risk appetite | Risk-on/off, positioning |
+| Agent | Tier | Domain | Key Outputs |
+|-------|------|--------|-------------|
+| Central Bank | 1 | Monetary policy, rates, QE/QT | Rate path, liquidity conditions |
+| Fiscal Policy | 1 | Gov spending, taxes, deficits | Demand impact, debt trajectory |
+| Commodities & Inflation | 1 | Prices, CPI/PPI | Inflation path, commodity moves |
+| Equity Market | 2 | Stock sectors, valuations | Sector rotation, P/E shifts |
+| Fixed Income | 2 | Bonds, yield curve, spreads | Yield moves, curve shape |
+| Forex | 2 | Exchange rates, capital flows | Currency direction, carry trade |
+| Sentiment & Behavioral | 2 | Psychology, risk appetite | Risk-on/off, positioning |
 
 ## Setup
 
 ```bash
 # 1. Clone and enter the project
+git clone <repo-url>
 cd financial-market-sim
 
 # 2. Create virtual environment
@@ -67,31 +118,55 @@ cp .env.example .env
 ## Usage
 
 ### CLI Mode
+
 ```bash
-# Interactive mode
+# Activate virtual environment
+source venv/bin/activate
+
+# Interactive mode (REPL — type scenarios, get reports)
 python main.py
 
 # Single scenario
 python main.py --scenario "The Fed cuts rates by 50bps unexpectedly"
 
-# Compare two scenarios
+# Compare two scenarios side-by-side
 python main.py --compare \
   --scenario-a "Fed raises rates 25bps" \
   --scenario-b "Fed raises rates 100bps"
+
+# Override model or economy
+python main.py --scenario "ECB begins QT" --economy EU --model claude-sonnet-4-20250514
 ```
 
 ### Web UI (Streamlit)
+
 ```bash
 streamlit run app.py
 ```
 
+Opens a browser dashboard where you can:
+- Enter scenarios and see full simulation reports
+- Compare two scenarios side-by-side
+- View individual agent analyses with confidence levels
+- Download reports as Markdown
+
 ### Python API
+
 ```python
 from orchestrator import Orchestrator
 
 orch = Orchestrator()
+
+# Single simulation
 report = orch.run("What happens if the Fed raises rates by 100bps unexpectedly?")
 print(report.to_markdown())
+
+# Compare two scenarios
+comparison = orch.compare(
+    "Fed raises rates 25bps",
+    "Fed raises rates 100bps",
+)
+print(comparison)
 ```
 
 ## Configuration
@@ -101,7 +176,8 @@ Edit `config.py` or set environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | Your Anthropic API key (required) |
-| `MODEL_NAME` | `claude-sonnet-4-20250514` | Claude model to use |
+| `MODEL_NAME` | `claude-sonnet-4-20250514` | Main model for agent analysis and synthesis |
+| `MODEL_FAST` | `claude-haiku-4-5-20251001` | Fast model for parsing and critic pass |
 | `BASE_ECONOMY` | `US` | Default economy for simulations |
 | `MAX_RETRIES` | `3` | API retry attempts |
 
@@ -112,6 +188,33 @@ Edit `config.py` or set environment variables:
 - *"China devalues the yuan by 10% in response to trade tariffs"*
 - *"The ECB begins quantitative tightening while the US cuts rates"*
 - *"Oil prices spike to $150/barrel due to Middle East supply disruption"*
+
+## Project Structure
+
+```
+financial-market-sim/
+├── config.py              # API keys, model config, routing rules, token budgets
+├── orchestrator.py        # Tiered execution, routing, two-pass synthesis
+├── main.py                # CLI entry point (Rich terminal UI)
+├── app.py                 # Streamlit web UI
+├── requirements.txt       # Python dependencies
+├── .env                   # API key (not committed)
+├── .env.example           # Template for .env
+├── agents/
+│   ├── base.py            # BaseAgent with tool_use and tier support
+│   ├── central_bank.py    # Monetary policy specialist (Tier 1)
+│   ├── fiscal_policy.py   # Government spending specialist (Tier 1)
+│   ├── commodities.py     # Commodities & inflation specialist (Tier 1)
+│   ├── equity_market.py   # Stock market specialist (Tier 2)
+│   ├── fixed_income.py    # Bond market specialist (Tier 2)
+│   ├── forex.py           # Currency specialist (Tier 2)
+│   └── sentiment.py       # Market psychology specialist (Tier 2)
+├── models/
+│   ├── scenario.py        # Pydantic model for parsed scenarios
+│   └── report.py          # Pydantic models for agent output and reports
+└── utils/
+    └── llm_client.py      # Anthropic API wrapper (caching, tool_use, model tiering)
+```
 
 ## License
 

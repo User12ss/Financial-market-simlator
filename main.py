@@ -41,12 +41,9 @@ def run_simulation(orch: Orchestrator, scenario_text: str, economy: str = "US"):
     console.print(Panel(scenario_text, title="Scenario Input", border_style="blue"))
     console.print()
 
-    # Phase 0: Parse
-    console.print("[bold yellow]Phase 0:[/bold yellow] Parsing scenario...")
-    # Phase 1: Agents
-    console.print("[bold yellow]Phase 1:[/bold yellow] Running agent analyses...")
-    # Phase 2: Synthesis
-    # (all handled inside orch.run)
+    console.print("[bold yellow]Phase 0:[/bold yellow] Parsing & routing scenario (fast model)...")
+    console.print("[bold yellow]Phase 1:[/bold yellow] Running upstream agents (tier 1)...")
+    console.print("[bold yellow]Phase 2:[/bold yellow] Running downstream agents with context (tier 2)...")
 
     report = orch.run(
         scenario_text,
@@ -57,7 +54,7 @@ def run_simulation(orch: Orchestrator, scenario_text: str, economy: str = "US"):
     )
 
     console.print()
-    console.print("[bold yellow]Phase 2:[/bold yellow] Synthesizing cross-domain report...")
+    console.print("[bold yellow]Phase 3:[/bold yellow] Two-pass synthesis (draft + critic)...")
     console.print("[green]✓ Synthesis complete[/green]")
     console.print()
 

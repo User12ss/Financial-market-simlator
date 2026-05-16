@@ -77,18 +77,19 @@ with tab_single:
                 st.error(str(e))
                 st.stop()
 
-            progress_bar = st.progress(0, text="Parsing scenario...")
+            progress_bar = st.progress(0, text="Parsing & routing scenario (fast model)...")
             status_container = st.empty()
-            agent_count = len(AGENT_ROSTER)
-            completed = {"n": 0}
+            completed = {"n": 0, "total": 0}
 
             def on_start(name):
                 status_container.info(f"🔄 Running **{name}**...")
 
             def on_done(name):
                 completed["n"] += 1
-                pct = int((completed["n"] / agent_count) * 80) + 10
-                progress_bar.progress(pct, text=f"✅ {name} complete ({completed['n']}/{agent_count})")
+                if completed["total"] == 0:
+                    completed["total"] = len(AGENT_ROSTER)
+                pct = int((completed["n"] / completed["total"]) * 75) + 10
+                progress_bar.progress(min(pct, 85), text=f"✅ {name} complete ({completed['n']} agents done)")
 
             try:
                 report = orch.run(

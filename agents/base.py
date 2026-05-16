@@ -5,6 +5,45 @@ from abc import ABC, abstractmethod
 from models.scenario import Scenario
 from models.report import AgentAnalysis
 from utils.llm_client import LLMClient
+from config import TOKEN_BUDGET
+
+ANALYSIS_TOOL: dict = {
+    "name": "submit_analysis",
+    "description": "Submit your domain analysis for this policy scenario.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "immediate_impact": {
+                "type": "string",
+                "description": "0-1 week reaction analysis (2-4 sentences)",
+            },
+            "short_term_impact": {
+                "type": "string",
+                "description": "1-3 month transmission analysis (2-4 sentences)",
+            },
+            "medium_term_impact": {
+                "type": "string",
+                "description": "3-12 month structural outlook (2-4 sentences)",
+            },
+            "cross_domain_effects": {
+                "type": "string",
+                "description": "How your domain's changes spill into other market domains (2-4 sentences)",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["low", "moderate", "high"],
+                "description": "Your confidence level in this analysis",
+            },
+        },
+        "required": [
+            "immediate_impact",
+            "short_term_impact",
+            "medium_term_impact",
+            "cross_domain_effects",
+            "confidence",
+        ],
+    },
+}
 
 
 class BaseAgent(ABC):
@@ -14,8 +53,6 @@ class BaseAgent(ABC):
     name: str = ""
     domain: str = ""
     outputs: str = ""
-
-    # Override in subclasses to inject domain-specific reasoning guidance
     domain_prompt: str = ""
 
     def __init__(self, llm: LLMClient):
@@ -33,23 +70,21 @@ YOUR EXPECTED OUTPUTS: {self.outputs}
 RULES:
 - Analyze the given policy scenario ONLY through the lens of your domain.
 - Provide directional analysis with magnitude estimates (mild/moderate/severe), NOT specific price predictions.
-- Use real economic frameworks (IS-LM, Phillips Curve, Taylor Rule, Mundell-Fleming, behavioral finance) as reasoning foundations — do NOT name-drop them as labels.
+- Use real economic frameworks as reasoning foundations — do NOT name-drop them as labels.
 - Distinguish between the announcement effect (immediate) and economic transmission (lagged).
 - Identify how your domain's changes will spill over into other agents' domains.
 - Frame all outputs as model suggestions, never as financial advice.
 - If the scenario has limited relevance to your domain, say so briefly and focus on the indirect effects.
 
-OUTPUT FORMAT — respond ONLY with valid JSON, no markdown fences, no preamble:
-{{
-    "immediate_impact": "Your 0-1 week analysis (2-4 sentences)",
-    "short_term_impact": "Your 1-3 month analysis (2-4 sentences)",
-    "medium_term_impact": "Your 3-12 month analysis (2-4 sentences)",
-    "cross_domain_effects": "How your domain's changes feed into other market domains (2-4 sentences)",
-    "confidence": "low | moderate | high"
-}}"""
+Submit your analysis using the provided tool."""
 
-    def analyze(self, scenario: Scenario, context: str = "") -> AgentAnalysis:
-        """Run this agent's analysis on a scenario."""
+    def analyze(
+        self,
+        scenario: Scenario,
+        context: str = "",
+        tier: str = "tier1",
+    ) -> AgentAnalysis:
+        """Run this agent's analysis on a scenario with tier-aware token budgeting."""
         user_msg = f"""POLICY SCENARIO:
 {scenario.description or scenario.raw_input}
 
@@ -59,12 +94,20 @@ SURPRISE FACTOR: {'Unexpected by markets' if scenario.is_surprise else 'Largely 
 MAGNITUDE: {scenario.magnitude}
 """
         if context:
-            user_msg += f"\nCONTEXT FROM OTHER AGENTS:\n{context}\n"
+            user_msg += f"\nUPSTREAM AGENT SIGNALS (use these as inputs to your analysis — do not contradict unless you have strong domain-specific reasons):\n{context}\n"
 
-        data = self.llm.complete_json(
+        if tier == "tier2":
+            user_msg += "\nYou are running as a DOWNSTREAM agent. The upstream signals above represent the primary policy transmission. Focus your analysis on how these signals propagate into YOUR domain specifically.\n"
+
+        max_tokens = TOKEN_BUDGET.get(tier, 2048)
+
+        data = self.llm.complete_tool(
             system_prompt=self.system_prompt,
             user_message=user_msg,
+            tool_schema=ANALYSIS_TOOL,
+            max_tokens=max_tokens,
             temperature=0.3,
+            cache=True,
         )
 
         return AgentAnalysis(
