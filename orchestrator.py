@@ -1,265 +1,215 @@
-"""Orchestrator — LangGraph pipeline with conditional routing and revision loop.
+"""Agentic Orchestrator — ReAct-style tool-use loop that dynamically decides analysis strategy.
 
-Graph structure (conditional edges marked with ?):
-
-    START → parse_scenario → route_agents
-        ─?→ run_tier1 → build_context ─?→ run_tier2 → draft_synthesis
-        ─?→ run_tier2 (no tier1 context)  ↗
-        ─?→ draft_synthesis (no agents)  ↗
-
-    draft_synthesis → critic_review
-        ─?→ build_report (accept)   → END
-        ─?→ revise_synthesis (fix)  → build_report → END
+Instead of a fixed pipeline, the orchestrator LLM reasons about the scenario and decides
+which tools to use, which specialists to consult, and when to synthesize — adapting its
+approach based on the scenario's nature and user preferences.
 """
 
 from __future__ import annotations
-from typing import TypedDict, Any
+from typing import Any
 import concurrent.futures
+import json
 
-from langgraph.graph import StateGraph, START, END
+import anthropic
 
-from models.scenario import Scenario
+from models.scenario import Scenario, PolicyType
 from models.report import AgentAnalysis, SimulationReport, ScenarioOutcome
 from agents import ALL_AGENTS
 from agents.base import BaseAgent
 from utils.llm_client import LLMClient
-from config import BASE_ECONOMY, AGENT_ROUTING, TOKEN_BUDGET
+from config import (
+    ANTHROPIC_API_KEY, MODEL_NAME, MODEL_FAST, MAX_TOKENS,
+    BASE_ECONOMY, TOKEN_BUDGET, MEMORY_ENABLED, MEMORY_DIR,
+    MEMORY_RETRIEVE_K, MCP_ENABLED, MCP_SERVERS,
+)
 
 
-# ── State schema ─────────────────────────────────────────────────────────────
-
-class SimulationState(TypedDict, total=False):
-    """Shared state flowing through every node in the graph."""
-    user_input: str
-    base_economy: str
-    parallel: bool
-    scenario: Any              # Scenario
-    tier1_agent_ids: list[str]
-    tier2_agent_ids: list[str]
-    tier1_results: list        # list[AgentAnalysis]
-    tier2_results: list        # list[AgentAnalysis]
-    tier1_context: str
-    all_initial_analyses: list # list[AgentAnalysis] — pre-deliberation
-    deliberated_analyses: list # list[AgentAnalysis] — post-deliberation
-    has_disagreements: bool
-    draft: dict
-    critique: dict
-    was_revised: bool
-    report: Any                # SimulationReport
+MAX_ITERATIONS = 25
 
 
-# ── Tool schemas for structured output ───────────────────────────────────────
+# ── Orchestrator Tool Definitions ────────────────────────────────────────────
 
-SCENARIO_PARSE_TOOL: dict = {
-    "name": "parse_scenario",
-    "description": "Parse the user's policy scenario into structured fields.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "description": {"type": "string", "description": "Restate the policy in precise economic terms (1-3 sentences)"},
-            "policy_type": {"type": "string", "enum": ["monetary", "fiscal", "trade", "regulatory", "supply_shock", "mixed"]},
-            "magnitude": {"type": "string", "enum": ["mild", "moderate", "severe"]},
-            "is_surprise": {"type": "boolean", "description": "Whether this is unexpected by markets"},
-            "baseline_conditions": {"type": "string", "description": "Brief assumed starting macro conditions"},
-            "time_horizon": {"type": "string", "description": "Relevant time horizon for analysis"},
-        },
-        "required": ["description", "policy_type", "magnitude", "is_surprise", "baseline_conditions", "time_horizon"],
-    },
-}
-
-SYNTHESIS_TOOL: dict = {
-    "name": "submit_synthesis",
-    "description": "Submit the unified cross-domain synthesis report.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "scenario_summary": {"type": "string", "description": "2-3 sentence precise restatement"},
-            "immediate_reaction": {"type": "string", "description": "Unified 0-1 week reaction (1 paragraph)"},
-            "short_term_transmission": {"type": "string", "description": "1-3 month transmission effects (1 paragraph)"},
-            "medium_term_outlook": {"type": "string", "description": "3-12 month structural outlook (1 paragraph)"},
-            "cross_domain_map": {"type": "string", "description": "Causal chain with arrows: Agent A → Agent B → Agent C"},
-            "scenario_matrix": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "probability": {"type": "string"},
-                        "key_driver": {"type": "string"},
-                        "market_impact": {"type": "string"},
-                    },
-                    "required": ["label", "probability", "key_driver", "market_impact"],
-                },
-                "description": "Base / Bull / Bear case matrix",
+TOOLS: list[dict] = [
+    {
+        "name": "parse_scenario",
+        "description": "Parse the user's policy scenario into structured fields (policy type, magnitude, surprise factor, etc). Call this first to understand the scenario.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "raw_input": {"type": "string", "description": "The raw scenario text to parse"},
             },
-            "risk_factors": {"type": "string", "description": "Key risks and assumptions (1 paragraph)"},
-            "synthesis": {"type": "string", "description": "2-3 sentence high-level takeaway"},
+            "required": ["raw_input"],
         },
-        "required": [
-            "scenario_summary", "immediate_reaction", "short_term_transmission",
-            "medium_term_outlook", "cross_domain_map", "scenario_matrix",
-            "risk_factors", "synthesis",
-        ],
     },
-}
-
-CRITIC_TOOL: dict = {
-    "name": "submit_critique",
-    "description": "Submit your critique of the draft synthesis.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "contradictions": {"type": "string", "description": "Logical contradictions found between agents or in the synthesis"},
-            "missing_links": {"type": "string", "description": "Causal chains that were missed or under-explored"},
-            "unsupported_claims": {"type": "string", "description": "Claims not backed by agent analyses"},
-            "revised_synthesis": {"type": "string", "description": "Corrected 2-3 sentence takeaway"},
-            "revised_risk_factors": {"type": "string", "description": "Updated risk factors if any were missed"},
-            "confidence_adjustment": {"type": "string", "enum": ["raise", "maintain", "lower"]},
+    {
+        "name": "fetch_market_data",
+        "description": "Fetch real-time market data relevant to the scenario via MCP tools (prices, yields, technicals, sector performance). Use this when you need current market context to inform your analysis.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What market data to fetch (e.g. 'treasury yields and equity indices' or 'commodity prices and inflation indicators')"},
+            },
+            "required": ["query"],
         },
-        "required": ["contradictions", "missing_links", "unsupported_claims", "revised_synthesis", "revised_risk_factors", "confidence_adjustment"],
     },
-}
+    {
+        "name": "search_memory",
+        "description": "Search past simulations for similar scenarios. Returns historical analyses and outcomes that can inform the current analysis.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Description of what to search for in memory"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "consult_specialist",
+        "description": "Consult one or more specialist agents for domain-specific analysis. Each specialist analyzes the scenario through their domain lens. You can consult multiple specialists in one call for parallel execution.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of agent IDs to consult. Available: central_bank, fiscal_policy, equity_market, fixed_income, forex, commodities_inflation, sentiment",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Additional context to provide the agents (e.g. upstream signals, market data, memory)",
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["tier1", "tier2"],
+                    "description": "Token budget tier. Use tier1 for primary/upstream agents, tier2 for downstream agents that receive upstream signals.",
+                },
+            },
+            "required": ["agent_ids"],
+        },
+    },
+    {
+        "name": "run_debate",
+        "description": "Run a structured bull/bear debate about the scenario's impact magnitude. Use when you want to stress-test whether the impact will be severe or contained. Returns a calibrated verdict.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scenario_description": {"type": "string", "description": "The scenario being debated"},
+                "agent_analyses_summary": {"type": "string", "description": "Summary of specialist analyses to ground the debate"},
+                "rounds": {"type": "integer", "description": "Number of debate rounds (1-3)", "default": 2},
+            },
+            "required": ["scenario_description", "agent_analyses_summary"],
+        },
+    },
+    {
+        "name": "run_deliberation",
+        "description": "Have agents review each other's analyses and revise their positions. Use when you detect disagreements between specialists that need resolution.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Agent IDs to include in deliberation",
+                },
+            },
+            "required": ["agent_ids"],
+        },
+    },
+    {
+        "name": "submit_report",
+        "description": "Submit the final simulation report. Call this when you have enough analysis to produce a complete, well-reasoned report. This ends the simulation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scenario_summary": {"type": "string"},
+                "immediate_reaction": {"type": "string", "description": "0-1 week market reaction"},
+                "short_term_transmission": {"type": "string", "description": "1-3 month effects"},
+                "medium_term_outlook": {"type": "string", "description": "3-12 month structural outlook"},
+                "cross_domain_map": {"type": "string", "description": "How effects propagate across domains"},
+                "scenario_matrix": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "probability": {"type": "string"},
+                            "key_driver": {"type": "string"},
+                            "market_impact": {"type": "string"},
+                        },
+                        "required": ["label", "probability", "key_driver", "market_impact"],
+                    },
+                },
+                "risk_factors": {"type": "string"},
+                "synthesis": {"type": "string", "description": "Key takeaways and unified view"},
+            },
+            "required": ["scenario_summary", "immediate_reaction", "short_term_transmission", "medium_term_outlook", "cross_domain_map", "scenario_matrix", "risk_factors", "synthesis"],
+        },
+    },
+]
 
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────
+# ── Orchestrator Context (shared mutable state) ─────────────────────────────
+
+class OrchestratorContext:
+    """Mutable state accumulated across the orchestrator's tool calls."""
+
+    def __init__(self, user_input: str, base_economy: str, preferences: dict | None = None):
+        self.user_input = user_input
+        self.base_economy = base_economy
+        self.preferences = preferences or {}
+        self.scenario: Scenario | None = None
+        self.market_data: list[str] = []
+        self.memory_results: list[dict] = []
+        self.memory_context: str = ""
+        self.agent_analyses: list[AgentAnalysis] = []
+        self.deliberated_analyses: list[AgentAnalysis] = []
+        self.debate_verdict: str = ""
+        self.data_sources: list[str] = []
+
+
+# ── Main Orchestrator Class ──────────────────────────────────────────────────
 
 class Orchestrator:
-    """Builds and invokes a LangGraph simulation pipeline with conditional routing."""
+    """Agentic orchestrator using ReAct-style reasoning with tool use.
+
+    The LLM decides dynamically what steps to take based on the scenario,
+    user preferences, and intermediate results.
+    """
 
     def __init__(self, api_key: str | None = None, model: str | None = None):
-        self.llm = LLMClient(api_key=api_key, model=model)
+        self.api_key = api_key or ANTHROPIC_API_KEY
+        self.model = model or MODEL_NAME
+        if not self.api_key:
+            raise ValueError("ANTHROPIC_API_KEY is required. Set it in .env or pass --api-key")
+        self.client = anthropic.Anthropic(api_key=self.api_key)
+        self.llm = LLMClient(api_key=self.api_key, model=self.model)
         self.agents: dict[str, BaseAgent] = {
             AgentCls.id: AgentCls(self.llm) for AgentCls in ALL_AGENTS
         }
-        self._on_agent_start: callable | None = None
-        self._on_agent_done: callable | None = None
-        self._graph = self._build_graph()
 
-    # ── Graph construction ───────────────────────────────────────────────
+        self._on_agent_start = None
+        self._on_agent_done = None
+        self._on_phase = None
 
-    def _build_graph(self):
-        """
-        Build the simulation pipeline as a directed graph with conditional edges.
+        # Memory system
+        self.memory = None
+        if MEMORY_ENABLED:
+            try:
+                from memory.store import SimulationMemory
+                self.memory = SimulationMemory(persist_dir=MEMORY_DIR)
+            except ImportError:
+                pass
 
-        Conditional routing:
-          - route_agents   →? run_tier1 | run_tier2 | draft_synthesis
-          - build_context  →? run_tier2 | draft_synthesis
-          - critic_review  →? revise_synthesis | build_report
-        """
-        graph = StateGraph(SimulationState)
-
-        # ── Nodes ──
-        graph.add_node("parse_scenario", self._node_parse)
-        graph.add_node("route_agents", self._node_route)
-        graph.add_node("run_tier1", self._node_tier1)
-        graph.add_node("build_context", self._node_build_context)
-        graph.add_node("run_tier2", self._node_tier2)
-        graph.add_node("check_disagreements", self._node_check_disagreements)
-        graph.add_node("deliberate", self._node_deliberate)
-        graph.add_node("draft_synthesis", self._node_draft_synthesis)
-        graph.add_node("critic_review", self._node_critic)
-        graph.add_node("revise_synthesis", self._node_revise)
-        graph.add_node("build_report", self._node_build_report)
-
-        # ── Edges ──
-        graph.add_edge(START, "parse_scenario")
-        graph.add_edge("parse_scenario", "route_agents")
-
-        # Decision 1: After routing, decide which tier to start with
-        graph.add_conditional_edges(
-            "route_agents",
-            self._should_run_tier1,
-            {
-                "run_tier1": "run_tier1",
-                "skip_to_tier2": "run_tier2",
-                "skip_all": "check_disagreements",
-            },
-        )
-
-        graph.add_edge("run_tier1", "build_context")
-
-        # Decision 2: After tier 1 context is built, check if tier 2 is needed
-        graph.add_conditional_edges(
-            "build_context",
-            self._should_run_tier2,
-            {
-                "run_tier2": "run_tier2",
-                "skip_to_check": "check_disagreements",
-            },
-        )
-
-        graph.add_edge("run_tier2", "check_disagreements")
-
-        # Decision 3: After all agents run, check if deliberation is needed
-        graph.add_conditional_edges(
-            "check_disagreements",
-            self._should_deliberate,
-            {
-                "deliberate": "deliberate",
-                "skip_to_synthesis": "draft_synthesis",
-            },
-        )
-
-        graph.add_edge("deliberate", "draft_synthesis")
-        graph.add_edge("draft_synthesis", "critic_review")
-
-        # Decision 4: After critic, accept or revise
-        graph.add_conditional_edges(
-            "critic_review",
-            self._should_revise,
-            {
-                "revise": "revise_synthesis",
-                "accept": "build_report",
-            },
-        )
-
-        graph.add_edge("revise_synthesis", "build_report")
-        graph.add_edge("build_report", END)
-
-        return graph.compile()
-
-    # ── Conditional edge functions ───────────────────────────────────────
-
-    def _should_run_tier1(self, state: SimulationState) -> str:
-        """Decide whether to run tier 1, skip to tier 2, or skip all agents."""
-        has_tier1 = len(state.get("tier1_agent_ids", [])) > 0
-        has_tier2 = len(state.get("tier2_agent_ids", [])) > 0
-
-        if has_tier1:
-            return "run_tier1"
-        elif has_tier2:
-            return "skip_to_tier2"
-        else:
-            return "skip_all"
-
-    def _should_run_tier2(self, state: SimulationState) -> str:
-        """After tier 1 completes, decide whether tier 2 is needed."""
-        if len(state.get("tier2_agent_ids", [])) > 0:
-            return "run_tier2"
-        return "skip_to_check"
-
-    def _should_deliberate(self, state: SimulationState) -> str:
-        """After all agents run, check if their analyses conflict enough to warrant deliberation."""
-        if not state.get("has_disagreements", False):
-            return "skip_to_synthesis"
-        return "deliberate"
-
-    def _should_revise(self, state: SimulationState) -> str:
-        """After critic review, decide whether the draft needs revision."""
-        critique = state.get("critique", {})
-        adjustment = critique.get("confidence_adjustment", "maintain")
-
-        contradictions = critique.get("contradictions", "").strip().lower()
-        missing = critique.get("missing_links", "").strip().lower()
-        no_issue_markers = {"", "none", "none found", "none found.", "n/a", "no contradictions found", "no contradictions found.", "no missing links", "no missing links found", "no missing links found."}
-
-        has_contradictions = contradictions not in no_issue_markers
-        has_missing_links = missing not in no_issue_markers
-        confidence_lowered = adjustment == "lower"
-
-        if confidence_lowered or (has_contradictions and has_missing_links):
-            return "revise"
-        return "accept"
+        # MCP tool system
+        self.mcp = None
+        if MCP_ENABLED and MCP_SERVERS:
+            try:
+                from mcp_tools.client import MCPManager, MCPServerConfig
+                configs = [MCPServerConfig(**cfg) for cfg in MCP_SERVERS]
+                self.mcp = MCPManager(configs)
+                self.mcp.connect_all_sync()
+            except Exception as e:
+                print(f"  MCP initialization failed: {e}")
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -268,423 +218,617 @@ class Orchestrator:
         user_input: str,
         base_economy: str = BASE_ECONOMY,
         parallel: bool = True,
-        on_agent_start: callable = None,
-        on_agent_done: callable = None,
+        preferences: dict | None = None,
+        on_agent_start: Any = None,
+        on_agent_done: Any = None,
+        on_phase: Any = None,
     ) -> SimulationReport:
-        """Invoke the full simulation graph from user input to final report."""
+        """Run the agentic simulation loop."""
         self._on_agent_start = on_agent_start
         self._on_agent_done = on_agent_done
+        self._on_phase = on_phase
+        self._parallel = parallel
 
-        result = self._graph.invoke({
-            "user_input": user_input,
-            "base_economy": base_economy,
-            "parallel": parallel,
-        })
+        ctx = OrchestratorContext(user_input, base_economy, preferences)
+        report = self._agent_loop(ctx)
 
-        return result["report"]
+        # Store in memory
+        if self.memory and ctx.scenario and report:
+            try:
+                self._emit_phase("Storing simulation in memory...")
+                self.memory.store_simulation(ctx.scenario, report)
+                self._emit_phase("", "  ✓ Simulation stored for future reference")
+            except Exception as e:
+                self._emit_phase("", f"  ○ WARNING: Memory store failed: {e}")
 
-    def compare(
-        self,
-        input_a: str,
-        input_b: str,
-        base_economy: str = BASE_ECONOMY,
-    ) -> str:
-        """Run two scenarios and produce a comparative analysis."""
+        return report
+
+    def compare(self, input_a: str, input_b: str, base_economy: str = BASE_ECONOMY) -> str:
         report_a = self.run(input_a, base_economy, parallel=True)
         report_b = self.run(input_b, base_economy, parallel=True)
         return self._compare_reports(report_a, report_b)
 
-    # ── Graph nodes ──────────────────────────────────────────────────────
+    # ── Core Agent Loop ──────────────────────────────────────────────────
 
-    def _node_parse(self, state: SimulationState) -> dict:
-        """Phase 0: Parse raw input into structured Scenario (Haiku)."""
-        system = """You are a financial scenario parser. Given a user's plain-language description of a policy scenario, extract structured information. Use the provided tool to submit your parse."""
+    def _agent_loop(self, ctx: OrchestratorContext) -> SimulationReport:
+        """ReAct loop: the LLM reasons, picks tools, processes results, repeats."""
+        self._emit_phase("Orchestrator reasoning about analysis strategy...")
 
-        data = self.llm.complete_tool(
-            system_prompt=system,
-            user_message=f"Parse this scenario:\n{state['user_input']}",
-            tool_schema=SCENARIO_PARSE_TOOL,
-            max_tokens=TOKEN_BUDGET["scenario_parse"],
-            temperature=0.2,
-            cache=True,
-            use_fast_model=True,
+        system_prompt = self._build_system_prompt(ctx)
+        messages = [{"role": "user", "content": self._build_initial_message(ctx)}]
+
+        for iteration in range(MAX_ITERATIONS):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=MAX_TOKENS,
+                temperature=0.3,
+                system=system_prompt,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice={"type": "auto"},
+            )
+
+            # Process response content
+            assistant_content = response.content
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            # Check if the model is done (no tool use, just text)
+            tool_uses = [b for b in assistant_content if b.type == "tool_use"]
+            if not tool_uses:
+                # Model finished without submitting report — force synthesis
+                self._emit_phase("", "  ○ Orchestrator finished reasoning without report — forcing synthesis")
+                return self._force_synthesis(ctx)
+
+            # Execute all tool calls and collect results
+            tool_results = []
+            for tool_use in tool_uses:
+                result = self._execute_tool(tool_use.name, tool_use.input, ctx)
+
+                # Check if this is the final report
+                if tool_use.name == "submit_report":
+                    return result  # result is a SimulationReport
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
+                    "content": result if isinstance(result, str) else json.dumps(result, default=str),
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        # Max iterations reached
+        self._emit_phase("", "  ○ Max iterations reached — forcing synthesis")
+        return self._force_synthesis(ctx)
+
+    # ── System Prompt Construction ───────────────────────────────────────
+
+    def _build_system_prompt(self, ctx: OrchestratorContext) -> str:
+        prefs = ctx.preferences
+        pref_section = ""
+        if prefs:
+            pref_lines = []
+            if prefs.get("depth"):
+                pref_lines.append(f"- Analysis depth: {prefs['depth']} (quick/standard/deep)")
+            if prefs.get("focus_domains"):
+                pref_lines.append(f"- Focus on these domains: {', '.join(prefs['focus_domains'])}")
+            if prefs.get("time_horizon"):
+                pref_lines.append(f"- Emphasize time horizon: {prefs['time_horizon']}")
+            if prefs.get("skip_debate"):
+                pref_lines.append("- Skip debate (user wants faster results)")
+            if prefs.get("include_memory"):
+                pref_lines.append("- Include historical context from past simulations")
+            if pref_lines:
+                pref_section = "\n\nUSER PREFERENCES:\n" + "\n".join(pref_lines)
+
+        available_agents = "\n".join(
+            f"  - {a.id}: {a.name} — {a.domain}"
+            for a in self.agents.values()
         )
 
-        scenario = Scenario(
-            raw_input=state["user_input"],
-            base_economy=state["base_economy"],
-            description=data.get("description", state["user_input"]),
+        has_mcp = "AVAILABLE" if (self.mcp and self.mcp.is_connected) else "NOT AVAILABLE"
+        has_memory = "AVAILABLE" if self.memory else "NOT AVAILABLE"
+
+        return f"""You are the orchestrator of a multi-agent financial market simulation system.
+
+Your job is to analyze a policy scenario by deciding WHAT to do and in WHAT ORDER — you are NOT following a fixed pipeline. Think carefully about what this specific scenario requires.
+
+AVAILABLE SPECIALIST AGENTS:
+{available_agents}
+
+EXTERNAL DATA (MCP): {has_mcp}
+SIMULATION MEMORY: {has_memory}
+
+YOUR DECISION-MAKING PROCESS:
+1. First, parse the scenario to understand its nature.
+2. Then REASON about what this scenario needs:
+   - Which domains are most affected? Consult those specialists.
+   - Is real-time market data relevant? Fetch it.
+   - Are there similar past scenarios in memory? Check.
+   - Should upstream agents inform downstream ones? Use tiers.
+   - Are there likely disagreements worth resolving? Use deliberation.
+   - Is the impact magnitude uncertain? Run a debate.
+3. You do NOT need to consult ALL agents — only the relevant ones.
+4. You do NOT need to run debate/deliberation unless the scenario warrants it.
+5. When you have sufficient analysis, synthesize and submit the report.
+
+GUIDELINES:
+- For simple/clear scenarios: parse → consult 2-4 key agents → submit report. Fast and efficient.
+- For complex/ambiguous scenarios: parse → fetch data → consult all agents in tiers → deliberate → debate → submit report. Thorough and rigorous.
+- For scenarios where you already have strong memory context: leverage past outcomes, consult fewer agents, focus on what's different this time.
+- Always think about which agents' outputs FEED INTO other agents (monetary policy affects fixed income, fiscal affects equities, etc.)
+- When consulting multiple independent agents, group them in a single consult_specialist call for parallel execution.
+{pref_section}
+
+IMPORTANT: End every simulation by calling submit_report with a complete analysis. Do not leave the simulation open-ended."""
+
+    def _build_initial_message(self, ctx: OrchestratorContext) -> str:
+        return f"""Analyze this financial policy scenario:
+
+SCENARIO: {ctx.user_input}
+ECONOMY: {ctx.base_economy}
+
+Decide your analysis strategy and begin. Think about what this specific scenario requires — which agents to consult, whether you need market data, whether a debate would add value."""
+
+    # ── Tool Execution ───────────────────────────────────────────────────
+
+    def _execute_tool(self, name: str, inputs: dict, ctx: OrchestratorContext) -> Any:
+        handlers = {
+            "parse_scenario": self._tool_parse_scenario,
+            "fetch_market_data": self._tool_fetch_market_data,
+            "search_memory": self._tool_search_memory,
+            "consult_specialist": self._tool_consult_specialist,
+            "run_debate": self._tool_run_debate,
+            "run_deliberation": self._tool_run_deliberation,
+            "submit_report": self._tool_submit_report,
+        }
+        handler = handlers.get(name)
+        if not handler:
+            return f"Unknown tool: {name}"
+        return handler(inputs, ctx)
+
+    def _tool_parse_scenario(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        self._emit_phase("Parsing scenario...")
+        raw = inputs.get("raw_input", ctx.user_input)
+
+        parse_tool = {
+            "name": "parse_scenario",
+            "description": "Parse the policy scenario into structured fields.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "policy_type": {"type": "string", "enum": ["monetary", "fiscal", "trade", "regulatory", "supply_shock", "mixed"]},
+                    "magnitude": {"type": "string", "enum": ["mild", "moderate", "severe"]},
+                    "is_surprise": {"type": "boolean"},
+                    "baseline_conditions": {"type": "string"},
+                    "time_horizon": {"type": "string"},
+                },
+                "required": ["description", "policy_type", "magnitude", "is_surprise", "baseline_conditions", "time_horizon"],
+            },
+        }
+
+        data = self.llm.complete_tool(
+            system_prompt="You are a financial scenario parser. Extract structured fields.",
+            user_message=f"Parse this scenario:\n{raw}",
+            tool_schema=parse_tool,
+            max_tokens=TOKEN_BUDGET["scenario_parse"],
+            temperature=0.2, cache=True, use_fast_model=True,
+        )
+
+        ctx.scenario = Scenario(
+            raw_input=raw,
+            base_economy=ctx.base_economy,
+            description=data.get("description", raw),
             policy_type=data.get("policy_type", "mixed"),
             magnitude=data.get("magnitude", "moderate"),
             is_surprise=data.get("is_surprise", True),
             baseline_conditions=data.get("baseline_conditions", "Current macro environment"),
             time_horizon=data.get("time_horizon", "12 months"),
         )
-        return {"scenario": scenario}
 
-    def _node_route(self, state: SimulationState) -> dict:
-        """Phase 0.5: Classify agents into tiers, skip irrelevant ones."""
-        scenario: Scenario = state["scenario"]
-        policy = scenario.policy_type.value if hasattr(scenario.policy_type, "value") else str(scenario.policy_type)
-        routing = AGENT_ROUTING.get(policy, AGENT_ROUTING["mixed"])
+        self._emit_phase("", f"  ✓ Parsed: type={ctx.scenario.policy_type}, magnitude={ctx.scenario.magnitude}, surprise={'yes' if ctx.scenario.is_surprise else 'no'}")
+        return f"Scenario parsed: type={ctx.scenario.policy_type}, magnitude={ctx.scenario.magnitude}, surprise={ctx.scenario.is_surprise}, description={ctx.scenario.description}"
 
-        skip = set(routing.get("skip", []))
-        tier1 = [aid for aid in routing["tier1"] if aid in self.agents and aid not in skip]
-        tier2 = [aid for aid in routing["tier2"] if aid in self.agents and aid not in skip]
+    def _tool_fetch_market_data(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        if not self.mcp or not self.mcp.is_connected:
+            return "MCP not available — no live market data."
 
-        return {"tier1_agent_ids": tier1, "tier2_agent_ids": tier2}
+        self._emit_phase("Fetching live market data...")
+        query = inputs.get("query", ctx.user_input)
+        enrichment = self.mcp.enrich_scenario_context(query)
 
-    def _node_tier1(self, state: SimulationState) -> dict:
-        """Phase 1: Run upstream agents in parallel — no cross-agent context."""
-        agents = [self.agents[aid] for aid in state["tier1_agent_ids"]]
-        results = self._run_agent_batch(agents, state["scenario"], "tier1", state.get("parallel", True))
-        return {"tier1_results": results}
+        if enrichment:
+            ctx.market_data.append(enrichment)
+            ctx.data_sources.append(self._summarize_enrichment(enrichment))
+            self._emit_phase("", "  ✓ Market data received")
+            return f"MARKET DATA:\n{enrichment}"
+        else:
+            self._emit_phase("", "  ○ No relevant market data found")
+            return "No relevant market data found for this query."
 
-    def _node_build_context(self, state: SimulationState) -> dict:
-        """Compress tier 1 outputs into a context string for downstream agents."""
+    def _tool_search_memory(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        if not self.memory:
+            return "Memory system not available."
+
+        self._emit_phase("Searching simulation memory...")
+        query_text = inputs.get("query", "")
+
+        # Use scenario if available, otherwise create temporary one for search
+        if ctx.scenario:
+            memories = self.memory.retrieve_similar(ctx.scenario, k=MEMORY_RETRIEVE_K)
+            reflections = self.memory.retrieve_reflections(ctx.scenario)
+        else:
+            temp_scenario = Scenario(raw_input=query_text, description=query_text, base_economy=ctx.base_economy)
+            memories = self.memory.retrieve_similar(temp_scenario, k=MEMORY_RETRIEVE_K)
+            reflections = self.memory.retrieve_reflections(temp_scenario)
+
+        if not memories and not reflections:
+            self._emit_phase("", "  ○ No similar past simulations found")
+            return "No similar past simulations in memory."
+
+        ctx.memory_results = memories
+        self._emit_phase("", f"  ✓ Found {len(memories)} past simulation(s), {len(reflections)} reflection(s)")
+
+        # Format for orchestrator
         lines = []
-        for a in state.get("tier1_results", []):
-            lines.append(f"[{a.agent_name} | Confidence: {a.confidence}]")
-            lines.append(f"  Immediate: {a.immediate_impact}")
-            lines.append(f"  Cross-domain: {a.cross_domain_effects}")
-            lines.append("")
-        return {"tier1_context": "\n".join(lines)}
+        for i, mem in enumerate(memories, 1):
+            doc = mem.get("document", "")
+            policy_line = ""
+            outcome_line = ""
+            for line in doc.split("\n"):
+                if line.startswith("Policy:"):
+                    policy_line = line.replace("Policy:", "").strip()
+                if line.startswith("Synthesis:"):
+                    outcome_line = line.replace("Synthesis:", "").strip()
+            summary = f"[{i}] {policy_line}"
+            if outcome_line:
+                summary += f" → Outcome: {outcome_line[:150]}"
+            lines.append(summary)
+            ctx.data_sources.append(f"Memory [{i}]: {policy_line}. Outcome: {outcome_line[:100]}")
 
-    def _node_tier2(self, state: SimulationState) -> dict:
-        """Phase 2: Run downstream agents with tier 1 context (if available)."""
-        agents = [self.agents[aid] for aid in state["tier2_agent_ids"]]
-        context = state.get("tier1_context", "")
-        results = self._run_agent_batch(
-            agents, state["scenario"], "tier2",
-            state.get("parallel", True), context=context,
+        for ref in reflections:
+            lines.append(f"[Reflection] {ref[:200]}")
+
+        ctx.memory_context = "\n".join(lines)
+        return f"PAST SIMULATIONS:\n" + "\n".join(lines)
+
+    def _tool_consult_specialist(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        agent_ids = inputs.get("agent_ids", [])
+        extra_context = inputs.get("context", "")
+        tier = inputs.get("tier", "tier1")
+
+        # Filter to valid agents
+        valid_ids = [aid for aid in agent_ids if aid in self.agents]
+        if not valid_ids:
+            return f"No valid agent IDs provided. Available: {list(self.agents.keys())}"
+
+        agents = [self.agents[aid] for aid in valid_ids]
+        scenario = ctx.scenario or Scenario(raw_input=ctx.user_input, description=ctx.user_input, base_economy=ctx.base_economy)
+
+        # Build context from accumulated data
+        context_parts = []
+        if extra_context:
+            context_parts.append(extra_context)
+        if ctx.market_data:
+            context_parts.append("\n".join(ctx.market_data))
+        if ctx.memory_context:
+            context_parts.append(ctx.memory_context)
+        full_context = "\n\n".join(context_parts)
+
+        self._emit_phase(f"Consulting specialists ({', '.join(a.name for a in agents)})...")
+
+        results = self._run_agent_batch(agents, scenario, tier, self._parallel, context=full_context)
+        ctx.agent_analyses.extend(results)
+
+        # Format results for orchestrator
+        lines = []
+        for a in results:
+            lines.append(f"\n### {a.agent_name} [Confidence: {a.confidence}]")
+            lines.append(f"- Immediate: {a.immediate_impact}")
+            lines.append(f"- Short-term: {a.short_term_impact}")
+            lines.append(f"- Medium-term: {a.medium_term_impact}")
+            lines.append(f"- Cross-domain: {a.cross_domain_effects}")
+
+        return "SPECIALIST ANALYSES:" + "\n".join(lines)
+
+    def _tool_run_debate(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        self._emit_phase("Running adversarial debate (Bull vs Bear)...")
+        scenario_desc = inputs.get("scenario_description", "")
+        analyses_summary = inputs.get("agent_analyses_summary", "")
+        rounds = min(inputs.get("rounds", 2), 3)
+
+        bull_args = []
+        bear_args = []
+
+        debate_tool = {
+            "name": "submit_argument",
+            "description": "Submit your argument.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "position_summary": {"type": "string"},
+                    "key_arguments": {"type": "string"},
+                    "rebuttal": {"type": "string"},
+                    "magnitude_estimate": {"type": "string"},
+                },
+                "required": ["position_summary", "key_arguments", "rebuttal", "magnitude_estimate"],
+            },
+        }
+
+        judge_tool = {
+            "name": "submit_verdict",
+            "description": "Submit your verdict.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "winner": {"type": "string", "enum": ["bull", "bear", "mixed"]},
+                    "reasoning": {"type": "string"},
+                    "calibrated_impact": {"type": "string"},
+                    "key_uncertainties": {"type": "string"},
+                },
+                "required": ["winner", "reasoning", "calibrated_impact", "key_uncertainties"],
+            },
+        }
+
+        for round_num in range(rounds):
+            self._emit_phase("", f"  ▸ Debate round {round_num+1}/{rounds}...")
+
+            bull_system = "You are the IMPACT MAXIMIZER. Argue this policy will have SEVERE, WIDESPREAD effects. Rebut the opposing view."
+            bear_history = f"\nOPPOSING:\n" + "\n".join(bear_args) if bear_args else ""
+            bull_data = self.llm.complete_tool(
+                system_prompt=bull_system,
+                user_message=f"SCENARIO: {scenario_desc}\nANALYSES:\n{analyses_summary}{bear_history}\nRound {round_num+1}.",
+                tool_schema=debate_tool,
+                max_tokens=TOKEN_BUDGET["debate_argue"],
+                temperature=0.4, cache=True,
+            )
+            bull_args.append(f"[R{round_num+1}] {bull_data.get('position_summary', '')} — {bull_data.get('key_arguments', '')}")
+
+            bear_system = "You are the IMPACT MINIMIZER. Argue this policy will have CONTAINED, LIMITED effects. Markets adapt. Rebut the opposing view."
+            bull_history = f"\nOPPOSING:\n" + "\n".join(bull_args)
+            bear_data = self.llm.complete_tool(
+                system_prompt=bear_system,
+                user_message=f"SCENARIO: {scenario_desc}\nANALYSES:\n{analyses_summary}{bull_history}\nRound {round_num+1}.",
+                tool_schema=debate_tool,
+                max_tokens=TOKEN_BUDGET["debate_argue"],
+                temperature=0.4, cache=True,
+            )
+            bear_args.append(f"[R{round_num+1}] {bear_data.get('position_summary', '')} — {bear_data.get('key_arguments', '')}")
+
+        # Judge
+        self._emit_phase("", "  ▸ Judge arbitrating...")
+        judge_system = "You are the JUDGE. Decide which side (bull=severe impact, bear=contained impact) made the stronger case. Produce a calibrated view."
+        verdict = self.llm.complete_tool(
+            system_prompt=judge_system,
+            user_message=f"SCENARIO: {scenario_desc}\n\nBULL:\n" + "\n".join(bull_args) + f"\n\nBEAR:\n" + "\n".join(bear_args),
+            tool_schema=judge_tool,
+            max_tokens=TOKEN_BUDGET["debate_judge"],
+            temperature=0.3, cache=True,
         )
-        return {"tier2_results": results}
 
-    def _node_check_disagreements(self, state: SimulationState) -> dict:
-        """Check if agents produced conflicting signals that warrant a deliberation round.
+        winner = verdict.get("winner", "mixed")
+        ctx.debate_verdict = f"Verdict: {winner}. {verdict.get('reasoning', '')} Calibrated: {verdict.get('calibrated_impact', '')}"
+        self._emit_phase("", f"  ✓ Debate complete — {winner} side prevailed")
 
-        Uses Haiku to quickly scan for contradictions across all agent outputs.
-        If agents disagree on direction (e.g., one says risk-on, another says risk-off),
-        the graph routes through deliberation so agents can revise.
-        """
-        all_analyses = state.get("tier1_results", []) + state.get("tier2_results", [])
+        return f"DEBATE VERDICT: {ctx.debate_verdict}\nKey uncertainties: {verdict.get('key_uncertainties', '')}"
 
-        if len(all_analyses) < 2:
-            return {"all_initial_analyses": all_analyses, "has_disagreements": False}
+    def _tool_run_deliberation(self, inputs: dict, ctx: OrchestratorContext) -> str:
+        agent_ids = inputs.get("agent_ids", [])
+        self._emit_phase("Running agent deliberation...")
 
-        summaries = self._compress_for_synthesis(all_analyses)
+        # Get analyses for these agents
+        analyses_by_id = {a.agent_id: a for a in ctx.agent_analyses if a.agent_id in agent_ids}
+        if len(analyses_by_id) < 2:
+            return "Need at least 2 agent analyses to deliberate."
 
-        system = """You are a conflict detector for a multi-agent financial simulation. Scan the agent analyses and determine if there are MATERIAL disagreements — cases where agents contradict each other on the DIRECTION of impact (not just magnitude).
-
-Examples of material disagreements:
-- One agent says "risk-on" while another says "risk-off"
-- One agent says "currency strengthens" while another says "capital outflows" (which weakens currency)
-- One agent says "yields rise" while another's logic implies they should fall
-
-Minor differences in magnitude or confidence are NOT disagreements.
-
-Respond with ONLY "yes" or "no" — nothing else."""
-
-        response = self.llm.complete(
-            system_prompt=system,
-            user_message=f"AGENT ANALYSES:\n{summaries}",
-            max_tokens=8,
-            temperature=0.0,
-            cache=True,
-            use_fast_model=True,
-        )
-
-        has_disagreements = response.strip().lower().startswith("yes")
-        return {"all_initial_analyses": all_analyses, "has_disagreements": has_disagreements}
-
-    def _node_deliberate(self, state: SimulationState) -> dict:
-        """Deliberation round: each agent sees all others' analyses and can revise.
-
-        This is where real inter-agent interaction happens. Each agent:
-        1. Reads every other agent's conclusions
-        2. Identifies agreements and disagreements
-        3. Revises its own analysis where warranted
-        4. Defends its position where its domain expertise justifies it
-
-        Runs in parallel — each agent deliberates independently but simultaneously.
-        """
-        all_analyses = state["all_initial_analyses"]
-        scenario: Scenario = state["scenario"]
-
-        analyses_by_id = {a.agent_id: a for a in all_analyses}
-        all_agent_ids = list(analyses_by_id.keys())
+        scenario = ctx.scenario or Scenario(raw_input=ctx.user_input, description=ctx.user_input, base_economy=ctx.base_economy)
+        all_analyses = list(analyses_by_id.values())
 
         def _deliberate_one(agent_id: str) -> AgentAnalysis:
             agent = self.agents[agent_id]
             own = analyses_by_id[agent_id]
-
             others = [a for a in all_analyses if a.agent_id != agent_id]
-            other_lines = []
-            for o in others:
-                other_lines.append(f"[{o.agent_name} | Confidence: {o.confidence}]")
-                other_lines.append(f"  Immediate: {o.immediate_impact}")
-                other_lines.append(f"  Medium-term: {o.medium_term_impact}")
-                other_lines.append(f"  Cross-domain: {o.cross_domain_effects}")
-                other_lines.append("")
-            others_context = "\n".join(other_lines)
-
+            others_ctx = "\n".join(
+                f"[{o.agent_name}] Immediate: {o.immediate_impact} | Cross-domain: {o.cross_domain_effects}"
+                for o in others
+            )
             if self._on_agent_start:
                 self._on_agent_start(f"{agent.name} (deliberation)")
-            result = agent.deliberate(scenario, own, others_context)
+            result = agent.deliberate(scenario, own, others_ctx)
             if self._on_agent_done:
                 self._on_agent_done(f"{agent.name} (deliberation)")
             return result
 
-        parallel = state.get("parallel", True)
-
-        if parallel and len(all_agent_ids) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_agent_ids)) as pool:
-                futures = {pool.submit(_deliberate_one, aid): aid for aid in all_agent_ids}
+        ids_to_deliberate = list(analyses_by_id.keys())
+        if self._parallel and len(ids_to_deliberate) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(ids_to_deliberate)) as pool:
+                futures = {pool.submit(_deliberate_one, aid): aid for aid in ids_to_deliberate}
                 revised = []
                 for future in concurrent.futures.as_completed(futures):
                     try:
                         revised.append(future.result())
-                    except Exception as e:
+                    except Exception:
                         aid = futures[future]
-                        print(f"  WARNING: {aid} deliberation failed, keeping original")
                         revised.append(analyses_by_id[aid])
         else:
-            revised = []
-            for aid in all_agent_ids:
-                try:
-                    revised.append(_deliberate_one(aid))
-                except Exception as e:
-                    print(f"  WARNING: {aid} deliberation failed, keeping original")
-                    revised.append(analyses_by_id[aid])
+            revised = [_deliberate_one(aid) for aid in ids_to_deliberate]
 
-        return {"deliberated_analyses": revised}
+        ctx.deliberated_analyses = revised
+        self._emit_phase("", "  ✓ Deliberation complete")
 
-    def _node_draft_synthesis(self, state: SimulationState) -> dict:
-        """Phase 3a: Merge all agent outputs into a draft synthesis (Sonnet)."""
-        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
-        agent_summaries = self._compress_for_synthesis(all_analyses)
-        scenario: Scenario = state["scenario"]
+        lines = []
+        for a in revised:
+            lines.append(f"### {a.agent_name} (revised) [Confidence: {a.confidence}]")
+            lines.append(f"- Immediate: {a.immediate_impact}")
+            lines.append(f"- Medium-term: {a.medium_term_impact}")
+            lines.append(f"- Cross-domain: {a.cross_domain_effects}")
+        return "DELIBERATED ANALYSES:\n" + "\n".join(lines)
 
-        system = """You are the synthesis engine of a multi-agent financial market simulation. You receive analyses from specialized agents and must merge them into a unified, coherent report.
+    def _tool_submit_report(self, inputs: dict, ctx: OrchestratorContext) -> SimulationReport:
+        self._emit_phase("Building final report...")
 
-Your job:
-1. Resolve any contradictions between agents by weighing confidence levels and economic logic.
-2. Identify the causal chains that connect agent outputs across domains.
-3. Build a probability-weighted scenario matrix (base/bull/bear).
-4. Highlight the key risk factors and assumptions.
+        # Use deliberated analyses if available, otherwise originals
+        all_analyses = ctx.deliberated_analyses if ctx.deliberated_analyses else ctx.agent_analyses
 
-Submit your synthesis using the provided tool."""
+        # Append debate verdict to synthesis if available
+        synthesis = inputs.get("synthesis", "")
+        if ctx.debate_verdict and ctx.debate_verdict not in synthesis:
+            synthesis += f"\n\n[Debate calibration: {ctx.debate_verdict}]"
 
-        user_msg = f"""SCENARIO: {scenario.description}
-ECONOMY: {scenario.base_economy}
-MAGNITUDE: {scenario.magnitude}
-SURPRISE: {'Yes' if scenario.is_surprise else 'No (priced in)'}
-
-AGENT ANALYSES:
-{agent_summaries}"""
-
-        draft = self.llm.complete_tool(
-            system_prompt=system,
-            user_message=user_msg,
-            tool_schema=SYNTHESIS_TOOL,
-            max_tokens=TOKEN_BUDGET["synthesis_draft"],
-            temperature=0.3,
-            cache=True,
-        )
-        return {"draft": draft}
-
-    def _node_critic(self, state: SimulationState) -> dict:
-        """Phase 3b: Critic pass — catch contradictions and gaps (Haiku)."""
-        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
-        agent_summaries = self._compress_for_synthesis(all_analyses)
-        draft = state["draft"]
-
-        system = """You are a financial analysis critic. You review a draft synthesis report produced by a multi-agent simulation system. Your job is to find:
-1. Logical contradictions between agents that weren't resolved
-2. Missing causal links in the cross-domain chain
-3. Claims in the synthesis not supported by the agent analyses
-4. Risk factors that were overlooked
-
-Be precise and specific. If the draft is solid, say so — do not fabricate issues."""
-
-        user_msg = f"""AGENT ANALYSES:
-{agent_summaries}
-
-DRAFT SYNTHESIS:
-Summary: {draft.get('scenario_summary', '')}
-Immediate: {draft.get('immediate_reaction', '')}
-Short-term: {draft.get('short_term_transmission', '')}
-Medium-term: {draft.get('medium_term_outlook', '')}
-Cross-domain map: {draft.get('cross_domain_map', '')}
-Risk factors: {draft.get('risk_factors', '')}
-Synthesis: {draft.get('synthesis', '')}"""
-
-        critique = self.llm.complete_tool(
-            system_prompt=system,
-            user_message=user_msg,
-            tool_schema=CRITIC_TOOL,
-            max_tokens=TOKEN_BUDGET["synthesis_critic"],
-            temperature=0.2,
-            cache=True,
-            use_fast_model=True,
-        )
-        return {"critique": critique}
-
-    def _node_revise(self, state: SimulationState) -> dict:
-        """Phase 3c: Re-synthesize incorporating critic feedback (Sonnet)."""
-        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
-        agent_summaries = self._compress_for_synthesis(all_analyses)
-        draft = state["draft"]
-        critique = state["critique"]
-        scenario: Scenario = state["scenario"]
-
-        system = """You are revising a financial market simulation synthesis based on critic feedback.
-The critic identified specific issues — contradictions, missing causal links, or unsupported claims.
-Produce a corrected synthesis that resolves ALL identified problems while maintaining analytical accuracy.
-
-Submit your revised synthesis using the provided tool."""
-
-        user_msg = f"""SCENARIO: {scenario.description}
-ECONOMY: {scenario.base_economy}
-
-ORIGINAL DRAFT:
-Summary: {draft.get('scenario_summary', '')}
-Immediate: {draft.get('immediate_reaction', '')}
-Short-term: {draft.get('short_term_transmission', '')}
-Medium-term: {draft.get('medium_term_outlook', '')}
-Cross-domain map: {draft.get('cross_domain_map', '')}
-Risk factors: {draft.get('risk_factors', '')}
-Synthesis: {draft.get('synthesis', '')}
-
-CRITIC FEEDBACK TO ADDRESS:
-Contradictions: {critique.get('contradictions', 'None')}
-Missing links: {critique.get('missing_links', 'None')}
-Unsupported claims: {critique.get('unsupported_claims', 'None')}
-
-AGENT ANALYSES (source of truth):
-{agent_summaries}"""
-
-        revised = self.llm.complete_tool(
-            system_prompt=system,
-            user_message=user_msg,
-            tool_schema=SYNTHESIS_TOOL,
-            max_tokens=TOKEN_BUDGET["synthesis_draft"],
-            temperature=0.3,
-            cache=True,
-        )
-        return {"draft": revised, "was_revised": True}
-
-    def _node_build_report(self, state: SimulationState) -> dict:
-        """Merge draft (or revised draft) + critique into final SimulationReport."""
-        draft = state["draft"]
-        critique = state.get("critique", {})
-        was_revised = state.get("was_revised", False)
-        all_analyses = state.get("deliberated_analyses") or (state.get("tier1_results", []) + state.get("tier2_results", []))
-
-        if was_revised:
-            final_synthesis = draft.get("synthesis", "")
-            final_risks = draft.get("risk_factors", "")
-        else:
-            final_synthesis = critique.get("revised_synthesis") or draft.get("synthesis", "")
-            final_risks = critique.get("revised_risk_factors") or draft.get("risk_factors", "")
-
-            contradictions = critique.get("contradictions", "").strip()
-            missing_links = critique.get("missing_links", "").strip()
-            no_issue = {"", "none", "none found", "none found.", "n/a"}
-            if contradictions.lower() not in no_issue:
-                final_risks += f"\n\nContradictions noted: {contradictions}"
-            if missing_links.lower() not in no_issue:
-                final_risks += f"\n\nMissing links noted: {missing_links}"
-
-        matrix = [ScenarioOutcome(**s) for s in draft.get("scenario_matrix", [])]
+        matrix = [ScenarioOutcome(**s) for s in inputs.get("scenario_matrix", [])]
 
         report = SimulationReport(
-            scenario_summary=draft.get("scenario_summary", state["scenario"].description),
+            scenario_summary=inputs.get("scenario_summary", ctx.user_input),
+            agent_analyses=all_analyses,
+            immediate_reaction=inputs.get("immediate_reaction", ""),
+            short_term_transmission=inputs.get("short_term_transmission", ""),
+            medium_term_outlook=inputs.get("medium_term_outlook", ""),
+            cross_domain_map=inputs.get("cross_domain_map", ""),
+            scenario_matrix=matrix,
+            risk_factors=inputs.get("risk_factors", ""),
+            synthesis=synthesis,
+            data_sources=ctx.data_sources,
+        )
+
+        self._emit_phase("", "  ✓ Report complete")
+        return report
+
+    # ── Fallback Synthesis ───────────────────────────────────────────────
+
+    def _force_synthesis(self, ctx: OrchestratorContext) -> SimulationReport:
+        """Force a report when the loop ends without submit_report."""
+        all_analyses = ctx.deliberated_analyses if ctx.deliberated_analyses else ctx.agent_analyses
+
+        if not all_analyses:
+            return SimulationReport(
+                scenario_summary=ctx.user_input,
+                synthesis="Simulation completed without sufficient agent analyses.",
+                data_sources=ctx.data_sources,
+            )
+
+        # Use LLM to synthesize from available analyses
+        analyses_text = "\n".join(
+            f"[{a.agent_name}] Immediate: {a.immediate_impact} | Short: {a.short_term_impact} | Medium: {a.medium_term_impact}"
+            for a in all_analyses
+        )
+
+        synthesis_tool = {
+            "name": "submit_synthesis",
+            "description": "Submit synthesis.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "scenario_summary": {"type": "string"},
+                    "immediate_reaction": {"type": "string"},
+                    "short_term_transmission": {"type": "string"},
+                    "medium_term_outlook": {"type": "string"},
+                    "cross_domain_map": {"type": "string"},
+                    "scenario_matrix": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "probability": {"type": "string"},
+                                "key_driver": {"type": "string"},
+                                "market_impact": {"type": "string"},
+                            },
+                            "required": ["label", "probability", "key_driver", "market_impact"],
+                        },
+                    },
+                    "risk_factors": {"type": "string"},
+                    "synthesis": {"type": "string"},
+                },
+                "required": ["scenario_summary", "immediate_reaction", "short_term_transmission", "medium_term_outlook", "cross_domain_map", "scenario_matrix", "risk_factors", "synthesis"],
+            },
+        }
+
+        market_data = "\n".join(ctx.market_data) if ctx.market_data else ""
+        debate_info = f"\nDEBATE VERDICT: {ctx.debate_verdict}" if ctx.debate_verdict else ""
+
+        draft = self.llm.complete_tool(
+            system_prompt="Synthesize all available analyses into a final simulation report.",
+            user_message=f"SCENARIO: {ctx.user_input}\n\nANALYSES:\n{analyses_text}\n{market_data}{debate_info}",
+            tool_schema=synthesis_tool,
+            max_tokens=TOKEN_BUDGET["synthesis_draft"],
+            temperature=0.3, cache=True,
+        )
+
+        matrix = [ScenarioOutcome(**s) for s in draft.get("scenario_matrix", [])]
+        return SimulationReport(
+            scenario_summary=draft.get("scenario_summary", ctx.user_input),
             agent_analyses=all_analyses,
             immediate_reaction=draft.get("immediate_reaction", ""),
             short_term_transmission=draft.get("short_term_transmission", ""),
             medium_term_outlook=draft.get("medium_term_outlook", ""),
             cross_domain_map=draft.get("cross_domain_map", ""),
             scenario_matrix=matrix,
-            risk_factors=final_risks,
-            synthesis=final_synthesis,
+            risk_factors=draft.get("risk_factors", ""),
+            synthesis=draft.get("synthesis", ""),
+            data_sources=ctx.data_sources,
         )
-        return {"report": report}
 
-    # ── Shared helpers ───────────────────────────────────────────────────
+    # ── Agent Execution ──────────────────────────────────────────────────
 
-    def _run_agent_batch(
-        self,
-        agents: list[BaseAgent],
-        scenario: Scenario,
-        tier: str,
-        parallel: bool,
-        context: str = "",
-    ) -> list[AgentAnalysis]:
-        """Run a batch of agents, optionally in parallel, with shared context."""
-
-        def _run_one(agent: BaseAgent) -> AgentAnalysis:
-            if self._on_agent_start:
-                self._on_agent_start(agent.name)
-            result = agent.analyze(scenario, context=context, tier=tier)
-            if self._on_agent_done:
-                self._on_agent_done(agent.name)
-            return result
-
+    def _run_agent_batch(self, agents, scenario, tier, parallel, context=""):
         if parallel and len(agents) > 1:
+            for agent in agents:
+                if self._on_agent_start:
+                    self._on_agent_start(agent.name)
+
+            def _run_one(agent):
+                return agent.analyze(scenario, context=context, tier=tier)
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
                 futures = {pool.submit(_run_one, a): a for a in agents}
                 results = []
                 for future in concurrent.futures.as_completed(futures):
                     try:
-                        results.append(future.result())
+                        result = future.result()
+                        results.append(result)
+                        if self._on_agent_done:
+                            self._on_agent_done(futures[future].name)
                     except Exception as e:
-                        agent = futures[future]
-                        print(f"  WARNING: {agent.name} failed: {e}")
+                        self._emit_phase("", f"  ○ WARNING: {futures[future].name} failed: {e}")
                 return results
-        else:
-            results = []
-            for agent in agents:
-                try:
-                    results.append(_run_one(agent))
-                except Exception as e:
-                    print(f"  WARNING: {agent.name} failed: {e}")
-            return results
 
-    def _compress_for_synthesis(self, analyses: list[AgentAnalysis]) -> str:
-        """Format agent outputs efficiently for synthesis prompts."""
-        lines = []
-        for a in analyses:
-            lines.append(f"### {a.agent_name} [Confidence: {a.confidence}]")
-            lines.append(f"- Immediate: {a.immediate_impact}")
-            lines.append(f"- Short-term: {a.short_term_impact}")
-            lines.append(f"- Medium-term: {a.medium_term_impact}")
-            lines.append(f"- Spillovers: {a.cross_domain_effects}")
-            lines.append("")
-        return "\n".join(lines)
+        results = []
+        for agent in agents:
+            if self._on_agent_start:
+                self._on_agent_start(agent.name)
+            result = agent.analyze(scenario, context=context, tier=tier)
+            if self._on_agent_done:
+                self._on_agent_done(agent.name)
+            results.append(result)
+        return results
 
-    def _compare_reports(self, report_a: SimulationReport, report_b: SimulationReport) -> str:
-        """Produce a comparative analysis of two simulation reports."""
-        system = """You are a financial market analyst comparing two policy simulation reports side-by-side.
-Produce a clear comparative analysis highlighting:
-1. Where the two scenarios diverge most sharply
-2. Which market domains are affected differently
-3. Which scenario carries more risk
-4. The key decision points that would favor one path over the other
+    # ── Helpers ──────────────────────────────────────────────────────────
 
-Write in clear prose with section headers. Frame as model analysis, not financial advice."""
+    def _emit_phase(self, label: str, detail: str = ""):
+        if self._on_phase:
+            self._on_phase(label, detail)
 
-        user_msg = f"""SCENARIO A:
-{report_a.to_markdown()}
+    def _summarize_enrichment(self, enrichment: str) -> str:
+        data_points = []
+        for line in enrichment.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("EXTERNAL"):
+                continue
+            content = line.split("]: ", 1)[-1] if "]:" in line else line
+            for segment in content.split(" | "):
+                segment = segment.strip()
+                if segment:
+                    data_points.append(segment)
 
----
+        if not data_points:
+            return "MCP: Live market data fetched via yfinance"
 
-SCENARIO B:
-{report_b.to_markdown()}"""
+        summary = f"MCP (live market data): {', '.join(data_points[:4])}"
+        if len(data_points) > 4:
+            summary += f", and {len(data_points) - 4} more indicators"
+        return summary
 
-        return self.llm.complete(
-            system, user_msg,
-            max_tokens=TOKEN_BUDGET["comparison"],
-            temperature=0.4,
-            cache=True,
-        )
+    def _compare_reports(self, report_a, report_b):
+        system = "Compare two policy simulation reports. Highlight divergences, risk differences, and key decision points."
+        user_msg = f"SCENARIO A:\n{report_a.to_markdown()}\n\n---\n\nSCENARIO B:\n{report_b.to_markdown()}"
+        return self.llm.complete(system, user_msg, max_tokens=TOKEN_BUDGET.get("comparison", 4096), temperature=0.4, cache=True)

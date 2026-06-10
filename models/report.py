@@ -38,11 +38,18 @@ class SimulationReport(BaseModel):
     scenario_matrix: list[ScenarioOutcome] = Field(default_factory=list)
     risk_factors: str = ""
     synthesis: str = ""
+    data_sources: list[str] = Field(default_factory=list, description="External data and memory used")
 
     def to_markdown(self) -> str:
         """Render the full report as Markdown."""
         lines = []
         lines.append("# Financial Market Simulation Report\n")
+
+        if self.data_sources:
+            lines.append("## Data Sources Used\n")
+            for src in self.data_sources:
+                lines.append(f"- {src}")
+            lines.append("")
 
         lines.append("## Policy Scenario Summary\n")
         lines.append(self.scenario_summary + "\n")

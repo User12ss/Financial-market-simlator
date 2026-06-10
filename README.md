@@ -1,143 +1,109 @@
 # Financial Market Simulation — Multi-Agent Framework
 
-An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API with a **LangGraph** state-machine pipeline, tiered execution, selective agent activation, model tiering, and two-pass synthesis.
+An AI-powered multi-agent system that simulates how financial markets react to macroeconomic, monetary, and fiscal policy changes. Built on the Anthropic Claude API with a **ReAct-style agentic orchestrator** that dynamically decides its analysis strategy, specialist domain agents, structured adversarial debate, vector memory (ChromaDB), live market data via MCP, and user preference steering.
 
 ## Architecture
 
-The orchestrator is a **LangGraph `StateGraph`** with 11 nodes and 4 conditional decision points. Each node does one job, reads from shared state, and returns a partial update.
+The orchestrator is a **ReAct agent loop** — instead of following a fixed pipeline, the orchestrator LLM reasons about each scenario and dynamically decides which tools to use, which specialists to consult, and when to synthesize.
 
 ```mermaid
 graph TD
-    START((START)) --> parse_scenario
+    START((User Scenario)) --> REASON
 
-    parse_scenario["parse_scenario<br/><i>Haiku · 1,024t</i>"]
-    parse_scenario --> route_agents
+    REASON["Orchestrator LLM<br/><i>Reason about what this scenario needs</i>"]
 
-    route_agents["route_agents<br/><i>Assign tiers, mark skips</i>"]
-    route_agents -->|has tier1| run_tier1
-    route_agents -->|no tier1| run_tier2
-    route_agents -->|no agents| check_disagreements
+    REASON -->|"need structure"| PARSE["parse_scenario<br/><i>Classify type, magnitude, surprise</i>"]
+    REASON -->|"need data"| MARKET["fetch_market_data<br/><i>Live prices, yields, technicals via MCP</i>"]
+    REASON -->|"need history"| MEMORY["search_memory<br/><i>Similar past simulations (ChromaDB)</i>"]
+    REASON -->|"need analysis"| CONSULT["consult_specialist<br/><i>1-7 domain agents, parallel</i>"]
+    REASON -->|"need calibration"| DEBATE["run_debate<br/><i>Bull vs Bear + Judge verdict</i>"]
+    REASON -->|"need resolution"| DELIBERATE["run_deliberation<br/><i>Agents revise after seeing each other</i>"]
+    REASON -->|"analysis complete"| REPORT["submit_report<br/><i>Final synthesis</i>"]
 
-    run_tier1["run_tier1<br/><i>Sonnet · 2,048t · parallel</i>"]
-    run_tier1 --> build_context
-
-    build_context["build_context<br/><i>Compress tier1 outputs</i>"]
-    build_context -->|has tier2| run_tier2
-    build_context -->|no tier2| check_disagreements
-
-    run_tier2["run_tier2<br/><i>Sonnet · 1,536t · parallel</i><br/>Receives tier1 context"]
-    run_tier2 --> check_disagreements
-
-    check_disagreements["check_disagreements<br/><i>Haiku · scan for conflicts</i>"]
-    check_disagreements -->|"agents agree"| draft_synthesis
-    check_disagreements -->|"agents conflict"| deliberate
-
-    deliberate["deliberate<br/><i>Sonnet · 1,536t · parallel</i><br/>Each agent sees all others,<br/>revises or defends position"]
-    deliberate --> draft_synthesis
-
-    draft_synthesis["draft_synthesis<br/><i>Sonnet · 4,096t</i>"]
-    draft_synthesis --> critic_review
-
-    critic_review["critic_review<br/><i>Haiku · 2,048t</i>"]
-    critic_review -->|accept| build_report
-    critic_review -->|issues found| revise_synthesis
-
-    revise_synthesis["revise_synthesis<br/><i>Sonnet · 4,096t</i>"]
-    revise_synthesis --> build_report
-
-    build_report["build_report"]
-    build_report --> END((END))
+    PARSE --> REASON
+    MARKET --> REASON
+    MEMORY --> REASON
+    CONSULT --> REASON
+    DEBATE --> REASON
+    DELIBERATE --> REASON
+    REPORT --> END((Report))
 
     style START fill:#2d9,stroke:#333,color:#fff
     style END fill:#2d9,stroke:#333,color:#fff
-    style route_agents fill:#f90,stroke:#333,color:#fff
-    style build_context fill:#f90,stroke:#333,color:#fff
-    style check_disagreements fill:#f90,stroke:#333,color:#fff
-    style critic_review fill:#f90,stroke:#333,color:#fff
-    style deliberate fill:#48f,stroke:#333,color:#fff
-    style revise_synthesis fill:#e55,stroke:#333,color:#fff
+    style REASON fill:#f90,stroke:#333,color:#fff
+    style PARSE fill:#48f,stroke:#333,color:#fff
+    style MARKET fill:#0a8,stroke:#333,color:#fff
+    style MEMORY fill:#0a8,stroke:#333,color:#fff
+    style CONSULT fill:#a3f,stroke:#333,color:#fff
+    style DEBATE fill:#e55,stroke:#333,color:#fff
+    style DELIBERATE fill:#48f,stroke:#333,color:#fff
+    style REPORT fill:#2d9,stroke:#333,color:#fff
 ```
 
-### 4 Decision Points
+### How the Agent Loop Works
 
-| Decision Node | Question | Paths |
-|--------------|----------|-------|
-| **route_agents** | Are there tier1 agents for this policy type? | `run_tier1` / `run_tier2` / `check_disagreements` |
-| **build_context** | Are there tier2 agents to run? | `run_tier2` / `check_disagreements` |
-| **check_disagreements** | Do agents contradict each other on direction? | `deliberate` / `draft_synthesis` |
-| **critic_review** | Did the critic find contradictions + gaps, or lower confidence? | `revise_synthesis` / `build_report` |
+1. The orchestrator receives the scenario and available tools
+2. It **reasons** about what this specific scenario requires
+3. It **calls tools** — parse, fetch data, consult agents, debate, etc.
+4. Tool results feed back into the orchestrator's context
+5. It **reasons again** — do I need more analysis, or am I ready to synthesize?
+6. Loop continues until it calls `submit_report` or hits the iteration cap (25)
 
-### Agent Interaction Model
+### Adaptive Behavior
 
-The system has **three levels** of inter-agent communication:
+The orchestrator adapts its strategy based on scenario complexity:
 
-1. **Tier1 → Tier2 context passing**: Upstream agents (central bank, fiscal) produce signals that downstream agents (equities, forex) receive as input. The fixed income agent *knows* the central bank's rate path conclusion instead of guessing independently.
+| Scenario Type | Typical Strategy | Tool Calls |
+|--------------|-----------------|------------|
+| Simple/clear (e.g. "Fed raises 25bp") | Parse → 2-3 key agents → report | 3-4 |
+| Moderate (e.g. "fiscal stimulus + tax reform") | Parse → market data → 4-5 agents in tiers → report | 5-7 |
+| Complex/ambiguous (e.g. "trade war + currency devaluation + supply shock") | Parse → data → memory → all agents in tiers → deliberation → debate → report | 8-12 |
 
-2. **Deliberation round** (conditional): After all agents run, Haiku scans for material directional conflicts (e.g., one agent says "risk-on" while another says "risk-off"). If conflicts exist, every agent sees every other agent's full analysis and can revise its position or defend it with domain-specific reasoning. This runs in parallel.
+### Why Agentic Instead of a Fixed Pipeline?
 
-3. **Synthesis + critic**: The synthesis merges all (potentially revised) analyses. The critic catches anything the agents themselves didn't resolve.
+- **Scenario-aware**: A simple rate change doesn't need 7 agents, debate, and deliberation. The orchestrator skips what's unnecessary.
+- **Dynamic ordering**: The LLM decides which agents should inform which — not a hardcoded routing table.
+- **User-steerable**: Preferences like "depth=deep" or "focus=equity_market" change the orchestrator's strategy, not just parameters.
+- **Self-correcting**: If agent analyses conflict, the orchestrator can choose to run deliberation or debate — or neither if the conflict is minor.
+- **Extensible**: Adding a new capability means adding a new tool definition — the orchestrator discovers when to use it.
 
-The deliberation round only fires when agents actually disagree — if everyone is aligned, the graph skips it and saves the API calls.
+## 7 Orchestrator Tools
 
-### Why LangGraph?
+| Tool | Purpose | When Used |
+|------|---------|-----------|
+| `parse_scenario` | Classify scenario (type, magnitude, surprise) | First call — always |
+| `fetch_market_data` | Pull live data via MCP (yields, prices, technicals) | When real-time context would help |
+| `search_memory` | Find similar past simulations in ChromaDB | When historical context exists |
+| `consult_specialist` | Run 1+ domain agents (parallel if multiple) | Core analysis step |
+| `run_debate` | Bull/bear adversarial debate on impact magnitude | When impact is genuinely uncertain |
+| `run_deliberation` | Agents review and revise each other's analyses | When agents materially disagree |
+| `submit_report` | Produce final report — ends the loop | When analysis is sufficient |
 
-- **Decision logic is in the graph**, not hidden inside functions. You see all 4 branch points at the architecture level.
-- **Agent interaction is a graph node**, not a side effect. Deliberation is an explicit step that can be traced and debugged.
-- **Self-correcting**: Two feedback mechanisms — agent deliberation (before synthesis) and critic revision (after synthesis).
-- **Skip paths save tokens**: Aligned agents skip deliberation. Regulatory scenarios skip tier1. Clean drafts skip revision.
-- **Extensible**: Adding a node means one `add_node` + one `add_edge`.
+## Agent Interaction Model
 
-## Optimizations
+The system has **five levels** of inter-agent communication, all triggered dynamically:
 
-### 1. Tiered Execution with Context Passing
-Upstream agents (central bank, fiscal policy, commodities) run first and produce primary signals. Their outputs are compressed and passed as context to downstream agents (fixed income, equities, forex, sentiment), so downstream agents build on real upstream conclusions instead of guessing independently.
+1. **Tiered context passing**: The orchestrator can consult upstream agents first (central bank, fiscal) and pass their outputs as context to downstream agents (equities, forex). Unlike the old fixed pipeline, the orchestrator decides the tier structure per-scenario.
 
-### 2. Selective Agent Activation
-After parsing the scenario, the orchestrator classifies it by policy type and activates only the relevant agents. A regulatory scenario runs 4 agents; a monetary scenario runs 6; a mixed scenario runs all 7. This saves 20-40% of API calls without losing quality.
+2. **Deliberation** (orchestrator-triggered): When the orchestrator notices agent analyses conflict, it can invoke deliberation — each agent sees all others' analyses and can revise or defend its position.
 
-| Policy Type  | Agents Run | Skipped            |
-|-------------|------------|--------------------|
-| monetary    | 6          | fiscal_policy      |
-| fiscal      | 5          | forex, commodities |
-| trade       | 6          | (none)             |
-| regulatory  | 4          | central_bank, forex, commodities |
-| supply_shock| 6          | fiscal_policy      |
-| mixed       | 7          | (none)             |
+3. **Adversarial debate** (orchestrator-triggered): A Bull agent argues for maximum impact, a Bear argues for minimum. They alternate for multiple rounds. A Judge produces a calibrated verdict.
 
-### 3. Model Tiering
-Scenario parsing and the critic pass use Haiku (fast, cheap). Agent analysis and draft synthesis use Sonnet (full reasoning). Token budgets are right-sized per call type.
+4. **Memory-informed analysis**: Past simulation outcomes are retrieved and injected into agent context, so analyses account for historical patterns.
 
-| Call Type           | Model  | Max Tokens | When it runs |
-|--------------------|--------|------------|--------------|
-| Scenario parse     | Haiku  | 1,024      | Always       |
-| Disagreement check | Haiku  | 8          | Always (yes/no response) |
-| Tier 1 agents      | Sonnet | 2,048      | If tier1 agents assigned |
-| Tier 2 agents      | Sonnet | 1,536      | If tier2 agents assigned |
-| Deliberation round | Sonnet | 1,536      | Only if agents conflict |
-| Draft synthesis    | Sonnet | 4,096      | Always       |
-| Critic pass        | Haiku  | 2,048      | Always       |
-| Revision pass      | Sonnet | 4,096      | Only if critic finds issues |
-
-### 4. Agent Deliberation (conditional)
-After all agents run independently, Haiku scans for material directional conflicts. If agents contradict each other (e.g., risk-on vs risk-off), each agent enters a deliberation round where it sees all other agents' full analyses and can revise its position or defend it. This runs in parallel and only fires when needed.
-
-### 5. Two-Pass Synthesis with Critic
-The draft synthesis merges all analyses into a unified report. The critic pass checks for contradictions, missing causal links, and unsupported claims. If the critic finds serious issues, the graph routes through a revision pass before building the final report.
-
-### Additional: Structured Output via Tool Use
-All LLM calls that expect JSON use Anthropic's `tool_use` feature instead of prompt-based JSON generation. This guarantees valid structured output and eliminates parse failures. System prompts are cached via `cache_control` for 90% savings on repeated calls.
+5. **Market-data grounding**: Live market data from MCP tools grounds analyses in current conditions rather than training knowledge alone.
 
 ## Agents
 
-| Agent | Tier | Domain | Key Outputs |
-|-------|------|--------|-------------|
-| Central Bank | 1 | Monetary policy, rates, QE/QT | Rate path, liquidity conditions |
-| Fiscal Policy | 1 | Gov spending, taxes, deficits | Demand impact, debt trajectory |
-| Commodities & Inflation | 1 | Prices, CPI/PPI | Inflation path, commodity moves |
-| Equity Market | 2 | Stock sectors, valuations | Sector rotation, P/E shifts |
-| Fixed Income | 2 | Bonds, yield curve, spreads | Yield moves, curve shape |
-| Forex | 2 | Exchange rates, capital flows | Currency direction, carry trade |
-| Sentiment & Behavioral | 2 | Psychology, risk appetite | Risk-on/off, positioning |
+| Agent | Domain | Key Outputs |
+|-------|--------|-------------|
+| Central Bank | Monetary policy, rates, QE/QT | Rate path, liquidity conditions |
+| Fiscal Policy | Gov spending, taxes, deficits | Demand impact, debt trajectory |
+| Commodities & Inflation | Prices, CPI/PPI | Inflation path, commodity moves |
+| Equity Market | Stock sectors, valuations | Sector rotation, P/E shifts |
+| Fixed Income | Bonds, yield curve, spreads | Yield moves, curve shape |
+| Forex | Exchange rates, capital flows | Currency direction, carry trade |
+| Sentiment & Behavioral | Psychology, risk appetite | Risk-on/off, positioning |
 
 ## Setup
 
@@ -150,7 +116,7 @@ cd financial-market-sim
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# 3. Install dependencies (includes langgraph, anthropic, streamlit, rich)
+# 3. Install dependencies
 pip install -r requirements.txt
 
 # 4. Set your API key
@@ -172,6 +138,9 @@ python main.py
 # Single scenario
 python main.py --scenario "The Fed cuts rates by 50bps unexpectedly"
 
+# With preferences (depth, focus domains, skip debate)
+python main.py --scenario "Fed raises rates" --preferences "depth=deep,focus=equity_market,focus=forex"
+
 # Compare two scenarios side-by-side
 python main.py --compare \
   --scenario-a "Fed raises rates 25bps" \
@@ -181,17 +150,31 @@ python main.py --compare \
 python main.py --scenario "ECB begins QT" --economy EU --model claude-sonnet-4-20250514
 ```
 
+### User Preferences
+
+Steer the orchestrator's analysis strategy via preferences:
+
+```bash
+# CLI
+python main.py -s "scenario" -p "depth=deep,focus=equity_market,focus=forex"
+
+# Interactive mode
+scenario> prefs depth=deep,focus=equity_market
+scenario> The Fed raises rates by 50bps
+```
+
+| Preference | Values | Effect |
+|-----------|--------|--------|
+| `depth` | quick / standard / deep | Controls how many agents and rounds the orchestrator uses |
+| `focus` | Any agent domain name | Orchestrator prioritizes these domains |
+| `horizon` | immediate / short / medium | Emphasizes a specific time horizon |
+| `no_debate` | (flag) | Orchestrator skips the debate step |
+
 ### Web UI (Streamlit)
 
 ```bash
 streamlit run app.py
 ```
-
-Opens a browser dashboard where you can:
-- Enter scenarios and see full simulation reports
-- Compare two scenarios side-by-side
-- View individual agent analyses with confidence levels
-- Download reports as Markdown
 
 ### Python API
 
@@ -200,9 +183,15 @@ from orchestrator import Orchestrator
 
 orch = Orchestrator()
 
-# Single simulation
+# Basic simulation
 report = orch.run("What happens if the Fed raises rates by 100bps unexpectedly?")
 print(report.to_markdown())
+
+# With preferences
+report = orch.run(
+    "Fed raises rates 50bps",
+    preferences={"depth": "deep", "focus_domains": ["fixed_income", "forex"]},
+)
 
 # Compare two scenarios
 comparison = orch.compare(
@@ -212,6 +201,23 @@ comparison = orch.compare(
 print(comparison)
 ```
 
+## Key Features
+
+### ReAct Agent Loop
+The orchestrator uses Anthropic's `tool_use` API with `tool_choice: auto` to implement a reasoning loop. The LLM sees tool results, thinks about what to do next, and calls more tools or submits the final report. This replaces the old fixed LangGraph pipeline.
+
+### Vector Memory (ChromaDB)
+Every completed simulation is stored in a ChromaDB vector store. On the next run, the orchestrator can search for similar past scenarios and include their outcomes in agent context. This enables **cross-run learning**.
+
+### MCP Integration (Live Market Data)
+The system connects to external data services via the **Model Context Protocol**. The default MCP server provides live market data via yfinance — stock prices, treasury yields, technical indicators, sector performance, and fundamentals. The orchestrator decides when to fetch market data based on scenario relevance.
+
+### Adversarial Debate
+A Bull agent argues for maximum impact, a Bear argues for minimum. A Judge arbitrates with a calibrated verdict. The orchestrator decides whether a debate adds value for each scenario.
+
+### Structured Output via Tool Use
+All LLM calls use Anthropic's `tool_use` for guaranteed valid JSON. System prompts are cached via `cache_control` for cost savings on repeated calls.
+
 ## Configuration
 
 Edit `config.py` or set environment variables:
@@ -219,10 +225,15 @@ Edit `config.py` or set environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | Your Anthropic API key (required) |
-| `MODEL_NAME` | `claude-sonnet-4-20250514` | Main model for agent analysis and synthesis |
-| `MODEL_FAST` | `claude-haiku-4-5-20251001` | Fast model for parsing and critic pass |
+| `MODEL_NAME` | `claude-sonnet-4-20250514` | Main model for orchestrator and agents |
+| `MODEL_FAST` | `claude-haiku-4-5-20251001` | Fast model for parsing |
 | `BASE_ECONOMY` | `US` | Default economy for simulations |
-| `MAX_RETRIES` | `3` | API retry attempts |
+| `MAX_ORCHESTRATOR_ITERATIONS` | `25` | Max tool-call iterations per simulation |
+| `MAX_DEBATE_ROUNDS` | `2` | Number of Bull/Bear exchange cycles |
+| `MEMORY_ENABLED` | `true` | Enable cross-run ChromaDB memory |
+| `MEMORY_DIR` | `.memory` | Directory for ChromaDB persistence |
+| `MEMORY_RETRIEVE_K` | `3` | Number of similar past scenarios to retrieve |
+| `MCP_ENABLED` | `false` | Enable MCP external data integration |
 
 ## Example Scenarios
 
@@ -236,27 +247,33 @@ Edit `config.py` or set environment variables:
 
 ```
 financial-market-sim/
-├── config.py              # API keys, model config, routing rules, token budgets
-├── orchestrator.py        # LangGraph StateGraph pipeline (8 nodes)
-├── main.py                # CLI entry point (Rich terminal UI)
+├── config.py              # API keys, model config, token budgets
+├── orchestrator.py        # ReAct agentic orchestrator (tool-use loop)
+├── orchestrator_legacy.py # Old LangGraph fixed pipeline (reference)
+├── main.py                # CLI entry point (Rich terminal UI, preferences)
 ├── app.py                 # Streamlit web UI
 ├── requirements.txt       # Python dependencies
 ├── .env                   # API key (not committed)
 ├── .env.example           # Template for .env
 ├── agents/
-│   ├── base.py            # BaseAgent with tool_use and tier support
-│   ├── central_bank.py    # Monetary policy specialist (Tier 1)
-│   ├── fiscal_policy.py   # Government spending specialist (Tier 1)
-│   ├── commodities.py     # Commodities & inflation specialist (Tier 1)
-│   ├── equity_market.py   # Stock market specialist (Tier 2)
-│   ├── fixed_income.py    # Bond market specialist (Tier 2)
-│   ├── forex.py           # Currency specialist (Tier 2)
-│   └── sentiment.py       # Market psychology specialist (Tier 2)
+│   ├── base.py            # BaseAgent with tool_use and deliberation
+│   ├── central_bank.py    # Monetary policy specialist
+│   ├── fiscal_policy.py   # Government spending specialist
+│   ├── commodities.py     # Commodities & inflation specialist
+│   ├── equity_market.py   # Stock market specialist
+│   ├── fixed_income.py    # Bond market specialist
+│   ├── forex.py           # Currency specialist
+│   └── sentiment.py       # Market psychology specialist
+├── memory/
+│   └── store.py           # ChromaDB vector store for cross-run learning
+├── mcp_tools/
+│   ├── client.py          # MCP client manager (async bridge)
+│   └── yfinance_server.py # Live market data MCP server (yfinance)
 ├── models/
 │   ├── scenario.py        # Pydantic model for parsed scenarios
 │   └── report.py          # Pydantic models for agent output and reports
 └── utils/
-    └── llm_client.py      # Anthropic API wrapper (caching, tool_use, model tiering)
+    └── llm_client.py      # Anthropic API wrapper (caching, tool_use, tiering)
 ```
 
 ## License

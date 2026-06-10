@@ -16,16 +16,49 @@ MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4096"))
 BASE_ECONOMY: str = os.getenv("BASE_ECONOMY", "US")
 TIME_HORIZONS: list[str] = ["immediate (0-1 week)", "short-term (1-3 months)", "medium-term (3-12 months)"]
 
-# --- Token Budgets (Optimization 3: right-size each call) ---
+# --- Token Budgets (right-size each call) ---
 TOKEN_BUDGET: dict[str, int] = {
     "tier1": 2048,
     "tier2": 1536,
     "deliberation": 1536,
+    "debate_argue": 2048,
+    "debate_judge": 2048,
     "synthesis_draft": 4096,
     "synthesis_critic": 2048,
     "scenario_parse": 1024,
     "comparison": 4096,
 }
+
+# --- Orchestrator Configuration ---
+MAX_ORCHESTRATOR_ITERATIONS: int = int(os.getenv("MAX_ORCHESTRATOR_ITERATIONS", "25"))
+
+# --- Debate Configuration ---
+MAX_DEBATE_ROUNDS: int = int(os.getenv("MAX_DEBATE_ROUNDS", "2"))
+
+# --- Memory Configuration ---
+MEMORY_ENABLED: bool = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
+MEMORY_DIR: str = os.getenv("MEMORY_DIR", ".memory")
+MEMORY_RETRIEVE_K: int = int(os.getenv("MEMORY_RETRIEVE_K", "3"))
+
+# --- MCP Configuration ---
+MCP_ENABLED: bool = os.getenv("MCP_ENABLED", "false").lower() == "true"
+MCP_SERVERS: list[dict] = [
+    {
+        "name": "market-data",
+        "transport": "stdio",
+        "command": "python",
+        "args": ["mcp_tools/yfinance_server.py"],
+        "enabled": True,
+    },
+    # Example: database server (requires npx/Node.js)
+    # {
+    #     "name": "postgres",
+    #     "transport": "stdio",
+    #     "command": "npx",
+    #     "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://..."],
+    #     "enabled": True,
+    # },
+]
 
 # --- Agent Tiers (Optimization 1: upstream agents produce signals first) ---
 AGENT_TIERS: dict[str, list[str]] = {
