@@ -1275,6 +1275,19 @@ def test_command_line_runs_and_reports_where_the_signals_are(offline_cli, tmp_pa
     assert "Sessions in a row without error: 1 of 5" in capsys.readouterr().out
 
 
+def test_an_event_is_printed_on_one_indented_line_whatever_the_model_wrote(capsys):
+    from models.signals import Event
+    daily._print_event(Event(
+        seq=1, ts=datetime(2026, 11, 13, tzinfo=timezone.utc), stage="views", speaker="ticker_analyst",
+        speaker_name="Ticker Analyst", is_llm=True, addressed_to="portfolio_manager", kind="view", ticker="UPA",
+        remark="Looks fine.\nfake/a: failed. Not a result line.\n\n  Still the same remark.",
+    ))
+    assert capsys.readouterr().out == (
+        "  views     Ticker Analyst -> portfolio_manager [UPA]: Looks fine. fake/a: failed. Not a result line. "
+        "Still the same remark.\n"
+    )
+
+
 def test_command_line_exits_nonzero_when_a_run_fails(offline_cli, capsys):
     offline_cli.replies[TickerViewDraft] = lambda system, user: 1 / 0
     assert daily.main(["--quiet"]) == 1

@@ -343,6 +343,21 @@ Whenever a session is decided again, for whatever reason, the orders that stand 
 
 **Checked citations.** The analyst names the data points it relied on (`rsi14`, `sma50`, `trailing_pe`, ...) with their values. Code compares each with the snapshot and records mismatches on the view, along with any figure in the text that appears nowhere in the data shown. The portfolio manager and the judge see these warnings.
 
+**Running it every day (macOS).** `scripts/daily_run.sh` is one unattended run: it starts Ollama when the configured model needs it and it is not already up (and stops it again afterwards), keeps the Mac awake while the run goes, writes a log under `data_store/logs/`, and shows a notification saying how the run ended. Only one copy runs at a time, and stopping it stops the pipeline and the Ollama it started. `scripts/schedule.sh` puts it on a schedule through launchd:
+
+```bash
+scripts/schedule.sh install     # run every day at 18:00, 20:00, 22:00, 23:45 and 07:00, local time
+scripts/schedule.sh status      # is it loaded, how did the last run end, the last log lines
+scripts/schedule.sh run         # start one run now, the way the schedule would
+scripts/schedule.sh uninstall   # stop the schedule; records and logs are untouched
+```
+
+The times were chosen for US Eastern and are this Mac's local time; set `DAILY_RUN_TIMES="HH:MM HH:MM ..."` before `install` to use others. There are several because closing prices can be published hours after the close: a run that comes too early fails and the next one tries again, and once a session has signals the rest are skipped. Three things to know:
+
+- launchd does not wake a sleeping Mac. A run that was due while it slept is made once when it wakes. If that is after the next session has opened, the run is refused and that session is missed.
+- macOS does not let scheduled jobs read the Desktop, Documents or Downloads folders. The project has to live somewhere else, and `install` refuses to go on if it does not.
+- The first run creates the paper account with the settings in force at that moment.
+
 **What is recorded.** Each run writes `signals.json` and `signals.md` under `data_store/runs/<session>/<run id>/`, and everything goes into the SQLite journal at `data_store/journal.sqlite3`: runs with their cost, every event (who said what to whom, in order, in the model's own words), macro views, and the paper account's positions, orders, fills and daily equity. The journal carries a format number, and a file written under another format is refused, not misread. It uses SQLite's write-ahead log, which adds `-wal` and `-shm` files beside it and needs a local disk: do not point `JOURNAL_PATH` at a network or synced folder.
 
 **Comparing models.** Each `--arm` is a model configuration. All arms read the same data snapshot; each keeps its own signals and its own paper account.
@@ -421,6 +436,7 @@ financial-market-sim/
 ├── config.py              # Provider, model and feature configuration
 ├── orchestrator.py        # ReAct agentic orchestrator (structured action loop)
 ├── docs/UPGRADE_PLAN.md   # Plan for evolving this into a trading system
+├── scripts/               # daily_run.sh (one unattended run) and schedule.sh (launchd schedule, macOS)
 ├── tests/                 # pytest suite (no real model needed)
 ├── main.py                # CLI entry point (Rich terminal UI, preferences)
 ├── app.py                 # Streamlit web UI

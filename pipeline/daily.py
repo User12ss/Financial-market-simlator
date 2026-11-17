@@ -825,8 +825,13 @@ def default_arm() -> Arm:
 
 
 def _print_event(event: Event) -> None:
+    """One indented line per event, whatever a model put in its remark.
+
+    scripts/daily_run.sh tells the result lines from everything else by this.
+    """
     subject = f" [{event.ticker}]" if event.ticker else ""
-    print(f"  {event.stage:<9} {event.speaker_name} -> {event.addressed_to}{subject}: {event.remark}", flush=True)
+    remark = " ".join(event.remark.split())
+    print(f"  {event.stage:<9} {event.speaker_name} -> {event.addressed_to}{subject}: {remark}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -857,7 +862,9 @@ def main(argv: list[str] | None = None) -> int:
     results = pipeline.run(force=args.force, refresh_macro=args.refresh_macro)
 
     for result in results:
-        print(f"\n{result.arm}: {result.status}" + (f". {result.message}" if result.message else ""))
+        # One line, like every event: scripts/daily_run.sh reads how the run ended from it.
+        message = " ".join(result.message.split())
+        print(f"\n{result.arm}: {result.status}" + (f". {message}" if message else ""))
         if result.table:
             table = result.table
             accepted = [p for p in table.proposals if p.status == "accepted" and p.source == "portfolio_manager"]
