@@ -40,12 +40,16 @@ RULES:
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
 
-    def view(self, ticker: str, ticker_data: str, market_data: str, macro_view: str) -> TickerViewDraft:
+    def view(
+        self, ticker: str, ticker_data: str, market_data: str, macro_view: str, lessons: str = "",
+    ) -> TickerViewDraft:
         return self.llm.complete_structured(
-            self.system_prompt, self.user_message(ticker, ticker_data, market_data, macro_view), TickerViewDraft,
+            self.system_prompt, self.user_message(ticker, ticker_data, market_data, macro_view, lessons),
+            TickerViewDraft,
         )
 
     @staticmethod
-    def user_message(ticker: str, ticker_data: str, market_data: str, macro_view: str) -> str:
-        parts = [macro_view, market_data, f"TICKER DATA\n{ticker_data}", f"Give your view of {ticker}."]
+    def user_message(ticker: str, ticker_data: str, market_data: str, macro_view: str, lessons: str = "") -> str:
+        """`lessons` is what earlier, similar views turned out to be worth. Empty unless the desk has turned it on."""
+        parts = [macro_view, market_data, lessons, f"TICKER DATA\n{ticker_data}", f"Give your view of {ticker}."]
         return "\n\n".join(part for part in parts if part)

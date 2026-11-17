@@ -69,6 +69,22 @@ def next_trading_day(day: date) -> date:
     return _calendar().date_to_session(_checked(stamp.date()), direction="next").date()
 
 
+def trading_days(first: date, last: date) -> list[date]:
+    """Every session from `first` to `last`, both included. Empty when `last` is before `first`."""
+    if last < first:
+        return []
+    return [stamp.date() for stamp in _calendar().sessions_in_range(_checked(first), _checked(last))]
+
+
+def trading_day_after(day: date, sessions: int) -> date:
+    """The session that many sessions after `day`: 1 is the next one."""
+    if sessions < 1:
+        raise CalendarError(f"A count of sessions has to be 1 or more, not {sessions}.")
+    for _ in range(sessions):
+        day = next_trading_day(day)
+    return day
+
+
 def last_completed_session(now: datetime | None = None) -> date:
     """The most recent session that has already closed.
 

@@ -364,6 +364,31 @@ The times were chosen for US Eastern and are this Mac's local time; set `DAILY_R
 
 Each stage of the larger plan has an exit test; `--status` shows where the signal stage's stands (five trading sessions in a row without error, with at least one sell or trim accepted along the way).
 
+## Evaluation
+
+```bash
+python -m evaluation                # every model configuration in the journal
+python -m evaluation --lessons      # also have each model review a few of its own views
+```
+
+The evaluation measures what the pipeline's views and trades turned out to be worth, from prices that came after each decision. It reads the journal and writes a report to `data_store/evaluation/<date>/` (`evaluation.md` and `evaluation.json`). It decides nothing: it places no order and changes nothing the pipeline has recorded. What it adds to the journal are the scores, for the dashboard to read, and lessons when they are asked for. If the price source returns nothing for the benchmark, it stops with an error and leaves the scores on record as they were.
+
+**Every view is scored, not only the trades.** A view names a direction and a horizon, and both can be checked, which gives far more evidence than the few trades do. A view is measured from the open of the session after it was written (the first price anyone could act on: the view is written after a close, with that evening's news already in hand) to the close of the session that ends its own horizon, dividends included. A bullish view is right when the ticker rose, a bearish one when it fell (a ticker that ends exactly where it started is right for neither); because almost every bullish view is "right" in a rising market, each is also checked against the benchmark (`EVALUATION_BENCHMARK`, SPY). Neutral views claim no direction and are counted apart. A score becomes final once it has been worked out two sessions after the view matured; until then it is worked out again each time, because a close read minutes after the bell can change and a dividend can be posted late. A final score is kept even if the source later drops the ticker, and a score measured against another benchmark is never kept. The scorecard splits the results by the confidence stated (does a higher confidence mean anything?), by direction, sector, the macro view of the day, and candidate against holding. Views written on one day rise and fall together, so they are worth less than their number; the report says how many sessions they come from and how wide the margin of error is.
+
+**Three references, all plain code:**
+
+- The benchmark bought and held.
+- The day's candidates in equal weight, swapped each morning for the new list: what the screen alone is worth, before any model has an opinion. Like the benchmark it is fully invested, which the account never is, so both are references and not like-for-like rivals.
+- Random picks from the same candidates. Each of the account's buys is replaced, `EVALUATION_SIMULATIONS` times, by a ticker drawn at random from that day's candidates the analyst gave a view on (without a view the pipeline cannot buy a ticker, so a random pick may not either; which way the view pointed does not matter). The account's own ticker and every other such candidate go through one and the same replay: sized by the sizing rule and the risk gate against the account as it stood that day, bought at the same open, protected by the rule's own stop, sold when the account sold its own pick, and valued on the day the account's books stand at. The ticker is what differs, so the share of random outcomes the account's picks beat answers one question: were the model's picks better than picking at random from the same list? About 50% means no. One thing a random pick inherits is not about itself: the moment it is sold was decided by what happened to the account's ticker. What the account's books recorded for the same buys is reported beside it and is not what is compared: it also reflects a stop the analyst proposed, a size cut by another order of the same day, and the limits then in force. Each candidate is gated on its own, with today's limits; the other orders of that day are not counted. The replay follows the paper broker's order of events, and tests hold it to the broker's recorded result.
+
+**Trades** are put back together from the account's fills: what each made, how it ended (sold, stopped out, still open), and where the profit and loss came from by ticker, sector and kind of exit.
+
+**Lessons.** With `--lessons`, the model reviews a few of its own views with the real outcome beside them: first the views the desk traded on, then the ones that were most confident and wrong. The facts in a lesson (what the price and the benchmark did) are written by code; only the assessment and the one-sentence lesson are the model's. The reviewer is told nothing that happened after the view matured. A lesson is kept but marked, and never shown to anyone, when it states figures the reviewer was not shown, when the one-sentence lesson names any figure at all (it is asked to be general, and would otherwise carry one ticker's numbers into the view of another), or when it runs past 300 characters. Lessons are stored in the journal. **They are shown to the ticker analyst only when `PIPELINE_USE_LESSONS=true`**, which is off by default, because that changes what the analyst reads and so what the pipeline decides. When it is on, the analyst sees up to `PIPELINE_LESSONS_PER_TICKER` lessons, about the same ticker first and then the same sector, and never one whose outcome was not yet known on the day of the decision. The analyst's own figure check then accepts the numbers in those lessons' fact lines, which may be about another ticker of the sector. A small local model writes generic lessons and sometimes misreads the facts it was given; read a few before turning this on.
+
+**What it cannot tell you.** With tens of views or trades, a hit rate cannot be told from a coin flip: the margin is about 0.5/√n, 7 points at 50 and 5 at 100. The report states this beside its numbers. It can show that something is clearly wrong; it cannot show a durable edge in a few weeks.
+
+A journal written before the evaluation existed opens as it is: the two tables the evaluation adds are created the first time it is opened, and nothing already in it is touched.
+
 ## Configuration
 
 Set these in `.env` (see `.env.example`):
@@ -418,6 +443,13 @@ Set these in `.env` (see `.env.example`):
 | `KILL_SWITCH_FILE` | `data_store/HALT` | While this file exists no order is placed. `TRADING_HALT=1` does the same |
 | `JOURNAL_PATH` | `data_store/journal.sqlite3` | The SQLite journal |
 | `RUNS_DIR` | `data_store/runs` | Where signal tables are written |
+| `EVALUATION_DIR` | `data_store/evaluation` | Where evaluation reports are written |
+| `EVALUATION_BENCHMARK` | `SPY` | What views and the account are measured against |
+| `EVALUATION_SIMULATIONS` | `1000` | Random-pick replacements of the account's buys |
+| `EVALUATION_SEED` | `20261117` | Seed for those picks, so that an evaluation can be repeated |
+| `EVALUATION_MAX_LESSONS` | `5` | Most lessons written by one evaluation run with `--lessons` |
+| `PIPELINE_USE_LESSONS` | `false` | Show lessons to the ticker analyst. Changes what the pipeline decides |
+| `PIPELINE_LESSONS_PER_TICKER` | `3` | Most lessons shown for one ticker |
 
 The pipeline's numbers, the risk limits included, are conservative placeholders, not recommendations. Set them before relying on any result.
 
@@ -458,9 +490,18 @@ financial-market-sim/
 │   ├── paper.py           # Paper broker: matching against daily bars, splits, dividends, equity
 │   └── placement.py       # Three-step order placement that survives a crash
 ├── journal/
-│   └── store.py           # SQLite journal: runs, events, macro views, paper books, checkpoints
+│   └── store.py           # SQLite journal: runs, events, macro views, paper books, checkpoints, scores, lessons
+├── evaluation/
+│   ├── run.py             # The evaluation command: python -m evaluation
+│   ├── scoring.py         # Scores every view against later prices; the scorecard
+│   ├── trades.py          # The account's trades, put back together from its fills
+│   ├── baselines.py       # Benchmark, candidates in equal weight, random picks from the same candidates
+│   ├── lessons.py         # A model reviews its own views once the outcome is known
+│   ├── memory.py          # Which lessons the ticker analyst is shown, when that is turned on
+│   ├── prices.py          # Prices fetched once for the whole evaluation
+│   └── report.py          # The evaluation as Markdown
 ├── agents/
-│   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager
+│   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager, reviewer
 │   ├── base.py            # BaseAgent: scenario analysis, deliberation, current-state assessment
 │   ├── central_bank.py    # Monetary policy specialist
 │   ├── fiscal_policy.py   # Government spending specialist
@@ -485,7 +526,8 @@ financial-market-sim/
 │   ├── scenario.py        # Pydantic model for parsed scenarios
 │   ├── report.py          # Pydantic models for agent output and reports
 │   ├── signals.py         # Pydantic models for the pipeline's signals
-│   └── trading.py         # Orders, fills, positions, accounts, risk decisions
+│   ├── trading.py         # Orders, fills, positions, accounts, risk decisions
+│   └── evaluation.py      # View scores, scorecard, trades, benchmarks, lessons, the report
 └── utils/
     ├── llm_client.py      # One LLM interface over Ollama, OpenAI-compatible and Claude
     ├── text_overlap.py    # Detects agents copying each other's text

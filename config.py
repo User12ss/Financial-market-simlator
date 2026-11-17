@@ -148,6 +148,25 @@ RISK_MAX_LIMIT_DEVIATION_PCT: float = float(os.getenv("RISK_MAX_LIMIT_DEVIATION_
 # Kill switch: while this file exists, or TRADING_HALT is set to 1, no order of any kind is placed.
 KILL_SWITCH_FILE: str = os.getenv("KILL_SWITCH_FILE", "").strip() or str(PROJECT_ROOT / "data_store" / "HALT")
 
+# --- Evaluation ---
+# What the views and trades turned out to be worth, measured after the fact.
+# Run with `python -m evaluation`. It reads the journal and later prices, and
+# changes no decision the pipeline has made or will make.
+EVALUATION_DIR: str = os.getenv("EVALUATION_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "evaluation")
+# What every view and the account are measured against.
+EVALUATION_BENCHMARK: str = os.getenv("EVALUATION_BENCHMARK", "").strip().upper() or "SPY"
+# How many times the account's buys are replaced by random picks from the same day's candidates.
+EVALUATION_SIMULATIONS: int = int(os.getenv("EVALUATION_SIMULATIONS", "1000"))
+# Fixed, so that two evaluations of the same records draw the same random picks.
+EVALUATION_SEED: int = int(os.getenv("EVALUATION_SEED", "20261117"))
+# Lessons a model writes about its own past views, once their real outcome is
+# known: at most this many per evaluation, and only when asked for (--lessons).
+EVALUATION_MAX_LESSONS: int = int(os.getenv("EVALUATION_MAX_LESSONS", "5"))
+# Whether the ticker analyst is shown those lessons. Off by default: turning it
+# on changes what the analyst reads, and so what the pipeline decides.
+PIPELINE_USE_LESSONS: bool = os.getenv("PIPELINE_USE_LESSONS", "false").strip().lower() == "true"
+PIPELINE_LESSONS_PER_TICKER: int = int(os.getenv("PIPELINE_LESSONS_PER_TICKER", "3"))
+
 
 # --- Agent Definitions ---
 AGENT_ROSTER: list[dict] = [

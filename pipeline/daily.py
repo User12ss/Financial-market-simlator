@@ -50,6 +50,7 @@ from data.market_calendar import (
 from data.models import Snapshot
 from data.render import render_market, render_market_brief, render_ticker
 from data.snapshot import SnapshotBuilder, load_snapshot, save_snapshot
+from evaluation.memory import lessons_for, render_lessons
 from execution.paper import PaperBroker, sector_of
 from execution.placement import place, reconcile
 from journal.store import Journal
@@ -542,13 +543,24 @@ class DailyPipeline:
                 run.problem(f"{ticker}: no view today, its data is not usable. {reasons}".strip())
                 continue
             ticker_data = render_ticker(item)
+            # What earlier, similar views turned out to be worth. Empty unless it is turned on,
+            # and then the analyst is asked exactly what it was asked before lessons existed.
+            lessons = ""
+            if config.PIPELINE_USE_LESSONS:
+                lessons = render_lessons(lessons_for(
+                    self.journal, run.arm.name, ticker, sector_of(item), snapshot.session_date,
+                    config.PIPELINE_LESSONS_PER_TICKER,
+                ))
+            asked = "\n".join((ticker_data, backdrop, macro_view)) + (f"\n{lessons}" if lessons else "")
             try:
-                draft = self._cached(run, f"view:{ticker}", "\n".join((ticker_data, backdrop, macro_view)),
-                                     TickerViewDraft, lambda: analyst.view(ticker, ticker_data, backdrop, macro_view))
+                draft = self._cached(
+                    run, f"view:{ticker}", asked, TickerViewDraft,
+                    lambda: analyst.view(ticker, ticker_data, backdrop, macro_view, lessons),
+                )
             except LLMError as e:
                 run.problem(f"{ticker}: the analyst call failed. {e}")
                 continue
-            shown = [ticker_data, backdrop, macro_view, analyst.system_prompt]
+            shown = [ticker_data, backdrop, macro_view, analyst.system_prompt, lessons]
             view, refusal = check_view(ticker, snapshot.session_date, ticker in holdings, draft, item, shown)
             if view is None:
                 self._refuse(run, "views", analyst.id, refusal, ticker)

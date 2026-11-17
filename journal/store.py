@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Iterator
 
 import config
+from models.evaluation import Lesson, ViewScore
 from models.signals import Event, MacroRegime, SignalTable, UsageSummary
 
-# Bumped whenever a table changes. A journal written under another number is
-# refused rather than read wrongly.
+# Bumped whenever an existing table changes. A journal written under another
+# number is refused rather than read wrongly. Adding a table is not such a
+# change: see _ADDED below.
 SCHEMA_VERSION = 2
 
 _SCHEMA = """
@@ -166,6 +168,36 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 """
 
+# Tables that came after format 2 was fixed. They are created when a journal
+# is opened and does not have them, so a journal that was written before they
+# existed keeps everything in it and simply gains them. The program that
+# wrote it can still read it afterwards: it never looks at these tables.
+_ADDED = {
+    # What each analyst view turned out to be worth, once its horizon had ended.
+    "view_scores": """
+CREATE TABLE view_scores (
+    run_id       TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    arm          TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    status       TEXT NOT NULL,           -- scored, pending, unpriced
+    score_json   TEXT NOT NULL,
+    PRIMARY KEY (arm, run_id, ticker)
+)""",
+    # What a model wrote about one of its own views after the real outcome was known.
+    "lessons": """
+CREATE TABLE lessons (
+    arm          TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    session_date TEXT NOT NULL,           -- when the view was written
+    known_on     TEXT NOT NULL,           -- the session at whose close the outcome was known
+    sector       TEXT NOT NULL,
+    clean        INTEGER NOT NULL,        -- 0 when the text states figures it was not shown
+    lesson_json  TEXT NOT NULL,
+    PRIMARY KEY (arm, ticker, session_date)
+)""",
+}
+
 COMPLETED = ("ok", "degraded")
 
 
@@ -191,6 +223,13 @@ class Journal:
                 f"{self.path} was written in journal format {version}; this program uses format "
                 f"{SCHEMA_VERSION}. Move the file aside to start a new journal."
             )
+        # Looked up first, and created only when missing: creating a table
+        # takes the write lock, which a pipeline run in progress may hold.
+        present = {row["name"] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for name, statement in _ADDED.items():
+            if name not in present:
+                self._db.execute(statement)
+        self._db.commit()
         # Write-ahead logging: someone reading the journal (the dashboard) never
         # blocks the pipeline from saving.
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -384,6 +423,52 @@ class Journal:
             (arm, session.isoformat()),
         ).fetchone()
         return MacroRegime.model_validate_json(row["regime_json"]) if row else None
+
+    # ── Evaluation ───────────────────────────────────────────────────────
+
+    def save_view_scores(self, arm: str, scores: list[ViewScore]) -> None:
+        """Replace an arm's scores with these, all at once.
+
+        Replaced, not added to: the scores of a run that has since been
+        replaced by a forced rerun must not stay behind for a reader to find.
+        """
+        with self.transaction():
+            self._db.execute("DELETE FROM view_scores WHERE arm = ?", (arm,))
+            for score in scores:
+                self._db.execute(
+                    "INSERT INTO view_scores VALUES (?, ?, ?, ?, ?, ?)",
+                    (score.run_id, score.ticker, arm, score.session_date.isoformat(), score.status,
+                     score.model_dump_json()),
+                )
+
+    def view_scores(self, arm: str) -> list[ViewScore]:
+        rows = self._db.execute(
+            "SELECT score_json FROM view_scores WHERE arm = ? ORDER BY session_date, ticker", (arm,)
+        )
+        return [ViewScore.model_validate_json(row["score_json"]) for row in rows]
+
+    def save_lesson(self, lesson: Lesson) -> None:
+        with self.transaction():
+            self._db.execute(
+                "INSERT OR REPLACE INTO lessons VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (lesson.arm, lesson.ticker, lesson.session_date.isoformat(), lesson.known_on.isoformat(),
+                 lesson.sector, 0 if lesson.data_warnings else 1, lesson.model_dump_json()),
+            )
+
+    def lessons(self, arm: str, known_by: date | None = None, clean_only: bool = False) -> list[Lesson]:
+        """An arm's lessons, the most recently learned first.
+
+        `known_by` leaves out every lesson whose outcome was not yet known at
+        that session's close: a decision may only be shown what had happened
+        by the time it is made.
+        """
+        sql, params = "SELECT lesson_json FROM lessons WHERE arm = ?", [arm]
+        if known_by is not None:
+            sql, params = sql + " AND known_on <= ?", params + [known_by.isoformat()]
+        if clean_only:
+            sql += " AND clean = 1"
+        rows = self._db.execute(sql + " ORDER BY known_on DESC, session_date DESC, ticker", tuple(params))
+        return [Lesson.model_validate_json(row["lesson_json"]) for row in rows]
 
     # ── What the books hold ──────────────────────────────────────────────
 
