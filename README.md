@@ -389,6 +389,35 @@ The evaluation measures what the pipeline's views and trades turned out to be wo
 
 A journal written before the evaluation existed opens as it is: the two tables the evaluation adds are created the first time it is opened, and nothing already in it is touched.
 
+## Dashboard
+
+```bash
+python -m dashboard                 # then open http://127.0.0.1:8765
+```
+
+A web page over the journal and the last evaluation report. Its own labels are in Chinese.
+
+**It is read-only.** Every address it serves answers a read and refuses anything else, the journal is opened in SQLite's read-only mode, and the page has no control that places an order, moves a limit or starts a run. It never writes to the journal and does not create one that is missing. (SQLite may put its own empty `-wal` and `-shm` files beside a journal that is opened for reading.)
+
+**Who can see it.** The page has no login. By default it listens on this computer only (`DASHBOARD_HOST`) and answers only a browser that addresses it as `127.0.0.1` or `localhost`, so a page on another web site cannot read the records through your browser by pointing its own name at your computer. Set `DASHBOARD_HOST` to one of the computer's own addresses and it also answers under that address; set it to `0.0.0.0` and it answers anyone who can reach the computer, under any name. Everyone who can open the page sees every record, so do not put it on a network you do not trust.
+
+**Only what was recorded is shown.** What a model said appears word for word, in the language it was written in. The page neither writes nor polishes a line, and puts recorded text on the page as text, never as markup. Fixed vocabulary (a side, a status, a stage) is named in Chinese; anything a model or a rule wrote in its own words is left as it is.
+
+| Page | What it shows |
+|------|---------------|
+| 总览 | Equity beside the benchmark bought and held and the candidates in equal weight (both lines are read from the last evaluation report; the third reference, random picks, is a distribution and is on the evaluation page). Cash, the day's change, the fall from the high. The two circuit breakers, judged with the risk gate's own comparisons. The kill switch, put to the gate's own function: that is the switch as the dashboard sees it at that moment, which covers the switch file but not a `TRADING_HALT` set for the pipeline alone, so what the last finished run itself recorded about being halted is shown beside it. |
+| 会议室 | The main page. Fourteen figures stand in a circle: seven macro analysts, the ticker analyst, the bull and the bear facing each other, the judge, the portfolio manager, and the risk officer and the trader, who are rules and are marked as rules. They have positions, not names, and are drawn by code; none is modelled on a real person. The latest session is played in the order it was recorded: whoever speaks is lit, the one spoken to is marked, the words appear in the middle, and everything else recorded with that line is listed below. While a run is going, new lines appear by themselves. |
+| 持仓和订单 | Positions with their stops, orders waiting to fill, fills, and the last finished session's candidates, views, proposals and risk decisions. |
+| 评估 | The last evaluation report as it was written: model configurations side by side, the scorecard, stated confidence against the hit rate, trades, where the account falls among random picks, model usage, and the lessons on record. The dashboard never runs the evaluation; `python -m evaluation` refreshes it. |
+| 回放 | Any past session, played back the same way: pick a day and the run that counts for it is shown. |
+| 运行状态 | Every run with its duration, model calls, cost, warnings and errors, and a link that replays that one run, a failed or replaced attempt included. |
+
+When a session was run more than once, the run shown for it is the one still going, else the one whose signals stand, else the last attempt.
+
+A run counts as going only while the process that started it exists. One that was killed never records its ending, so the journal goes on saying "running" until the pipeline next takes that session up; the dashboard shows such a run as interrupted (中断), not as live. That label is the dashboard's own reading, not a status in the journal. If the page loses its connection to the dashboard it says so at the top, keeps what it last read, and reconnects by itself.
+
+The server is Starlette with a server-sent event stream that looks at the journal once a second. The page is plain HTML, CSS and JavaScript modules: no build step, and nothing loaded from outside this computer.
+
 ## Configuration
 
 Set these in `.env` (see `.env.example`):
@@ -450,6 +479,8 @@ Set these in `.env` (see `.env.example`):
 | `EVALUATION_MAX_LESSONS` | `5` | Most lessons written by one evaluation run with `--lessons` |
 | `PIPELINE_USE_LESSONS` | `false` | Show lessons to the ticker analyst. Changes what the pipeline decides |
 | `PIPELINE_LESSONS_PER_TICKER` | `3` | Most lessons shown for one ticker |
+| `DASHBOARD_HOST` | `127.0.0.1` | Address the dashboard listens on. The default serves this computer only |
+| `DASHBOARD_PORT` | `8765` | Port the dashboard listens on |
 
 The pipeline's numbers, the risk limits included, are conservative placeholders, not recommendations. Set them before relying on any result.
 
@@ -500,6 +531,12 @@ financial-market-sim/
 │   ├── memory.py          # Which lessons the ticker analyst is shown, when that is turned on
 │   ├── prices.py          # Prices fetched once for the whole evaluation
 │   └── report.py          # The evaluation as Markdown
+├── dashboard/
+│   ├── __main__.py        # The dashboard command: python -m dashboard
+│   ├── app.py             # Read-only web server: GET addresses, the live event stream, the page's files
+│   ├── reader.py          # Everything shown, read from the journal (opened read-only) and the last report
+│   ├── personas.py        # The fourteen figures: position, seat, model or rule
+│   └── static/            # The page: index.html, styles.css, js/ (meeting room, playback, charts, pages)
 ├── agents/
 │   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager, reviewer
 │   ├── base.py            # BaseAgent: scenario analysis, deliberation, current-state assessment
@@ -541,6 +578,8 @@ pytest                               # unit tests, no model needed
 RUN_LIVE=1 pytest -m live            # structured output against local Ollama
 RUN_LIVE_ANTHROPIC=1 pytest -m live  # the same against Claude (costs a fraction of a cent)
 ```
+
+The dashboard page's own logic (playing a meeting back, following a run that is still going, number formats, seats) has tests in `tests/js`. `pytest` runs them with `node` when it is installed and skips them when it is not; `node --test tests/js/*.test.mjs` runs them alone.
 
 ## License
 

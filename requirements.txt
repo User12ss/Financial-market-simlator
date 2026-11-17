@@ -9,4 +9,7 @@ mcp>=1.0.0
 yfinance>=0.2.40
 pandas>=2.0.0
 exchange_calendars>=4.5
+starlette>=0.40.0
+uvicorn>=0.30.0
+sse-starlette>=2.1.0
 pytest>=8.0.0

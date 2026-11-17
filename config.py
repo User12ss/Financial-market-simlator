@@ -167,6 +167,13 @@ EVALUATION_MAX_LESSONS: int = int(os.getenv("EVALUATION_MAX_LESSONS", "5"))
 PIPELINE_USE_LESSONS: bool = os.getenv("PIPELINE_USE_LESSONS", "false").strip().lower() == "true"
 PIPELINE_LESSONS_PER_TICKER: int = int(os.getenv("PIPELINE_LESSONS_PER_TICKER", "3"))
 
+# --- Dashboard ---
+# A read-only web page over the journal: python -m dashboard. By default it
+# listens on this machine only. It has no login, so do not point it at a
+# network address unless everyone on that network may read the account.
+DASHBOARD_HOST: str = os.getenv("DASHBOARD_HOST", "").strip() or "127.0.0.1"
+DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8765"))
+
 
 # --- Agent Definitions ---
 AGENT_ROSTER: list[dict] = [
