@@ -35,8 +35,9 @@ class MarketDataProvider(Protocol):
         """Daily bars per symbol from `start` to `end` inclusive.
 
         Each frame is indexed by session date, oldest first, with BAR_COLUMNS.
-        Prices are as traded; `adj_close` is adjusted for splits and
-        dividends. Symbols with no data are left out of the result.
+        Open, high, low and close are adjusted for splits but not for
+        dividends; `adj_close` is adjusted for both. Symbols with no data are
+        left out of the result.
         """
 
     def fundamentals(self, symbol: str) -> Fundamentals: ...

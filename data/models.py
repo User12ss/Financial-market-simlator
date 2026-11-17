@@ -22,8 +22,13 @@ class Issue(BaseModel):
 
 
 class Bars(BaseModel):
-    """Daily bars in column form, oldest first. Prices are as traded (not adjusted),
-    except `adj_close`, which is adjusted for splits and dividends."""
+    """Daily bars in column form, oldest first.
+
+    Open, high, low and close are adjusted for splits but not for dividends:
+    the source restates earlier bars each time a split takes effect, so every
+    bar is on the share scale of the snapshot's last session. `adj_close` is
+    adjusted for dividends as well.
+    """
 
     dates: list[date] = Field(default_factory=list)
     open: list[float] = Field(default_factory=list)

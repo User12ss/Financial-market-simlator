@@ -4,6 +4,13 @@ An AI-powered multi-agent system that simulates how financial markets react to m
 
 The model provider is configurable. By default it runs open-source models on your own machine through Ollama; it can also use Claude or any service with an OpenAI-compatible API.
 
+There are two ways to use it:
+
+- **Research mode** (`main.py`, `app.py`): describe a policy scenario and get a report on how markets might react. Most of this document describes it.
+- **Daily trading pipeline** (`python -m pipeline.daily`): a fixed pipeline that turns each day's market data into buy, sell, hold and trim signals for US stocks. It runs in **shadow mode**: it records signals and keeps a hypothetical book, and places no orders. See [Daily Trading Pipeline](#daily-trading-pipeline-shadow-mode).
+
+Nothing this system produces is financial advice. Its outputs are model outputs, and there is no evidence yet that they beat a benchmark; `docs/UPGRADE_PLAN.md` describes how that is to be tested.
+
 ## Architecture
 
 The orchestrator is a **ReAct agent loop** — instead of following a fixed pipeline, the orchestrator LLM reasons about each scenario and dynamically decides which tools to use, which specialists to consult, and when to synthesize.
@@ -275,6 +282,53 @@ The check is lenient on purpose. A figure passes if any number shown rounds to i
 ### Structured Output
 Every structured call is validated against a Pydantic model. Ollama and OpenAI-compatible services get a JSON schema constraint; Claude uses the SDK's structured outputs. A reply that fails validation is retried with the error shown to the model. For Claude, system prompts are cached via `cache_control`.
 
+## Daily Trading Pipeline (shadow mode)
+
+```bash
+python -m pipeline.daily              # run for the last completed US session
+python -m pipeline.daily --status     # past runs, and progress towards the stage's exit test
+python -m pipeline.daily --arm ollama:qwen2.5-coder:7b --arm anthropic:claude-haiku-5-5   # compare two models
+```
+
+Other options: `--force` (run a session again), `--refresh-macro` (form a new macro view now), `--universe FILE`, `--quiet`.
+
+The stages run in an order fixed in code. Models work inside a stage and never choose the next one.
+
+| Stage | Who | What happens |
+|---|---|---|
+| Data | code | Screen the universe on price, liquidity and trend. Take one snapshot of the candidates and of everything the book holds. |
+| Settle | code | Fill earlier proposals in the shadow book at the open of the session after they were made. |
+| Macro | 7 models, then code | Each macro agent assesses the current state of its domain. Code combines the stances into the desk's macro view: the stance with the most confidence behind it, and sector tilts only where more than one agent's worth of confidence agrees. Reused for a week. |
+| Views | 1 model | The ticker analyst writes one view per candidate and per holding: direction, confidence, horizon, invalidation, cited data. |
+| Debate | 3 models | Bull, bear and judge argue the strongest new candidates and any holding whose view has turned. |
+| Proposals | 1 model | The portfolio manager proposes buy, sell, hold or trim. |
+| Checks | code | Each proposal is accepted or rejected by rule. Every holding gets a decision; a missing one is "hold". |
+
+**Models propose, code decides.** A model's output is a draft. Code checks it and keeps it, or refuses it and records why. Nothing is repaired silently: a confidence outside 0 to 1 is refused, not clamped. The rules for proposals:
+
+- The ticker must be one of today's candidates or holdings. Only the first proposal for a ticker counts.
+- A buy needs a checked analyst view of that ticker that is bullish, no ruling against it from the judge, a current macro view, and room in the book.
+- Sell, trim and hold apply only to positions the book holds, and a position with an exit already waiting gets no second order.
+- Buys are taken in order of confidence until the book is full. A position being sold today still counts as held.
+
+These rules are also what limits the damage of a persuaded model. Headlines are outside text, and a model can be talked into things; code still only lets it buy a screened candidate that the analyst and the judge did not reject, up to the position limit, or exit what the book already holds.
+
+**When to run it.** After the close, once closing prices are published, and before the next session opens. Yahoo Finance can take hours after the close to publish them; until then the run fails with a message saying so and can simply be repeated. Once the next session has opened the run is refused: its signals would rest on that day's news and prices, and would be filled at an open that has already passed. The same check is made again after the data is collected and before orders are queued, so a run that is overtaken by the open queues nothing. With a local 7B model a run takes five to eight minutes.
+
+A session that already has signals is skipped, so the command is safe to schedule and to repeat. A run that started less than six hours ago and has not finished is taken to be still going: the command reports `blocked` and exits non-zero, and `--force` overrides it after a crash.
+
+**When a run does not count.** A run fails, and proposes nothing, when the price source is down, when fewer than half the universe has usable prices for the session, when the next session is already trading, when the model is unreachable, or when the cost limit is reached. A run that finished but lost model calls, had outputs refused, had data missing, or could not analyse something the book holds is marked `degraded`.
+
+**The shadow book.** Shadow mode has no broker, so each accepted proposal is treated as an order for a fixed dollar amount that fills at the next session's open. This gives the portfolio manager real positions to hold, trim and sell. It has no cash balance, dividends or slippage. Splits are handled: the price source restates all earlier prices after a split, so positions are moved onto each new snapshot's share scale before anything is filled or valued. The move is only made when the listed split and the restated prices agree; when they do not, the position is left unvalued, its orders wait, and the run is marked degraded. A position that runs have found without a usable, consistent price for more than `SHADOW_PENDING_MAX_DAYS` days, such as a delisted one, is closed by the book at the last close it could trust. Days on which the pipeline did not run are not counted.
+
+**Checked citations.** The analyst names the data points it relied on (`rsi14`, `sma50`, `trailing_pe`, ...) with their values. Code compares each with the snapshot and records mismatches on the view, along with any figure in the text that appears nowhere in the data shown. The portfolio manager and the judge see these warnings.
+
+**What is recorded.** Each run writes `signals.json` and `signals.md` under `data_store/runs/<session>/<run id>/`, and everything goes into the SQLite journal at `data_store/journal.sqlite3`: runs with their cost, every event (who said what to whom, in order, in the model's own words), macro views, and the shadow book with its trades. Orders, the fills a run reported and the run's final status are saved in one transaction. The journal carries a format number, and a file written under another format is refused, not misread. It uses SQLite's write-ahead log, which adds `-wal` and `-shm` files beside it and needs a local disk: do not point `JOURNAL_PATH` at a network or synced folder.
+
+**Comparing models.** Each `--arm` is a model configuration. All arms read the same data snapshot; each keeps its own signals and its own shadow book.
+
+Each stage of the larger plan has an exit test. For this one it is five trading sessions in a row without error, with at least one sell or trim accepted along the way; `--status` shows where that stands.
+
 ## Configuration
 
 Set these in `.env` (see `.env.example`):
@@ -298,6 +352,21 @@ Set these in `.env` (see `.env.example`):
 | `MEMORY_RETRIEVE_K` | `3` | Number of similar past scenarios to retrieve |
 | `MARKET_DATA_ENABLED` | `true` | Let the orchestrator fetch market and macro data |
 | `SNAPSHOT_DIR` | `data_store/snapshots` | Where data snapshots are saved |
+| `UNIVERSE_FILE` | built-in list | Tickers the pipeline screens, one per line |
+| `PIPELINE_MAX_CANDIDATES` | `10` | Candidates kept by the screen each day |
+| `PIPELINE_MIN_PRICE` | `5` | Screen: minimum share price |
+| `PIPELINE_MIN_DOLLAR_VOLUME` | `20000000` | Screen: minimum 20-day average dollar volume |
+| `PIPELINE_MACRO_MAX_AGE_DAYS` | `7` | The macro view is reused until it is this old |
+| `PIPELINE_DEBATE_TOP` | `3` | New candidates debated each day |
+| `PIPELINE_DEBATE_ROUNDS` | `1` | Rounds per debate |
+| `PIPELINE_MAX_COST_USD` | `2.0` | A run stops once its model calls have cost this much |
+| `SHADOW_POSITION_USD` | `10000` | Dollars per shadow position |
+| `SHADOW_MAX_POSITIONS` | `10` | Most positions the shadow book may hold |
+| `SHADOW_PENDING_MAX_DAYS` | `10` | An order with no usable price is dropped after this many days, and a position with none is closed |
+| `JOURNAL_PATH` | `data_store/journal.sqlite3` | The SQLite journal |
+| `RUNS_DIR` | `data_store/runs` | Where signal tables are written |
+
+The pipeline's numbers are placeholders, not recommendations.
 
 ## Example Scenarios
 
@@ -320,8 +389,18 @@ financial-market-sim/
 ├── requirements.txt       # Python dependencies
 ├── .env                   # API key (not committed)
 ├── .env.example           # Template for .env
+├── pipeline/
+│   ├── daily.py           # The fixed daily pipeline (shadow mode) and its command line
+│   ├── universe.py        # Ticker universe and the rule-based candidate screen
+│   ├── macro.py           # Combines the macro agents' assessments by rule
+│   ├── checks.py          # Rules between model output and what is kept
+│   ├── shadow.py          # Shadow book: hypothetical fills at the next open
+│   └── report.py          # Briefings and the Markdown signal table
+├── journal/
+│   └── store.py           # SQLite journal: runs, events, macro views, shadow book
 ├── agents/
-│   ├── base.py            # BaseAgent: structured analysis and deliberation
+│   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager
+│   ├── base.py            # BaseAgent: scenario analysis, deliberation, current-state assessment
 │   ├── central_bank.py    # Monetary policy specialist
 │   ├── fiscal_policy.py   # Government spending specialist
 │   ├── commodities.py     # Commodities & inflation specialist
@@ -343,7 +422,8 @@ financial-market-sim/
 │   └── yfinance_server.py # MCP server exposing the data layer to outside clients
 ├── models/
 │   ├── scenario.py        # Pydantic model for parsed scenarios
-│   └── report.py          # Pydantic models for agent output and reports
+│   ├── report.py          # Pydantic models for agent output and reports
+│   └── signals.py         # Pydantic models for the pipeline's signals
 └── utils/
     ├── llm_client.py      # One LLM interface over Ollama, OpenAI-compatible and Claude
     ├── text_overlap.py    # Detects agents copying each other's text

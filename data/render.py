@@ -14,6 +14,12 @@ GROUNDING_RULE = (
     "describe direction and magnitude in words."
 )
 
+# The same rule for work that has no scenario: the daily trading pipeline.
+DATA_ONLY_RULE = (
+    "Every number you state must appear in the data you are shown below. Do not invent price levels, "
+    "index levels, yields or targets. Where you have no figure, describe direction and size in words."
+)
+
 
 def _pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:+.2f}%"
@@ -84,6 +90,20 @@ def render_market(snapshot: Snapshot) -> str:
         lines.append("Macro series (FRED):")
         lines.extend(_macro_line(p) for p in snapshot.macro)
     return "\n".join(lines)
+
+
+def render_market_brief(snapshot: Snapshot) -> str:
+    """The few market-wide lines a single-ticker analysis needs: indices, VIX and sector ranking."""
+    lines = [f"MARKET BACKDROP (last completed US session: {snapshot.session_date})"]
+    lines.extend(_market_line(p) for p in snapshot.market if p.group == "market")
+    sectors = sorted(
+        (p for p in snapshot.market if p.group == "sectors" and p.return_1mo_pct is not None),
+        key=lambda p: p.return_1mo_pct, reverse=True,
+    )
+    if sectors:
+        lines.append("Sector ETFs, 1-month return, best to worst:")
+        lines.append("- " + ", ".join(f"{p.name} {_pct(p.return_1mo_pct)}" for p in sectors))
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def render_ticker(item: TickerSnapshot) -> str:

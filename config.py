@@ -79,7 +79,37 @@ MEMORY_RETRIEVE_K: int = int(os.getenv("MEMORY_RETRIEVE_K", "3"))
 # from FRED. Both are free and need no key. Every fetch is saved as a
 # point-in-time snapshot under SNAPSHOT_DIR.
 MARKET_DATA_ENABLED: bool = os.getenv("MARKET_DATA_ENABLED", "true").lower() == "true"
-SNAPSHOT_DIR: str = os.getenv("SNAPSHOT_DIR", str(PROJECT_ROOT / "data_store" / "snapshots"))
+SNAPSHOT_DIR: str = os.getenv("SNAPSHOT_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "snapshots")
+
+# --- Daily trading pipeline (shadow mode: signals only, no orders) ---
+# Every number here is a placeholder until the user sets it.
+JOURNAL_PATH: str = os.getenv("JOURNAL_PATH", "").strip() or str(PROJECT_ROOT / "data_store" / "journal.sqlite3")
+RUNS_DIR: str = os.getenv("RUNS_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "runs")
+# One symbol per line. Empty means the built-in list in pipeline/universe.py.
+UNIVERSE_FILE: str = os.getenv("UNIVERSE_FILE", "").strip()
+
+# Candidate screen: plain rules, no model involved.
+PIPELINE_MAX_CANDIDATES: int = int(os.getenv("PIPELINE_MAX_CANDIDATES", "10"))
+PIPELINE_MIN_PRICE: float = float(os.getenv("PIPELINE_MIN_PRICE", "5"))
+PIPELINE_MIN_DOLLAR_VOLUME: float = float(os.getenv("PIPELINE_MIN_DOLLAR_VOLUME", "20000000"))
+
+# The macro team's view is reused until it is this many days old.
+PIPELINE_MACRO_MAX_AGE_DAYS: int = int(os.getenv("PIPELINE_MACRO_MAX_AGE_DAYS", "7"))
+# How many of the strongest new candidates get a bull/bear debate, and how many rounds each.
+PIPELINE_DEBATE_TOP: int = int(os.getenv("PIPELINE_DEBATE_TOP", "3"))
+PIPELINE_DEBATE_ROUNDS: int = int(os.getenv("PIPELINE_DEBATE_ROUNDS", "1"))
+# A run stops, and proposes nothing, once its model calls have cost this much.
+# Local models have no per-token price and never reach it.
+PIPELINE_MAX_COST_USD: float = float(os.getenv("PIPELINE_MAX_COST_USD", "2.0"))
+
+# Shadow book: a hypothetical portfolio kept so that exits get exercised
+# before there is a paper broker. Fixed dollars per position, filled at the
+# next session's open.
+SHADOW_POSITION_USD: float = float(os.getenv("SHADOW_POSITION_USD", "10000"))
+SHADOW_MAX_POSITIONS: int = int(os.getenv("SHADOW_MAX_POSITIONS", "10"))
+# An order with no price to fill at is dropped after this many calendar days,
+# and a position with no usable price for as long is closed at its last good one.
+SHADOW_PENDING_MAX_DAYS: int = int(os.getenv("SHADOW_PENDING_MAX_DAYS", "10"))
 
 
 # --- Agent Definitions ---

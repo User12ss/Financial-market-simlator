@@ -72,7 +72,10 @@ MACRO_SERIES: list[tuple[str, str, str, str, bool]] = [
     ("DCOILWTICO", "WTI crude oil spot price", "USD per barrel", "daily", False),
 ]
 MACRO_HISTORY_DAYS = 800
-MACRO_STALE_AFTER_DAYS = {"daily": 10, "monthly": 75}
+# A monthly figure is dated the first of its month and published in the
+# middle of the next, so on the day before a release the latest one is already
+# about 75 days old. The monthly limit leaves room for that and for a late release.
+MACRO_STALE_AFTER_DAYS = {"daily": 10, "monthly": 95}
 MARKET_STALE_AFTER_DAYS = 5
 
 
@@ -109,14 +112,21 @@ class SnapshotBuilder:
         include_market: bool = True,
         include_macro: bool = True,
         include_news: bool = True,
+        include_fundamentals: bool = True,
     ) -> Snapshot:
+        """Prices and indicators for `tickers`, plus whatever else is switched on.
+
+        Fundamentals, earnings dates and headlines cost one request per ticker.
+        Screening a whole universe only needs prices, so it switches them off.
+        """
         now = self._now()
         session = last_completed_session(now)
         snapshot = Snapshot(
             snapshot_id=f"{session.isoformat()}_{now:%H%M%S}", created_at=now, session_date=session,
         )
         wanted = list(dict.fromkeys(t.strip().upper() for t in tickers if t and t.strip()))
-        symbols = wanted + ([symbol for _, _, symbol in MARKET_SERIES] if include_market else [])
+        # A sector ETF can be both a requested ticker and a market series.
+        symbols = list(dict.fromkeys(wanted + ([symbol for _, _, symbol in MARKET_SERIES] if include_market else [])))
 
         bars: dict[str, pd.DataFrame] = {}
         if symbols:
@@ -128,7 +138,9 @@ class SnapshotBuilder:
         bars = {symbol: frame[frame.index <= session] for symbol, frame in bars.items()}
 
         for ticker in wanted:
-            snapshot.tickers[ticker] = self._ticker(ticker, bars.get(ticker), session, include_news)
+            snapshot.tickers[ticker] = self._ticker(
+                ticker, bars.get(ticker), session, now, include_news, include_fundamentals,
+            )
         if include_market:
             snapshot.market = self._market(bars, session, snapshot.issues)
         if include_macro:
@@ -137,7 +149,10 @@ class SnapshotBuilder:
 
     # ── One ticker ───────────────────────────────────────────────────────
 
-    def _ticker(self, ticker: str, frame: pd.DataFrame | None, session: date, include_news: bool) -> TickerSnapshot:
+    def _ticker(
+        self, ticker: str, frame: pd.DataFrame | None, session: date, now: datetime,
+        include_news: bool, include_fundamentals: bool,
+    ) -> TickerSnapshot:
         item = TickerSnapshot(ticker=ticker, issues=check_bars(ticker, frame, session))
         if frame is None or frame.empty:
             return item
@@ -147,17 +162,23 @@ class SnapshotBuilder:
         item.bars = _stored_bars(frame)
         item.actions = _actions(frame)
 
-        try:
-            item.fundamentals = self.market.fundamentals(ticker)
-        except DataError as e:
-            item.issues.append(_warn("no_fundamentals", str(e)))
-        try:
-            item.next_earnings = self.market.next_earnings(ticker, session)
-        except DataError as e:
-            item.issues.append(_warn("no_earnings_date", str(e)))
+        if include_fundamentals:
+            try:
+                item.fundamentals = self.market.fundamentals(ticker)
+            except DataError as e:
+                item.issues.append(_warn("no_fundamentals", str(e)))
+            try:
+                item.next_earnings = self.market.next_earnings(ticker, session)
+            except DataError as e:
+                item.issues.append(_warn("no_earnings_date", str(e)))
         if include_news:
             try:
-                item.news = self.news.headlines(ticker, HEADLINES_PER_TICKER)
+                # A headline published after the snapshot's own moment was not
+                # known then. This only happens when the clock is set back.
+                item.news = [
+                    headline for headline in self.news.headlines(ticker, HEADLINES_PER_TICKER)
+                    if headline.published is None or headline.published <= now
+                ]
             except DataError as e:
                 item.issues.append(_warn("no_news", str(e)))
         return item

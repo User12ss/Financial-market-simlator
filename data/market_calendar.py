@@ -50,6 +50,13 @@ def session_close(day: date) -> datetime:
     return _calendar().session_close(pd.Timestamp(day)).to_pydatetime()
 
 
+def session_open(day: date) -> datetime:
+    """When the session on `day` starts, as a UTC datetime."""
+    if not is_trading_day(day):
+        raise CalendarError(f"{day} is not a trading day.")
+    return _calendar().session_open(pd.Timestamp(day)).to_pydatetime()
+
+
 def previous_trading_day(day: date) -> date:
     """The last trading day strictly before `day`."""
     stamp = _checked(day) - pd.Timedelta(days=1)

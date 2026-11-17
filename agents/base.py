@@ -6,9 +6,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from data.render import GROUNDING_RULE
+from data.render import DATA_ONLY_RULE, GROUNDING_RULE
 from models.scenario import Scenario
 from models.report import AgentAnalysis
+from models.signals import DomainAssessmentDraft
 from utils.llm_client import LLMClient
 
 
@@ -129,6 +130,35 @@ MAGNITUDE: {scenario.magnitude}
             medium_term_impact=data.medium_term_impact,
             cross_domain_effects=data.cross_domain_effects,
             confidence=data.confidence,
+        )
+
+    @property
+    def current_state_prompt(self) -> str:
+        """System prompt for reading the present state of the domain, with no scenario."""
+        return f"""You are the {self.name} on the macro team of a US equity swing-trading desk. The desk only buys shares and holds them for days to weeks.
+
+YOUR DOMAIN: {self.domain}
+
+{self.domain_prompt}
+
+The guidance above was written for analysing a policy scenario. There is no scenario today. Apply the same reasoning to the CURRENT state of your domain, as shown in the data.
+
+RULES:
+- Judge what the current state of your domain means for US equities over the next one to four weeks.
+- Stay inside your domain. Other analysts cover the other domains.
+- {DATA_ONLY_RULE}
+- confidence is a number from 0 to 1. Use 0.5 when the data in your domain points both ways.
+- List a sector tilt only when your domain gives a clear reason for it. An empty list is a normal answer.
+- This is a model output for a paper-trading system, not financial advice.
+
+Give your assessment in the requested structured fields."""
+
+    def assess_current(self, data: str) -> DomainAssessmentDraft:
+        """Read the current state of this agent's domain from a rendered data snapshot."""
+        return self.llm.complete_structured(
+            self.current_state_prompt,
+            f"{data}\n\nAssess the current state of your domain and what it means for US equities.",
+            DomainAssessmentDraft,
         )
 
     def deliberate(

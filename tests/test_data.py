@@ -6,7 +6,7 @@ recorded from the real sources (tests/fixtures).
 
 import math
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pandas as pd
@@ -535,3 +535,27 @@ def test_full_text_joins_market_and_tickers_and_is_empty_for_nothing():
     assert text.index("DATA SNAPSHOT") < text.index("AAPL (Apple Inc.)")
     assert render_snapshot(Snapshot(snapshot_id="x", created_at=MARKET_OPEN_NOW, session_date=SESSION)) == ""
     assert "DATA SNAPSHOT" in GROUNDING_RULE
+
+
+def test_headlines_published_after_the_snapshot_moment_are_left_out():
+    from data.models import NewsItem
+
+    class LaterNews:
+        def headlines(self, symbol, limit):
+            return [
+                NewsItem(title="Known at the time", published=MARKET_OPEN_NOW - timedelta(hours=1)),
+                NewsItem(title="Published later", published=MARKET_OPEN_NOW + timedelta(hours=1)),
+                NewsItem(title="No timestamp"),
+            ]
+
+    item = fake_builder(news=LaterNews()).build(["AAPL"]).tickers["AAPL"]
+    assert [n.title for n in item.news] == ["Known at the time", "No timestamp"]
+
+
+def test_session_open_is_the_exchange_open_in_utc():
+    from data.market_calendar import session_open
+
+    assert session_open(date(2026, 11, 16)) == datetime(2026, 11, 16, 14, 30, tzinfo=timezone.utc)
+    assert session_open(date(2026, 7, 6)) == datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc)      # daylight time
+    with pytest.raises(CalendarError):
+        session_open(date(2026, 11, 14))
