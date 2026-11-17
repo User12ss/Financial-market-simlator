@@ -13,6 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from models.trading import Account, Fill, OrderRequest, Position, RiskDecision
+
 # The eleven sectors, named as the sector ETFs are in data.snapshot.MARKET_SERIES.
 Sector = Literal[
     "Technology", "Healthcare", "Financials", "Energy", "Consumer Discretionary", "Consumer Staples",
@@ -107,6 +109,13 @@ class TickerViewDraft(Draft):
     thesis: str = Field(description="Why, weighing price action, fundamentals and headlines (2-4 sentences)")
     catalysts: str = Field(description="What could move the price within the horizon (1-2 sentences)")
     invalidation: str = Field(description="An observable condition that would prove the view wrong (1 sentence)")
+    stop_price: float | None = Field(
+        description="For a bullish view: the price, below the last close, at which you would sell because the view "
+                    "has failed. null when the view is not bullish, or the data shows no level to put it under"
+    )
+    stop_reason: str = Field(
+        description="The level in the data that the stop sits just below (1 sentence). Empty when stop_price is null"
+    )
     evidence: list[Citation] = Field(description="Two to five data points you relied on")
     remark: str = Field(description="One short sentence, in your own voice, said to the portfolio manager")
 
@@ -126,6 +135,11 @@ class TickerView(BaseModel):
     thesis: str
     catalysts: str
     invalidation: str
+    proposed_stop: float | None = Field(
+        default=None,
+        description="The analyst's stop for a new position, kept only when it is within the allowed range",
+    )
+    stop_reason: str = ""
     evidence: list[CheckedCitation] = Field(default_factory=list)
     remark: str
     data_warnings: list[str] = Field(default_factory=list)
@@ -194,30 +208,6 @@ class TradeProposal(BaseModel):
     note: str = Field(default="", description="Why it was rejected, or why a default was filled in")
 
 
-# ── Shadow book ──────────────────────────────────────────────────────────────
-
-class Holding(BaseModel):
-    ticker: str
-    shares: float
-    entry_price: float
-    entry_date: date
-    last_close: float | None = None
-    unrealized_pct: float | None = None
-    sessions_held: int = 0
-
-
-class ShadowFill(BaseModel):
-    ticker: str
-    # "close" is the book closing a position on its own, at the last price it
-    # could trust, after the ticker's data stayed unusable for too long.
-    action: Literal["buy", "sell", "trim", "close"]
-    shares: float
-    price: float
-    trade_date: date
-    proposed_session: date
-    pnl_pct: float | None = Field(default=None, description="Return against the entry price, for sells and trims")
-
-
 # ── Run record ───────────────────────────────────────────────────────────────
 
 class ScreenRow(BaseModel):
@@ -245,7 +235,7 @@ class Event(BaseModel):
 
     seq: int
     ts: datetime
-    stage: Literal["settle", "macro", "views", "debate", "proposals", "checks"]
+    stage: Literal["settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
     speaker: str
     speaker_name: str
     is_llm: bool
@@ -268,13 +258,17 @@ class SignalTable(BaseModel):
     universe_size: int
     screen: list[ScreenRow] = Field(default_factory=list)
     candidates: list[str] = Field(default_factory=list)
-    fills: list[ShadowFill] = Field(default_factory=list, description="Earlier proposals filled at this run's start")
-    holdings: list[Holding] = Field(default_factory=list, description="The shadow book the portfolio manager saw")
+    account: Account | None = Field(default=None, description="The paper account after it was brought up to date")
+    fills: list[Fill] = Field(default_factory=list, description="Fills since the last finished run")
+    holdings: list[Position] = Field(default_factory=list, description="The positions the portfolio manager saw")
     regime: MacroRegime | None = None
     regime_reused_from: date | None = None
     views: list[TickerView] = Field(default_factory=list)
     debates: list[DebateRecord] = Field(default_factory=list)
     proposals: list[TradeProposal] = Field(default_factory=list)
     pm_summary: str = ""
+    risk: list[RiskDecision] = Field(default_factory=list, description="What the risk gate did with each sized order")
+    orders: list[OrderRequest] = Field(default_factory=list, description="The orders that passed the gate")
+    halted: str = Field(default="", description="Why no order was placed, when the kill switch was on")
     warnings: list[str] = Field(default_factory=list)
     usage: UsageSummary = Field(default_factory=UsageSummary)

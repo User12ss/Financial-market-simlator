@@ -1,5 +1,6 @@
 """The daily pipeline end to end, offline: synthetic prices and a scripted model."""
 
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -11,7 +12,7 @@ from models.signals import (
 )
 from pipeline import daily
 from pipeline.daily import Arm, DailyPipeline, progress, status_lines
-from pipeline.shadow import ShadowBook
+from execution.paper import PaperBroker
 from tests.pipeline_fakes import (
     Clock, ScriptedLLM, SyntheticMarket, argument, assessment, by_agent, by_ticker, day, make_pipeline,
     proposals, ruling, session, view,
@@ -25,12 +26,25 @@ def run_once(pipeline, **options):
     return results[0]
 
 
-def seed_position(pipeline, arm, ticker, entry_session=10):
-    """Put a position straight into an arm's shadow book, as if bought at that session's close."""
-    market, when = SyntheticMarket(), session(entry_session)
-    close = 100.0 if ticker in market.missing else float(market.path(ticker, when)["close"].iloc[-1])
+def book(pipeline, arm="fake/a"):
+    return PaperBroker(pipeline.journal, arm)
+
+
+def waiting_orders(pipeline, arm="fake/a"):
+    """Orders at the broker that have not filled, protective stops left out: ticker to side."""
+    return {order.ticker: order.side for order in book(pipeline, arm).orders() if order.kind != "stop"}
+
+
+def seed_position(pipeline, arm, ticker, entry_session=10, shares=10):
+    """Put a position straight into an arm's paper account, as if bought at that session's close."""
+    market, when = SyntheticMarket(), session(entry_session).isoformat()
+    close = 100.0 if ticker in market.missing else float(market.path(ticker, session(entry_session))["close"].iloc[-1])
+    book(pipeline, arm)                                           # opens the account
     with pipeline.journal.transaction():
-        pipeline.journal.put_position(arm, ticker, 100.0, close, when, when, close)
+        pipeline.journal.write(
+            "INSERT INTO paper_positions VALUES (?, ?, ?, ?, ?, 'Technology', ?, ?, NULL, ?, 1)",
+            (arm, ticker, shares, close, when, when, close, close),
+        )
 
 
 # ── A normal day ─────────────────────────────────────────────────────────────
@@ -57,7 +71,77 @@ def test_first_run_produces_a_checked_signal_table(tmp_path):
     assert table.holdings == [] and table.fills == []
     # 7 macro agents, 3 views, 3 debates of two arguments and a ruling, 1 portfolio manager
     assert table.usage.calls == 7 + 3 + 9 + 1 and table.usage.cost_usd is None
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(16)) == {"UPA": "buy", "UPB": "buy"}
+
+    # Each buy was sized, cut by the gate to the single-position limit, and placed with a stop.
+    assert table.account.equity == 100_000 and table.account.cash == 100_000
+    assert [(d.ticker, d.side, d.verdict) for d in table.risk] == [("UPA", "buy", "reduced"), ("UPB", "buy", "reduced")]
+    assert all("Single position" in d.reasons[0] for d in table.risk)
+    closes = {ticker: pipeline.builder.market.path(ticker, session(13))["close"].iloc[-1] for ticker in ("UPA", "UPB")}
+    for order, decision in zip(table.orders, table.risk):
+        assert order.shares == decision.approved_shares == int(10_000 // closes[order.ticker])
+        assert 0 < order.protective_stop < closes[order.ticker]
+    assert waiting_orders(pipeline) == {"UPA": "buy", "UPB": "buy"}
+
+
+def stop_at(atrs):
+    """An analyst that puts its stop this many ATRs below the close it is shown."""
+    def reply(system_prompt, user_message):
+        ticker_data = user_message.split("TICKER DATA")[1]
+        close = float(re.search(r"- Close ([\d,.]+),", ticker_data).group(1).replace(",", ""))
+        atr = float(re.search(r"ATR\(14\) ([\d,.]+) ", ticker_data).group(1).replace(",", ""))
+        return view(stop=round(close - atrs * atr, 2))
+    return reply
+
+
+def test_an_analysts_stop_inside_the_range_is_the_one_the_order_carries(tmp_path):
+    llm = ScriptedLLM()
+    llm.replies[TickerViewDraft] = stop_at(3)
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+
+    result = run_once(pipeline)
+    table = result.table
+
+    assert result.status == "ok"
+    stop = table.views[0].proposed_stop
+    close = pipeline.builder.market.path("UPA", session(13))["close"].iloc[-1]
+    assert table.views[0].ticker == "UPA" and 0 < stop < close and table.views[0].data_warnings == []
+    [order], [decision] = table.orders, table.risk
+    assert order.protective_stop == stop and "the analyst's stop, 3.0 x ATR" in order.reason
+    # Risk budget 100,000 x 1% at the lower confidence, the analyst's 0.6, over the distance to that stop.
+    assert decision.requested_shares == int(600 // (close - stop))
+    text = result.markdown_path.read_text()
+    assert f"Protective stops attached on fill: UPA at {stop:,.2f} (the analyst's level)." in text
+    assert f"| {stop:,.2f}. Just below the 50-day average. | clean |" in text
+    # The debaters and the portfolio manager are shown the stop too.
+    assert f"Proposed stop for a new position: {stop:,.2f}." in llm.messages(ProposalSetDraft)[0]
+    assert f"Proposed stop for a new position: {stop:,.2f}." in llm.messages(DebateArgumentDraft)[0]
+
+    # Once filled, the position is protected at the analyst's level.
+    pipeline._now.now = day(16)
+    run_once(pipeline)
+    assert book(pipeline).positions()["UPA"].stop_price == stop
+
+
+@pytest.mark.parametrize("atrs", [0.5, 6])
+def test_an_analysts_stop_outside_the_range_is_refused_and_the_rule_sets_the_stop(tmp_path, atrs):
+    llm = ScriptedLLM()
+    llm.replies[TickerViewDraft] = stop_at(atrs)
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+
+    result = run_once(pipeline)
+    table = result.table
+
+    # A stop the range does not allow is no reason to distrust the rest of the view, or the run.
+    assert result.status == "ok" and table.warnings == []
+    assert all(v.proposed_stop is None and "is not used" in v.data_warnings[0] for v in table.views)
+    [order] = table.orders
+    assert f"({config.SIZING_STOP_ATR_MULTIPLE:g} x ATR $" in order.reason and "analyst" not in order.reason
+    text = result.markdown_path.read_text()
+    assert f"UPA at {order.protective_stop:,.2f} (set by the sizing rule)." in text
+    assert "| none | The proposed stop of" in text
+    assert "Proposed stop for a new position" not in llm.messages(ProposalSetDraft)[0]
 
 
 def test_signal_files_validate_against_the_schema_and_match_the_journal(tmp_path):
@@ -72,7 +156,9 @@ def test_signal_files_validate_against_the_schema_and_match_the_journal(tmp_path
 
     text = result.markdown_path.read_text()
     assert "# Signals for 2026-11-13" in text and "| UPA | buy | 0.70 | accepted |" in text
-    assert "Shadow mode: nothing here was sent to a broker" in text
+    assert "Paper trading: every order here is simulated" in text and "## Orders" in text
+    assert "| UPA | buy |" in text and "Single position" in text and "Protective stops attached on fill: UPA at" in text
+    assert "Equity 100,000.00 (cash 100,000.00, positions 0.00)" in text
     assert "20 model calls" in text and "no per-token cost" in text
 
     row = pipeline.journal.runs("fake/a")[0]
@@ -88,7 +174,7 @@ def test_screen_rows_explain_every_ticker_in_the_universe(tmp_path):
     assert "Not in an uptrend" in reasons["DOWN"] and "Data not usable" in reasons["GONE"]
 
 
-# ── The shadow book across days ──────────────────────────────────────────────
+# ── The paper account across days ──────────────────────────────────────────
 
 def test_buys_fill_at_the_next_open_and_exits_are_proposed_and_filled(tmp_path):
     clock, llm = Clock(day(13)), ScriptedLLM()
@@ -101,27 +187,36 @@ def test_buys_fill_at_the_next_open_and_exits_are_proposed_and_filled(tmp_path):
     llm.replies[ProposalSetDraft] = proposals(("UPA", "sell", 0.8), ("UPB", "trim", 0.5))
     second = run_once(pipeline).table
 
-    assert [(f.ticker, f.action, f.trade_date) for f in second.fills] == [
-        ("UPA", "buy", session(16)), ("UPB", "buy", session(16)),
+    assert [(f.ticker, f.side, f.kind, f.fill_date) for f in second.fills] == [
+        ("UPA", "buy", "market", session(16)), ("UPB", "buy", "market", session(16)),
     ]
     assert [(h.ticker, h.entry_date, h.sessions_held) for h in second.holdings] == [
         ("UPA", session(16), 1), ("UPB", session(16), 1),
     ]
+    assert all(h.stop_price is not None and h.stop_price < h.last_close for h in second.holdings)
+    spent = sum(f.shares * f.price for f in second.fills)
+    assert second.account.cash == pytest.approx(100_000 - spent, abs=0.01)
+    assert second.account.equity == pytest.approx(100_000 + 0.0025 * spent, rel=1e-3)   # up 0.3%, less 0.05% slippage
     assert all(v.held for v in second.views if v.ticker in ("UPA", "UPB"))
     assert [(p.ticker, p.action, p.status) for p in second.proposals] == [
         ("UPA", "sell", "accepted"), ("UPB", "trim", "accepted"),
     ]
     briefing = llm.messages(ProposalSetDraft)[-1]
-    assert "CURRENT HOLDINGS:\n- UPA: entered 2026-11-16 at" in briefing and "unrealized +0.30%" in briefing
+    assert f"CURRENT HOLDINGS:\n- UPA: {second.holdings[0].shares} shares bought 2026-11-16 at" in briefing
+    assert "unrealized +0.25%" in briefing and "stop at" in briefing
+    assert [(d.ticker, d.side, d.verdict) for d in second.risk] == [("UPA", "sell", "approved"), ("UPB", "sell", "approved")]
 
     clock.now = day(17)
     llm.replies[ProposalSetDraft] = proposals(("UPB", "hold", 0.6))
     third = run_once(pipeline).table
 
-    assert [(f.ticker, f.action) for f in third.fills] == [("UPA", "sell"), ("UPB", "trim")]
-    assert third.fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)
+    assert [(f.ticker, f.side, f.kind) for f in third.fills] == [("UPA", "sell", "market"), ("UPB", "sell", "market")]
+    assert third.fills[0].shares == second.holdings[0].shares                  # the whole position
+    assert third.fills[0].pnl_pct == pytest.approx(0.2, abs=0.01)             # +0.3% less slippage both ways
     assert [h.ticker for h in third.holdings] == ["UPB"]
-    assert third.holdings[0].shares == pytest.approx(second.holdings[1].shares / 2, rel=1e-4)
+    assert third.holdings[0].shares == second.holdings[1].shares - second.holdings[1].shares // 2
+    stops = [o for o in book(pipeline).orders() if o.kind == "stop"]
+    assert [(o.ticker, o.shares) for o in stops] == [("UPB", third.holdings[0].shares)]   # UPA's stop went with it
     assert [(p.ticker, p.action, p.source) for p in third.proposals] == [("UPB", "hold", "portfolio_manager")]
 
 
@@ -139,7 +234,8 @@ def test_a_preset_holding_whose_view_has_turned_is_debated_and_can_be_sold(tmp_p
     assert [(d.ticker, d.trigger) for d in table.debates] == [("DOWN", "exit_signal")]
     assert [(p.ticker, p.action, p.status) for p in table.proposals] == [("DOWN", "sell", "accepted")]
     debate_prompt = llm.messages(DebateArgumentDraft)[0]
-    assert "THE DESK'S POSITION\nDOWN: entered 2026-11-10" in debate_prompt
+    assert "THE DESK'S POSITION\nDOWN: 10 shares bought 2026-11-10" in debate_prompt
+    assert [(d.ticker, d.side, d.approved_shares) for d in table.risk] == [("DOWN", "sell", 10)]
     assert "keep holding DOWN" in llm.calls[[n for n, _, _ in llm.calls].index("DebateArgumentDraft")][1]
 
 
@@ -152,7 +248,7 @@ def test_a_holding_the_portfolio_manager_ignores_is_held_by_default(tmp_path):
     assert [(p.ticker, p.action, p.source, p.status) for p in table.proposals] == [
         ("UPC", "hold", "default", "accepted"),
     ]
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(16)) == {}
+    assert waiting_orders(pipeline) == {} and table.risk == []
 
 
 def test_a_holding_without_usable_data_gets_no_view_but_still_a_decision(tmp_path):
@@ -201,12 +297,13 @@ def test_a_position_whose_split_data_disagrees_degrades_the_run_and_is_not_value
     assert any("UPA: its listed splits and its restated prices do not agree" in w for w in result.table.warnings)
     held = result.table.holdings[0]
     assert held.ticker == "UPA" and held.last_close is None and held.unrealized_pct is None
-    assert "UPA: entered 2026-11-16 at" in llm.messages(ProposalSetDraft)[-1]
+    assert f"UPA: {held.shares} shares bought 2026-11-16 at" in llm.messages(ProposalSetDraft)[-1]
     assert "no usable price data today" in llm.messages(ProposalSetDraft)[-1]
+    assert result.table.fills == []                               # its stop, far above the halved price, did not fire
 
 
 def test_a_delisted_holding_is_closed_by_the_book_and_the_days_after_are_clean(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "SHADOW_PENDING_MAX_DAYS", 4)
+    monkeypatch.setattr(config, "PAPER_STALE_DAYS", 4)
     clock, llm = Clock(day(13)), ScriptedLLM()
     pipeline = make_pipeline(tmp_path, llm, clock=clock)
     seed_position(pipeline, "fake/a", "GONE", entry_session=12)
@@ -216,30 +313,32 @@ def test_a_delisted_holding_is_closed_by_the_book_and_the_days_after_are_clean(t
     result = run_once(pipeline)
 
     assert result.status == "degraded"
-    assert [(f.ticker, f.action, f.trade_date) for f in result.table.fills] == [("GONE", "close", session(12))]
+    assert [(f.ticker, f.kind, f.fill_date) for f in result.table.fills] == [("GONE", "close", session(12))]
     assert result.table.holdings == [] and "GONE" not in [p.ticker for p in result.table.proposals]
     closing = [e for e in pipeline.journal.events(result.run_id) if e.ticker == "GONE"]
-    assert "GONE closed by the book at its 2026-11-12 close" in closing[0].remark
-    assert "closed by the book, GONE" in result.markdown_path.read_text()
+    assert "Sell 10 GONE by the broker, at the last close it could be matched to on 2026-11-12" in closing[0].remark
+    assert "GONE by the broker" in result.markdown_path.read_text()
+    assert result.table.account.cash == pytest.approx(100_000 + 1_000)     # the seeded position came back as cash
 
     clock.now = day(19)
     assert run_once(pipeline).status == "ok"                      # nothing is left to complain about
 
 
 def test_an_order_that_could_never_fill_is_dropped_out_loud(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "SHADOW_PENDING_MAX_DAYS", 2)
+    from models.trading import OrderRequest
+
+    monkeypatch.setattr(config, "PAPER_STALE_DAYS", 2)
     clock = Clock(day(18))
     pipeline = make_pipeline(tmp_path, clock=clock)
-    with pipeline.journal.transaction():
-        pipeline.journal.put_pending("fake/a", "GONE", "buy", session(13), "old-run")
+    book(pipeline).submit(OrderRequest(order_id="old", ticker="GONE", side="buy", shares=5), session(13))
 
     result = run_once(pipeline)
 
     assert result.status == "degraded"
-    assert any("GONE: buy proposed on 2026-11-13 was dropped" in w for w in result.table.warnings)
-    dropped = [e for e in pipeline.journal.events(result.run_id) if e.kind == "book_note"]
+    assert any("GONE: buy order from 2026-11-13 was cancelled" in w for w in result.table.warnings)
+    dropped = [e for e in pipeline.journal.events(result.run_id) if e.kind == "book_problem"]
     assert len(dropped) == 1 and dropped[0].speaker == "trader" and dropped[0].stage == "settle"
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(19)) == {}
+    assert waiting_orders(pipeline) == {}
 
 
 def test_fills_made_by_a_run_that_failed_later_appear_in_the_next_table(tmp_path):
@@ -251,16 +350,331 @@ def test_fills_made_by_a_run_that_failed_later_appear_in_the_next_table(tmp_path
     clock.now = day(16)
     llm.replies[TickerViewDraft] = lambda system, user: 1 / 0     # settles, then fails
     assert run_once(pipeline).status == "failed"
-    assert len(pipeline.journal.trades("fake/a")) == 1
+    assert len(book(pipeline).unreported_fills()) == 1
 
     llm.replies[TickerViewDraft] = view()
     table = run_once(pipeline).table
-    assert [(f.ticker, f.action, f.trade_date) for f in table.fills] == [("UPA", "buy", session(16))]
-    assert len(pipeline.journal.trades("fake/a")) == 1          # filled once, reported once
+    assert [(f.ticker, f.side, f.fill_date) for f in table.fills] == [("UPA", "buy", session(16))]
+    assert len(pipeline.journal.rows("SELECT 1 FROM paper_fills")) == 1       # filled once, reported once
 
-    assert run_once(pipeline, force=True).table.fills == []     # a forced rerun does not report it again
+    # A forced rerun replaces that run, and so reports the fill in its stead: once, not twice.
+    forced = run_once(pipeline, force=True).table
+    assert [(f.ticker, f.side, f.fill_date) for f in forced.fills] == [("UPA", "buy", session(16))]
+    assert len(pipeline.journal.rows("SELECT 1 FROM paper_fills")) == 1
     clock.now = day(17)
     assert run_once(pipeline).table.fills == []
+
+
+# ── The kill switch and the circuit breakers ─────────────────────────────────
+
+def test_kill_switch_file_stops_every_order_but_not_the_analysis(tmp_path, monkeypatch):
+    halt = tmp_path / "HALT"
+    halt.write_text("stop")
+    monkeypatch.setattr(config, "KILL_SWITCH_FILE", str(halt))
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7), ("DOWN", "sell", 0.8))
+    pipeline = make_pipeline(tmp_path, llm)
+    seed_position(pipeline, "fake/a", "DOWN")
+
+    result = run_once(pipeline)
+    table = result.table
+
+    assert result.status == "ok" and "kill switch file" in table.halted
+    assert [p.status for p in table.proposals] == ["accepted", "accepted"]       # the signals are still recorded
+    assert [(d.ticker, d.verdict) for d in table.risk] == [("DOWN", "rejected"), ("UPA", "rejected")]
+    assert all("Trading is halted" in d.reasons[0] for d in table.risk)
+    assert table.orders == [] and waiting_orders(pipeline) == {}
+    assert "**No order was placed.** Trading is halted" in result.markdown_path.read_text()
+
+    halt.unlink()                                                 # switch off: the same session can be run again
+    again = run_once(pipeline, force=True).table
+    assert again.halted == "" and waiting_orders(pipeline) == {"UPA": "buy", "DOWN": "sell"}
+
+
+def test_kill_switch_by_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "KILL_SWITCH_FILE", str(tmp_path / "HALT"))
+    monkeypatch.setenv("TRADING_HALT", "1")
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    table = run_once(make_pipeline(tmp_path, llm)).table
+    assert "TRADING_HALT" in table.halted and table.orders == []
+
+
+def test_drawdown_breaker_stops_new_positions_but_lets_exits_through(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "KILL_SWITCH_FILE", str(tmp_path / "HALT"))
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7), ("DOWN", "sell", 0.8))
+    pipeline = make_pipeline(tmp_path, llm)
+    seed_position(pipeline, "fake/a", "DOWN")
+    with pipeline.journal.transaction():                          # the account was once worth far more
+        pipeline.journal.write("UPDATE paper_accounts SET high_water = 125000 WHERE account = 'fake/a'")
+
+    table = run_once(pipeline).table
+
+    assert table.account.drawdown_pct > 10
+    verdicts = {d.ticker: d for d in table.risk}
+    assert verdicts["DOWN"].verdict == "approved"
+    assert verdicts["UPA"].verdict == "rejected" and "Drawdown breaker" in verdicts["UPA"].reasons[0]
+    assert waiting_orders(pipeline) == {"DOWN": "sell"}
+
+
+# ── Picking up an interrupted run ────────────────────────────────────────────
+
+class Killed(BaseException):
+    """Stands in for the process being killed: nothing in the pipeline catches it."""
+
+
+def test_a_killed_run_is_taken_up_without_fetching_data_or_asking_any_model_twice(tmp_path):
+    llm, market = ScriptedLLM(), SyntheticMarket()
+    pipeline = make_pipeline(tmp_path, llm, market=market)
+
+    def killed_at_the_last_call(system, user):
+        raise Killed()
+
+    llm.replies[ProposalSetDraft] = killed_at_the_last_call
+    with pytest.raises(Killed):
+        pipeline.run()
+    assert pipeline.journal.runs("fake/a")[0]["status"] == "running"
+    asked, fetched = len(llm.calls), len(market.requested)
+    assert asked == 7 + 3 + 9 + 1                                 # the killed call was made, and lost
+
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    result = run_once(pipeline)
+
+    assert result.status == "ok"
+    assert len(market.requested) == fetched                       # the saved snapshot was used
+    assert len(llm.calls) == asked + 1                            # only the call that never returned
+    assert result.table.usage.calls == 1
+    assert len(result.table.views) == 3 and len(result.table.debates) == 3 and result.table.regime is not None
+    statuses = [row["status"] for row in pipeline.journal.runs("fake/a")]
+    assert statuses == ["ok", "failed"]                           # the killed run is on record as failed
+
+    # The resumed run records the meeting again from the saved answers. The macro view was
+    # already formed and saved by the killed run, so it is reused like any earlier one.
+    kinds = [e.kind for e in pipeline.journal.events(result.run_id)]
+    assert kinds.count("view") == 3 and kinds.count("argument") == 6 and kinds.count("ruling") == 3
+    assert kinds[0] == "macro_view_reused" and result.table.regime_reused_from == session(13)
+
+
+def test_a_run_killed_while_placing_orders_places_each_exactly_once(tmp_path, monkeypatch):
+    import execution.placement as placement
+
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7), ("UPB", "buy", 0.6), ("UPC", "buy", 0.6))
+    pipeline = make_pipeline(tmp_path, llm)
+    real_submit, submitted = PaperBroker.submit, []
+
+    def killed_after_the_second(self, request, when):
+        if len(submitted) == 2:
+            raise Killed()
+        submitted.append(request.ticker)
+        return real_submit(self, request, when)
+
+    monkeypatch.setattr(PaperBroker, "submit", killed_after_the_second)
+    with pytest.raises(Killed):
+        pipeline.run()
+    assert sorted(waiting_orders(pipeline)) == ["UPA", "UPB"]
+    states = dict(pipeline.journal.rows("SELECT order_id, state FROM order_log"))
+    assert sorted(states.values()) == ["confirmed", "confirmed", "intent"]
+
+    monkeypatch.undo()
+    result = run_once(pipeline)
+
+    assert result.status == "ok" and sorted(waiting_orders(pipeline)) == ["UPA", "UPB", "UPC"]
+    assert len(book(pipeline).orders()) == 3                      # three orders, not five
+    assert all(state == "confirmed" for _, state in pipeline.journal.rows("SELECT order_id, state FROM order_log"))
+
+
+def test_a_sync_problem_is_still_reported_when_the_run_is_taken_up_again(tmp_path, monkeypatch):
+    from models.trading import OrderRequest
+
+    monkeypatch.setattr(config, "PAPER_STALE_DAYS", 2)
+    llm = ScriptedLLM()
+    pipeline = make_pipeline(tmp_path, llm, clock=Clock(day(18)))
+    book(pipeline).submit(OrderRequest(order_id="old", ticker="GONE", side="buy", shares=5), session(13))
+
+    def killed(system, user):
+        raise Killed()
+
+    llm.replies[ProposalSetDraft] = killed
+    with pytest.raises(Killed):
+        pipeline.run()                                           # the sync has cancelled the stale order by now
+
+    llm.replies[ProposalSetDraft] = proposals()
+    result = run_once(pipeline)
+
+    assert result.status == "degraded"                           # not "ok": the day did have a problem
+    assert any("GONE: buy order from 2026-11-13 was cancelled" in w for w in result.table.warnings)
+    assert [e.kind for e in pipeline.journal.events(result.run_id)][0] == "book_problem"
+
+
+def test_a_forced_run_that_dies_does_not_leave_the_session_counted_as_done(tmp_path):
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+    first = run_once(pipeline)
+
+    def killed(system, user):
+        raise Killed()
+
+    llm.replies[ProposalSetDraft] = killed
+    with pytest.raises(Killed):
+        pipeline.run(force=True)
+
+    statuses = {row["run_id"]: row["status"] for row in pipeline.journal.runs("fake/a")}
+    assert statuses[first.run_id] == "superseded"
+    assert pipeline.journal.completed_run("fake/a", session(13)) is None
+    assert waiting_orders(pipeline) == {"UPA": "buy"}            # the earlier order stands until a decision replaces it
+
+    llm.replies[ProposalSetDraft] = proposals(("UPB", "buy", 0.7))
+    result = run_once(pipeline)                                  # an ordinary run: not skipped, it takes the session up
+
+    assert result.status == "ok" and waiting_orders(pipeline) == {"UPB": "buy"}
+    events = pipeline.journal.events(result.run_id)
+    withdrawn = [e for e in events if e.kind == "order_withdrawn"]
+    assert len(withdrawn) == 1 and withdrawn[0].ticker == "UPA" and "Taken back: buy" in withdrawn[0].remark
+    assert [row["order_id"] for row in pipeline.journal.rows("SELECT order_id FROM order_log")] == [
+        result.table.orders[0].order_id,
+    ]
+
+
+def test_a_forced_run_that_decides_a_different_size_replaces_the_order(tmp_path, monkeypatch):
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+    first = run_once(pipeline).table.orders[0]
+
+    monkeypatch.setattr(config, "RISK_MAX_POSITION_PCT", 5)      # the limit is halved, then the session is run again
+    result = run_once(pipeline, force=True)
+
+    [order] = book(pipeline).orders()
+    assert order.order_id == first.order_id and order.shares == first.shares // 2
+    replaced = [e for e in pipeline.journal.events(result.run_id) if e.kind == "order_withdrawn"]
+    assert len(replaced) == 1 and replaced[0].remark.startswith(f"Replaced: buy {first.shares} UPA")
+    assert pipeline.journal.rows("SELECT state FROM order_log")[0]["state"] == "confirmed"
+
+
+def test_a_forced_run_killed_while_replacing_an_order_can_still_be_taken_up(tmp_path, monkeypatch):
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+    first = run_once(pipeline).table.orders[0]
+    monkeypatch.setattr(config, "RISK_MAX_POSITION_PCT", 5)
+    real_withdraw = PaperBroker.withdraw
+
+    def withdraw_then_die(self, order_id):
+        real_withdraw(self, order_id)
+        raise Killed()
+
+    monkeypatch.setattr(PaperBroker, "withdraw", withdraw_then_die)
+    with pytest.raises(Killed):
+        pipeline.run(force=True)
+    monkeypatch.setattr(PaperBroker, "withdraw", real_withdraw)
+    [still_there] = book(pipeline).orders()                      # the withdrawal was undone with everything else
+    assert still_there.shares == first.shares
+
+    result = run_once(pipeline)                                  # twice over, to be sure nothing is stuck
+    assert result.status == "ok" and book(pipeline).orders()[0].shares == first.shares // 2
+    assert run_once(pipeline).status == "skipped" and len(book(pipeline).orders()) == 1
+
+
+def test_kill_switch_set_after_a_crash_takes_back_the_orders_already_placed(tmp_path, monkeypatch):
+    halt = tmp_path / "HALT"
+    monkeypatch.setattr(config, "KILL_SWITCH_FILE", str(halt))
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7), ("UPB", "buy", 0.6), ("UPC", "buy", 0.6))
+    pipeline = make_pipeline(tmp_path, llm)
+    real_submit, submitted = PaperBroker.submit, []
+
+    def killed_after_the_second(self, request, when):
+        if len(submitted) == 2:
+            raise Killed()
+        submitted.append(request.ticker)
+        return real_submit(self, request, when)
+
+    monkeypatch.setattr(PaperBroker, "submit", killed_after_the_second)
+    with pytest.raises(Killed):
+        pipeline.run()
+    monkeypatch.setattr(PaperBroker, "submit", real_submit)
+    assert len(waiting_orders(pipeline)) == 2
+
+    halt.write_text("stop")                                      # the user pulls the switch, then runs again
+    result = run_once(pipeline)
+
+    assert result.status == "ok" and "kill switch file" in result.table.halted and result.table.orders == []
+    assert waiting_orders(pipeline) == {}                        # nothing is left to fill tomorrow
+    assert pipeline.journal.rows("SELECT 1 FROM order_log") == []
+    kinds = [e.kind for e in pipeline.journal.events(result.run_id)]
+    assert kinds.count("order_withdrawn") == 2 and "order_placed" not in kinds
+
+
+def test_a_saved_answer_is_not_reused_for_a_question_that_has_changed(tmp_path, monkeypatch):
+    llm = ScriptedLLM()
+    llm.replies[TickerViewDraft] = by_ticker({"UPB": LLMError("timed out")}, view())
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+    real_submit = PaperBroker.submit
+
+    def killed(self, request, when):
+        raise Killed()
+
+    monkeypatch.setattr(PaperBroker, "submit", killed)           # dies after the portfolio manager has answered
+    with pytest.raises(Killed):
+        pipeline.run()
+    monkeypatch.setattr(PaperBroker, "submit", real_submit)
+    asked = llm.count(ProposalSetDraft)
+
+    llm.replies[TickerViewDraft] = view()                        # this time the analyst reaches UPB
+    llm.replies[ProposalSetDraft] = proposals(("UPB", "buy", 0.7))
+    result = run_once(pipeline)
+
+    # The manager now sees a view it did not have before, so its earlier answer does not apply.
+    assert llm.count(ProposalSetDraft) == asked + 1
+    assert [v.ticker for v in result.table.views] == ["UPA", "UPB", "UPC"]
+    assert waiting_orders(pipeline) == {"UPB": "buy"}
+    assert llm.count(TickerViewDraft) == 3 + 1                   # UPA's and UPC's views were kept, UPB's asked again
+
+
+def test_a_saved_answer_that_no_longer_fits_what_is_asked_for_is_asked_again(tmp_path, monkeypatch):
+    llm = ScriptedLLM()
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    pipeline = make_pipeline(tmp_path, llm)
+    real_submit = PaperBroker.submit
+
+    def killed(self, request, when):
+        raise Killed()
+
+    monkeypatch.setattr(PaperBroker, "submit", killed)
+    with pytest.raises(Killed):
+        pipeline.run()
+    monkeypatch.setattr(PaperBroker, "submit", real_submit)
+    calls = len(llm.calls)
+
+    # As if the run had been killed by a version whose analyst was not yet asked for a stop.
+    with pipeline.journal.transaction():
+        rows = pipeline.journal.rows("SELECT key, value_json FROM checkpoints WHERE key LIKE 'view:%'")
+        assert len(rows) == 3
+        for row in rows:
+            old = re.sub(r'"stop_price":[^,]*,', "", row["value_json"])
+            assert old != row["value_json"]
+            pipeline.journal.write("UPDATE checkpoints SET value_json = ? WHERE key = ?", (old, row["key"]))
+
+    result = run_once(pipeline)
+
+    assert result.status == "ok" and waiting_orders(pipeline) == {"UPA": "buy"}
+    assert len(llm.calls) == calls + 3                           # the three views, and nothing else
+
+
+def test_force_starts_a_session_over_and_asks_every_model_again(tmp_path):
+    llm, market = ScriptedLLM(), SyntheticMarket()
+    pipeline = make_pipeline(tmp_path, llm, market=market)
+    run_once(pipeline)
+    asked, fetched = len(llm.calls), len(market.requested)
+
+    run_once(pipeline, force=True)
+
+    assert len(market.requested) == fetched + 2                   # screened and collected again
+    assert len(llm.calls) == asked + 3 + 9 + 1                    # everything but the macro view, which is reused
 
 
 # ── Running more than once ───────────────────────────────────────────────────
@@ -298,12 +712,12 @@ def test_forcing_a_rerun_replaces_that_sessions_orders_and_fills_nothing_twice(t
 
     assert second.status == "ok" and second.run_id != first.run_id
     assert second.table.regime_reused_from == session(13)        # the macro team is not asked again
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(16)) == {"UPB": "buy"}
+    assert waiting_orders(pipeline) == {"UPB": "buy"}                      # UPA's order was taken back
 
     clock.now = day(16)
     table = run_once(pipeline).table
-    assert [(f.ticker, f.action) for f in table.fills] == [("UPB", "buy")]
-    assert len(pipeline.journal.trades("fake/a")) == 1
+    assert [(f.ticker, f.side) for f in table.fills] == [("UPB", "buy")]
+    assert len(pipeline.journal.rows("SELECT 1 FROM paper_fills")) == 1
 
 
 # ── The macro view over time ─────────────────────────────────────────────────
@@ -569,30 +983,41 @@ def test_the_open_arriving_while_models_work_fails_the_run_and_queues_nothing(tm
     result = run_once(pipeline)
 
     assert result.status == "failed" and "TooLate" in result.message and "already trading" in result.message
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(17)) == {}
+    assert waiting_orders(pipeline) == {}
     assert pipeline.journal.completed_run("fake/a", session(13)) is None
 
 
-def test_a_run_that_is_still_going_is_not_started_twice(tmp_path):
-    clock, llm = Clock(day(13)), ScriptedLLM()
-    pipeline = make_pipeline(tmp_path, llm, clock=clock)
-    pipeline.journal.start_run("other-process", "fake/a", session(13), day(13))
+def dead_pid():
+    """The id of a process that has already ended."""
+    import subprocess, sys
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    return finished.pid
 
-    clock.now = day(13).replace(hour=23)                                 # half an hour later
+
+def test_a_run_that_is_still_going_in_another_process_is_not_started_twice(tmp_path):
+    import os
+
+    llm = ScriptedLLM()
+    pipeline = make_pipeline(tmp_path, llm)
+    pipeline.journal.start_run("other-process", "fake/a", session(13), day(13), pid=os.getppid())
+
     waiting = run_once(pipeline)
     assert waiting.status == "blocked" and waiting.run_id == "other-process" and llm.calls == []
-    assert "has not finished" in waiting.message and "--force" in waiting.message
+    assert "is still going" in waiting.message and "stop that process" in waiting.message
 
-    assert run_once(pipeline, force=True).status == "ok"                 # the user says it crashed
+    forced = run_once(pipeline, force=True)                              # two runs placing orders cannot both be right
+    assert forced.status == "blocked" and llm.calls == []
+    assert pipeline.journal.runs("fake/a")[0]["status"] == "running"     # and the live run is left alone
 
 
-def test_a_run_left_unfinished_long_ago_does_not_block_a_new_one(tmp_path):
-    clock = Clock(day(13))
-    pipeline = make_pipeline(tmp_path, clock=clock)
-    pipeline.journal.start_run("crashed", "fake/a", session(13), day(13))
+def test_a_run_whose_process_has_died_is_marked_failed_and_taken_up(tmp_path):
+    pipeline = make_pipeline(tmp_path)
+    pipeline.journal.start_run("crashed", "fake/a", session(13), day(13), pid=dead_pid())
 
-    clock.now = datetime(2026, 11, 14, 6, 0, tzinfo=timezone.utc)       # seven and a half hours later
     assert run_once(pipeline).status == "ok"
+    rows = {row["run_id"]: row for row in pipeline.journal.runs("fake/a")}
+    assert rows["crashed"]["status"] == "failed" and "ended before the run finished" in rows["crashed"]["error"]
 
 
 def test_a_run_before_the_next_open_is_allowed_and_a_finished_session_is_still_skipped(tmp_path):
@@ -617,7 +1042,7 @@ def test_an_unexpected_error_while_collecting_data_is_recorded(tmp_path):
     assert pipeline.journal.runs("fake/a")[0]["status"] == "failed"
 
 
-def test_if_the_run_cannot_be_recorded_its_orders_are_not_queued(tmp_path, monkeypatch):
+def test_if_the_run_cannot_be_recorded_the_next_one_finds_its_orders_and_places_none_twice(tmp_path, monkeypatch):
     llm = ScriptedLLM()
     llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
     pipeline = make_pipeline(tmp_path, llm)
@@ -634,8 +1059,16 @@ def test_if_the_run_cannot_be_recorded_its_orders_are_not_queued(tmp_path, monke
 
     assert attempts == ["ok", "failed"]
     assert result.status == "failed" and "database is locked" in result.message
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(16)) == {}
     assert pipeline.journal.completed_run("fake/a", session(13)) is None
+    placed = book(pipeline).orders()
+    assert [(o.ticker, o.side) for o in placed] == [("UPA", "buy")]     # the order went out before the failure
+
+    calls = len(llm.calls)
+    again = run_once(pipeline)                                           # no force: it picks up where it stopped
+
+    assert again.status == "ok" and len(llm.calls) == calls              # no model was asked again
+    assert book(pipeline).orders() == placed                             # and the order was not placed twice
+    assert [o.order_id for o in again.table.orders] == [placed[0].order_id]
 
 
 def test_data_for_a_different_session_than_the_run_is_refused(tmp_path):
@@ -658,7 +1091,7 @@ def test_cost_limit_stops_the_run_and_leaves_no_orders(tmp_path, monkeypatch):
     assert len(llm.calls) == 4                                  # the fifth call is never made
     row = pipeline.journal.runs("fake/a")[0]
     assert row["cost_usd"] == 2.0 and row["llm_calls"] == 4
-    assert ShadowBook(pipeline.journal, "fake/a").waiting(before=session(16)) == {}
+    assert waiting_orders(pipeline) == {}
 
 
 def test_priced_runs_record_their_cost(tmp_path):
@@ -725,7 +1158,7 @@ def test_every_utterance_is_recorded_in_order_with_speaker_and_listener(tmp_path
     events = pipeline.journal.events(first.run_id)
     assert [e.seq for e in events] == list(range(1, len(events) + 1))
     assert [e.stage for e in events] == (
-        ["macro"] * 8 + ["views"] * 3 + ["debate"] * 3 + ["proposals"] + ["checks"] * 2
+        ["macro"] * 8 + ["views"] * 3 + ["debate"] * 3 + ["proposals"] + ["checks"] * 2 + ["risk"] + ["orders"]
     )
     spoken = [(e.speaker, e.addressed_to, e.kind, e.is_llm) for e in events]
     assert spoken[0] == ("central_bank", "all", "assessment", True)
@@ -738,7 +1171,10 @@ def test_every_utterance_is_recorded_in_order_with_speaker_and_listener(tmp_path
     assert spoken[14] == ("portfolio_manager", "risk_officer", "proposals", True)
     assert spoken[15:] == [
         ("risk_officer", "trader", "accepted", False), ("risk_officer", "portfolio_manager", "rejected", False),
+        ("risk_officer", "trader", "risk_reduced", False), ("trader", "all", "order_placed", False),
     ]
+    assert events[17].remark.startswith("Reduced: buy UPA,") and "Single position" in events[17].remark
+    assert events[18].remark.startswith("Placed: buy ") and "UPA at the next open, stop at" in events[18].remark
     # What a model said is kept as it said it; what code did is stated plainly.
     assert events[8].remark == "I would own this one." and events[8].ticker == "UPA"
     assert events[8].payload["direction"] == "bullish"
@@ -749,7 +1185,7 @@ def test_every_utterance_is_recorded_in_order_with_speaker_and_listener(tmp_path
     second = run_once(pipeline)
     opening = pipeline.journal.events(second.run_id)[:2]
     assert (opening[0].stage, opening[0].speaker, opening[0].kind, opening[0].ticker) == ("settle", "trader", "fill", "UPA")
-    assert "Buy UPA filled at the 2026-11-16 open" in opening[0].remark
+    assert opening[0].remark.startswith("Buy ") and "UPA at the open on 2026-11-16" in opening[0].remark
     assert (opening[1].speaker, opening[1].kind) == ("pipeline", "macro_view_reused")
 
 
@@ -829,8 +1265,9 @@ def test_command_line_runs_and_reports_where_the_signals_are(offline_cli, tmp_pa
     assert daily.main(["--quiet"]) == 0
     out = capsys.readouterr().out
 
-    assert "Shadow mode: signals only, no orders. Arms: fake/cli" in out
-    assert "fake/cli: ok" in out and "3 views, 3 debates, 1 accepted proposal(s)" in out
+    assert "Paper trading: simulated orders only. Arms: fake/cli" in out
+    assert "fake/cli: ok" in out and "3 views, 3 debates, 1 accepted proposal(s), 1 order(s) placed" in out
+    assert "paper account: equity 100,000.00, cash 100,000.00" in out
     assert "signals.md" in out and "no per-token cost" in out
     assert len(list((tmp_path / "runs").rglob("signals.json"))) == 1
 
@@ -845,10 +1282,12 @@ def test_command_line_exits_nonzero_when_a_run_fails(offline_cli, capsys):
 
 
 def test_command_line_exits_nonzero_when_an_unfinished_run_blocks_the_session(offline_cli, capsys, tmp_path):
-    Journal(tmp_path / "journal.sqlite3").start_run("crashed", "fake/cli", session(13), day(13))
+    import os
+
+    Journal(tmp_path / "journal.sqlite3").start_run("running", "fake/cli", session(13), day(13), pid=os.getppid())
     assert daily.main(["--quiet"]) == 1
     assert "fake/cli: blocked" in capsys.readouterr().out
-    assert daily.main(["--quiet", "--force"]) == 0
+    assert daily.main(["--quiet", "--force"]) == 1
 
 
 def test_command_line_reports_a_bad_arm_or_universe_file(offline_cli, capsys, tmp_path):

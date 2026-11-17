@@ -1,8 +1,10 @@
 """The decision journal: one SQLite file that records what every run did.
 
 It holds the runs themselves, every event (who said what to whom, in order),
-the macro view each model configuration last formed, and each configuration's
-shadow book. The dashboard and the evaluation read this file and nothing else.
+the macro view each model configuration last formed, the paper broker's
+books (accounts, positions, orders, fills, daily equity), the pipeline's log
+of the orders it meant to place, and the checkpoints an interrupted run
+resumes from. The dashboard and the evaluation read this file and nothing else.
 
 Rows are keyed by "arm": the name of a model configuration. Two arms can read
 the same data on the same day and keep entirely separate records.
@@ -10,6 +12,7 @@ the same data on the same day and keep entirely separate records.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -21,7 +24,7 @@ from models.signals import Event, MacroRegime, SignalTable, UsageSummary
 
 # Bumped whenever a table changes. A journal written under another number is
 # refused rather than read wrongly.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -30,7 +33,7 @@ CREATE TABLE IF NOT EXISTS runs (
     session_date  TEXT NOT NULL,
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
-    status        TEXT NOT NULL,          -- running, ok, degraded, failed
+    status        TEXT NOT NULL,          -- running, ok, degraded, failed, superseded
     error         TEXT,
     snapshot_path TEXT,
     llm_calls     INTEGER,
@@ -38,7 +41,8 @@ CREATE TABLE IF NOT EXISTS runs (
     output_tokens INTEGER,
     model_seconds REAL,
     cost_usd      REAL,
-    signals_json  TEXT
+    signals_json  TEXT,
+    pid           INTEGER                 -- the process that ran it, to tell a live run from a dead one
 );
 CREATE INDEX IF NOT EXISTS runs_by_arm ON runs (arm, session_date);
 
@@ -65,38 +69,100 @@ CREATE TABLE IF NOT EXISTS regimes (
     PRIMARY KEY (arm, session_date)
 );
 
-CREATE TABLE IF NOT EXISTS shadow_positions (
-    arm           TEXT NOT NULL,
-    ticker        TEXT NOT NULL,
-    shares        REAL NOT NULL,
-    entry_price   REAL NOT NULL,
-    entry_date    TEXT NOT NULL,
-    last_adjusted TEXT NOT NULL,          -- the session whose share scale the position is on
-    anchor_close  REAL NOT NULL,          -- the ticker's close on that session, on that scale
-    out_of_sync_since TEXT,               -- first run that could not bring it onto the current scale
-    PRIMARY KEY (arm, ticker)
+-- The paper broker's own books. One account per model configuration.
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    account      TEXT PRIMARY KEY,
+    cash         REAL NOT NULL,
+    initial_cash REAL NOT NULL,
+    high_water   REAL NOT NULL,           -- highest equity at any session's close
+    last_session TEXT                     -- the last session the book was brought up to
 );
 
-CREATE TABLE IF NOT EXISTS shadow_pending (
-    arm              TEXT NOT NULL,
-    ticker           TEXT NOT NULL,
-    action           TEXT NOT NULL,       -- buy, sell, trim
-    proposed_session TEXT NOT NULL,
-    run_id           TEXT NOT NULL,
-    PRIMARY KEY (arm, ticker)
+CREATE TABLE IF NOT EXISTS paper_positions (
+    account           TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    shares            INTEGER NOT NULL,
+    avg_cost          REAL NOT NULL,
+    entry_date        TEXT NOT NULL,
+    sector            TEXT NOT NULL,
+    last_adjusted     TEXT NOT NULL,      -- the session whose share scale the position is on
+    anchor_close      REAL NOT NULL,      -- the ticker's close on that session, on that scale
+    out_of_sync_since TEXT,               -- first sync that could not bring it onto the current scale
+    last_close        REAL,               -- close at the last sync, NULL when the data was unusable
+    sessions_held     INTEGER NOT NULL,
+    PRIMARY KEY (account, ticker)
 );
 
-CREATE TABLE IF NOT EXISTS shadow_trades (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    arm              TEXT NOT NULL,
-    ticker           TEXT NOT NULL,
-    action           TEXT NOT NULL,       -- buy, sell, trim, or close (closed by the book itself)
-    shares           REAL NOT NULL,
-    price            REAL NOT NULL,
-    trade_date       TEXT NOT NULL,
-    proposed_session TEXT NOT NULL,
-    pnl_pct          REAL,
-    reported_run_id  TEXT                 -- the run whose signal table listed this fill
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id        TEXT PRIMARY KEY,
+    account         TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    kind            TEXT NOT NULL,        -- market, limit, stop
+    shares          INTEGER NOT NULL,
+    limit_price     REAL,
+    stop_price      REAL,
+    protective_stop REAL,
+    day_only        INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL,        -- open, filled, cancelled, expired, rejected
+    created_session TEXT NOT NULL,
+    filled_price    REAL,
+    filled_date     TEXT,
+    note            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS paper_orders_open ON paper_orders (account, status);
+
+CREATE TABLE IF NOT EXISTS paper_fills (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account         TEXT NOT NULL,
+    order_id        TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    kind            TEXT NOT NULL,        -- market, limit, stop, close
+    shares          INTEGER NOT NULL,
+    price           REAL NOT NULL,
+    fill_date       TEXT NOT NULL,
+    pnl_pct         REAL,
+    note            TEXT NOT NULL,
+    reported_run_id TEXT                  -- the run whose signal table listed this fill
+);
+
+-- What each sync found, so that syncing again to the same session can say it again.
+CREATE TABLE IF NOT EXISTS paper_syncs (
+    account      TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    result_json  TEXT NOT NULL,
+    PRIMARY KEY (account, session_date)
+);
+
+CREATE TABLE IF NOT EXISTS paper_equity (
+    account         TEXT NOT NULL,
+    session_date    TEXT NOT NULL,
+    cash            REAL NOT NULL,
+    positions_value REAL NOT NULL,
+    equity          REAL NOT NULL,
+    PRIMARY KEY (account, session_date)
+);
+
+-- The pipeline's own record of each order it meant to place, kept apart from
+-- the broker's books so the two can be compared after a crash.
+CREATE TABLE IF NOT EXISTS order_log (
+    order_id     TEXT PRIMARY KEY,
+    account      TEXT NOT NULL,
+    run_id       TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    state        TEXT NOT NULL            -- intent, submitted, confirmed
+);
+
+-- Outputs of finished stages, so an interrupted run can pick up where it stopped.
+CREATE TABLE IF NOT EXISTS checkpoints (
+    arm          TEXT NOT NULL,           -- "*" for what all arms share
+    session_date TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value_json   TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date, key)
 );
 """
 
@@ -174,17 +240,54 @@ class Journal:
     def _commit(self) -> None:
         self._db.commit()
 
-    def _require_transaction(self) -> None:
+    # ── Plain access, for the modules that keep their own tables here ────
+
+    def rows(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        return self._db.execute(sql, params).fetchall()
+
+    def write(self, sql: str, params: tuple = ()) -> None:
+        """Run one changing statement. Only inside a transaction."""
         if self._depth == 0:
-            raise JournalError("The shadow book may only be changed inside Journal.transaction().")
+            raise JournalError("Books may only be changed inside Journal.transaction().")
+        self._db.execute(sql, params)
+
+    # ── Checkpoints ──────────────────────────────────────────────────────
+
+    def checkpoint(self, arm: str, session: date, key: str) -> str | None:
+        row = self._db.execute(
+            "SELECT value_json FROM checkpoints WHERE arm = ? AND session_date = ? AND key = ?",
+            (arm, session.isoformat(), key),
+        ).fetchone()
+        return row["value_json"] if row else None
+
+    def save_checkpoint(self, arm: str, session: date, key: str, value_json: str) -> None:
+        with self.transaction():
+            self._db.execute(
+                "INSERT OR REPLACE INTO checkpoints VALUES (?, ?, ?, ?)",
+                (arm, session.isoformat(), key, value_json),
+            )
+
+    def clear_checkpoints(self, arm: str, session: date) -> None:
+        with self.transaction():
+            self._db.execute(
+                "DELETE FROM checkpoints WHERE arm = ? AND session_date = ?", (arm, session.isoformat())
+            )
+
+    def prune_checkpoints(self, before: date) -> None:
+        """Drop checkpoints of sessions before `before`: nothing can resume them any more."""
+        with self.transaction():
+            self._db.execute("DELETE FROM checkpoints WHERE session_date < ?", (before.isoformat(),))
 
     # ── Runs ─────────────────────────────────────────────────────────────
 
-    def start_run(self, run_id: str, arm: str, session: date, started_at: datetime) -> None:
+    def start_run(
+        self, run_id: str, arm: str, session: date, started_at: datetime, pid: int | None = None,
+    ) -> None:
         with self.transaction():
             self._db.execute(
-                "INSERT INTO runs (run_id, arm, session_date, started_at, status) VALUES (?, ?, ?, ?, 'running')",
-                (run_id, arm, session.isoformat(), started_at.isoformat()),
+                "INSERT INTO runs (run_id, arm, session_date, started_at, status, pid) "
+                "VALUES (?, ?, ?, ?, 'running', ?)",
+                (run_id, arm, session.isoformat(), started_at.isoformat(), os.getpid() if pid is None else pid),
             )
 
     def finish_run(
@@ -210,10 +313,29 @@ class Journal:
         ).fetchone()
         return row["run_id"] if row else None
 
+    def supersede_runs(self, arm: str, session: date) -> list[str]:
+        """Mark the finished runs of a session as replaced, when that session is started over.
+
+        From then on the session counts as not done, so if the run replacing
+        them dies, the next one takes the session up instead of skipping it.
+        Returns the ids of the runs replaced.
+        """
+        marks = ",".join("?" * len(COMPLETED))
+        with self.transaction():
+            replaced = [row["run_id"] for row in self._db.execute(
+                f"SELECT run_id FROM runs WHERE arm = ? AND session_date = ? AND status IN ({marks})",
+                (arm, session.isoformat(), *COMPLETED),
+            )]
+            self._db.execute(
+                f"UPDATE runs SET status = 'superseded' WHERE arm = ? AND session_date = ? AND status IN ({marks})",
+                (arm, session.isoformat(), *COMPLETED),
+            )
+        return replaced
+
     def running_run(self, arm: str, session: date) -> sqlite3.Row | None:
         """The latest run for this arm and session that started and never finished, if any."""
         return self._db.execute(
-            "SELECT run_id, started_at FROM runs WHERE arm = ? AND session_date = ? AND status = 'running' "
+            "SELECT run_id, started_at, pid FROM runs WHERE arm = ? AND session_date = ? AND status = 'running' "
             "ORDER BY started_at DESC, rowid DESC LIMIT 1",
             (arm, session.isoformat()),
         ).fetchone()
@@ -263,84 +385,16 @@ class Journal:
         ).fetchone()
         return MacroRegime.model_validate_json(row["regime_json"]) if row else None
 
-    # ── Shadow book ──────────────────────────────────────────────────────
-    # The writes below do not commit on their own: the shadow book wraps each
-    # of its updates in one transaction so a crash cannot leave it half applied.
+    # ── What the books hold ──────────────────────────────────────────────
 
-    def positions(self, arm: str) -> list[sqlite3.Row]:
-        return self._db.execute("SELECT * FROM shadow_positions WHERE arm = ? ORDER BY ticker", (arm,)).fetchall()
-
-    def put_position(
-        self, arm: str, ticker: str, shares: float, entry_price: float, entry_date: date,
-        last_adjusted: date, anchor_close: float, out_of_sync_since: date | None = None,
-    ) -> None:
-        self._require_transaction()
-        self._db.execute(
-            "INSERT OR REPLACE INTO shadow_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (arm, ticker, shares, entry_price, entry_date.isoformat(), last_adjusted.isoformat(), anchor_close,
-             out_of_sync_since.isoformat() if out_of_sync_since else None),
-        )
-
-    def drop_position(self, arm: str, ticker: str) -> None:
-        self._require_transaction()
-        self._db.execute("DELETE FROM shadow_positions WHERE arm = ? AND ticker = ?", (arm, ticker))
-
-    def pending(self, arm: str) -> list[sqlite3.Row]:
-        return self._db.execute(
-            "SELECT * FROM shadow_pending WHERE arm = ? ORDER BY proposed_session, ticker", (arm,)
-        ).fetchall()
-
-    def put_pending(self, arm: str, ticker: str, action: str, proposed_session: date, run_id: str) -> None:
-        self._require_transaction()
-        self._db.execute(
-            "INSERT OR REPLACE INTO shadow_pending VALUES (?, ?, ?, ?, ?)",
-            (arm, ticker, action, proposed_session.isoformat(), run_id),
-        )
-
-    def drop_pending(self, arm: str, ticker: str) -> None:
-        self._require_transaction()
-        self._db.execute("DELETE FROM shadow_pending WHERE arm = ? AND ticker = ?", (arm, ticker))
-
-    def drop_pending_from(self, arm: str, proposed_session: date) -> None:
-        self._require_transaction()
-        self._db.execute(
-            "DELETE FROM shadow_pending WHERE arm = ? AND proposed_session = ?", (arm, proposed_session.isoformat())
-        )
-
-    def add_trade(
-        self, arm: str, ticker: str, action: str, shares: float, price: float, trade_date: date,
-        proposed_session: date, pnl_pct: float | None,
-    ) -> None:
-        self._require_transaction()
-        self._db.execute(
-            "INSERT INTO shadow_trades (arm, ticker, action, shares, price, trade_date, proposed_session, pnl_pct) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (arm, ticker, action, shares, price, trade_date.isoformat(), proposed_session.isoformat(), pnl_pct),
-        )
-
-    def trades(self, arm: str) -> list[sqlite3.Row]:
-        return self._db.execute("SELECT * FROM shadow_trades WHERE arm = ? ORDER BY id", (arm,)).fetchall()
-
-    def unreported_trades(self, arm: str) -> list[sqlite3.Row]:
-        """Fills that no finished run has listed yet."""
-        return self._db.execute(
-            "SELECT * FROM shadow_trades WHERE arm = ? AND reported_run_id IS NULL ORDER BY id", (arm,)
-        ).fetchall()
-
-    def mark_trades_reported(self, arm: str, run_id: str) -> None:
-        self._require_transaction()
-        self._db.execute(
-            "UPDATE shadow_trades SET reported_run_id = ? WHERE arm = ? AND reported_run_id IS NULL", (run_id, arm)
-        )
-
-    def book_tickers(self, arms: list[str]) -> list[str]:
-        """Every ticker any of these arms holds or has an order waiting on."""
-        if not arms:
+    def book_tickers(self, accounts: list[str]) -> list[str]:
+        """Every ticker any of these paper accounts holds or has an open order on."""
+        if not accounts:
             return []
-        marks = ",".join("?" * len(arms))
+        marks = ",".join("?" * len(accounts))
         rows = self._db.execute(
-            f"SELECT ticker FROM shadow_positions WHERE arm IN ({marks}) "
-            f"UNION SELECT ticker FROM shadow_pending WHERE arm IN ({marks}) ORDER BY ticker",
-            (*arms, *arms),
+            f"SELECT ticker FROM paper_positions WHERE account IN ({marks}) "
+            f"UNION SELECT ticker FROM paper_orders WHERE status = 'open' AND account IN ({marks}) ORDER BY ticker",
+            (*accounts, *accounts),
         )
         return [row["ticker"] for row in rows]

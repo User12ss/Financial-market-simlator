@@ -7,7 +7,7 @@ The model provider is configurable. By default it runs open-source models on you
 There are two ways to use it:
 
 - **Research mode** (`main.py`, `app.py`): describe a policy scenario and get a report on how markets might react. Most of this document describes it.
-- **Daily trading pipeline** (`python -m pipeline.daily`): a fixed pipeline that turns each day's market data into buy, sell, hold and trim signals for US stocks. It runs in **shadow mode**: it records signals and keeps a hypothetical book, and places no orders. See [Daily Trading Pipeline](#daily-trading-pipeline-shadow-mode).
+- **Daily trading pipeline** (`python -m pipeline.daily`): a fixed pipeline that turns each day's market data into buy, sell, hold and trim signals for US stocks, sizes them, puts them through a risk gate and places the result with a **paper broker**. Every order is simulated: there is no real broker and no real money. See [Daily Trading Pipeline](#daily-trading-pipeline-paper-trading).
 
 Nothing this system produces is financial advice. Its outputs are model outputs, and there is no evidence yet that they beat a benchmark; `docs/UPGRADE_PLAN.md` describes how that is to be tested.
 
@@ -282,7 +282,7 @@ The check is lenient on purpose. A figure passes if any number shown rounds to i
 ### Structured Output
 Every structured call is validated against a Pydantic model. Ollama and OpenAI-compatible services get a JSON schema constraint; Claude uses the SDK's structured outputs. A reply that fails validation is retried with the error shown to the model. For Claude, system prompts are cached via `cache_control`.
 
-## Daily Trading Pipeline (shadow mode)
+## Daily Trading Pipeline (paper trading)
 
 ```bash
 python -m pipeline.daily              # run for the last completed US session
@@ -290,44 +290,64 @@ python -m pipeline.daily --status     # past runs, and progress towards the stag
 python -m pipeline.daily --arm ollama:qwen2.5-coder:7b --arm anthropic:claude-haiku-5-5   # compare two models
 ```
 
-Other options: `--force` (run a session again), `--refresh-macro` (form a new macro view now), `--universe FILE`, `--quiet`.
+Other options: `--force` (start a session over), `--refresh-macro` (form a new macro view now), `--universe FILE`, `--quiet`.
 
 The stages run in an order fixed in code. Models work inside a stage and never choose the next one.
 
 | Stage | Who | What happens |
 |---|---|---|
-| Data | code | Screen the universe on price, liquidity and trend. Take one snapshot of the candidates and of everything the book holds. |
-| Settle | code | Fill earlier proposals in the shadow book at the open of the session after they were made. |
+| Data | code | Screen the universe on price, liquidity and trend. Take one snapshot of the candidates and of everything the account holds or has an order on. |
+| Settle | code | Bring the paper account up to the session: dividends, splits, stops, fills at the open, equity at the close. |
 | Macro | 7 models, then code | Each macro agent assesses the current state of its domain. Code combines the stances into the desk's macro view: the stance with the most confidence behind it, and sector tilts only where more than one agent's worth of confidence agrees. Reused for a week. |
-| Views | 1 model | The ticker analyst writes one view per candidate and per holding: direction, confidence, horizon, invalidation, cited data. |
+| Views | 1 model | The ticker analyst writes one view per candidate and per holding: direction, confidence, horizon, invalidation, cited data and, for a candidate it is bullish on, the price it would put the stop at. |
 | Debate | 3 models | Bull, bear and judge argue the strongest new candidates and any holding whose view has turned. |
 | Proposals | 1 model | The portfolio manager proposes buy, sell, hold or trim. |
 | Checks | code | Each proposal is accepted or rejected by rule. Every holding gets a decision; a missing one is "hold". |
+| Risk | code | Each accepted proposal is sized, then the risk gate approves it, reduces it or rejects it, with the reason. |
+| Orders | code | What passed is placed with the paper broker, to fill at the next session's open. |
 
 **Models propose, code decides.** A model's output is a draft. Code checks it and keeps it, or refuses it and records why. Nothing is repaired silently: a confidence outside 0 to 1 is refused, not clamped. The rules for proposals:
 
 - The ticker must be one of today's candidates or holdings. Only the first proposal for a ticker counts.
 - A buy needs a checked analyst view of that ticker that is bullish, no ruling against it from the judge, a current macro view, and room in the book.
-- Sell, trim and hold apply only to positions the book holds, and a position with an exit already waiting gets no second order.
-- Buys are taken in order of confidence until the book is full. A position being sold today still counts as held.
+- Sell, trim and hold apply only to positions the account holds, and a position with an exit already waiting gets no second order.
 
-These rules are also what limits the damage of a persuaded model. Headlines are outside text, and a model can be talked into things; code still only lets it buy a screened candidate that the analyst and the judge did not reject, up to the position limit, or exit what the book already holds.
+These rules are also what limits the damage of a persuaded model. Headlines are outside text, and a model can be talked into things; code still only lets it buy a screened candidate that the analyst and the judge did not reject, with a stop inside a fixed range, the same money at risk wherever in that range the stop is, and limits it has no say in, or exit what the account already holds.
 
-**When to run it.** After the close, once closing prices are published, and before the next session opens. Yahoo Finance can take hours after the close to publish them; until then the run fails with a message saying so and can simply be repeated. Once the next session has opened the run is refused: its signals would rest on that day's news and prices, and would be filled at an open that has already passed. The same check is made again after the data is collected and before orders are queued, so a run that is overtaken by the open queues nothing. With a local 7B model a run takes five to eight minutes.
+**Sizing.** A model says what and how sure; code says how much. A buy risks a fixed share of equity (`SIZING_RISK_PCT`, scaled by the lower of the manager's and the analyst's confidence) between the last close and a protective stop below it. The share count is that money divided by the distance to the stop as it will be placed, so a wider stop means fewer shares and the loss at the stop is never more than that money. The risk gate can then only cut the count further: with the placeholder limits, the single-position limit binds whenever the stop is closer than about a tenth of the price, and then a closer stop means less money at risk, not more shares. A sell exits the whole position, a trim half.
 
-A session that already has signals is skipped, so the command is safe to schedule and to repeat. A run that started less than six hours ago and has not finished is taken to be still going: the command reports `blocked` and exits non-zero, and `--force` overrides it after a crash.
+**Where the stop goes.** The analyst may name a stop for a candidate it is bullish on, with the level in the data it sits under. Code uses it only when it is between `SIZING_STOP_MIN_ATR_MULTIPLE` and `SIZING_STOP_MAX_ATR_MULTIPLE` ATRs below the last close, and never closer than `SIZING_MIN_STOP_PCT` of the price. A stop outside that range is refused, not moved to the nearest allowed price, and the view says so; the rest of the view stands. (A stop that is not a number at all fails the reply as a whole, like any other malformed field.) Figures in the reason are traced to the data like those in the thesis. A closer stop is hit more easily, on the entry day included, and a gap at the open costs more against it. With no usable stop from the analyst, the stop is `SIZING_STOP_ATR_MULTIPLE` ATRs below the close. The report shows, for every order, which of the two set its stop. A position already held keeps the stop it was opened with.
 
-**When a run does not count.** A run fails, and proposes nothing, when the price source is down, when fewer than half the universe has usable prices for the session, when the next session is already trading, when the model is unreachable, or when the cost limit is reached. A run that finished but lost model calls, had outputs refused, had data missing, or could not analyse something the book holds is marked `degraded`.
+**The risk gate.** Every sized order is approved, reduced or rejected. All limits are settings, enforced in code, and every cut is recorded with the limit and the number that broke it:
 
-**The shadow book.** Shadow mode has no broker, so each accepted proposal is treated as an order for a fixed dollar amount that fills at the next session's open. This gives the portfolio manager real positions to hold, trim and sell. It has no cash balance, dividends or slippage. Splits are handled: the price source restates all earlier prices after a split, so positions are moved onto each new snapshot's share scale before anything is filled or valued. The move is only made when the listed split and the restated prices agree; when they do not, the position is left unvalued, its orders wait, and the run is marked degraded. A position that runs have found without a usable, consistent price for more than `SHADOW_PENDING_MAX_DAYS` days, such as a delisted one, is closed by the book at the last close it could trust. Days on which the pipeline did not run are not counted.
+- Long only. No position, no sell; a sell is cut to what is held.
+- Whitelist, minimum price, minimum dollar volume, usable data.
+- No buy without a protective stop below the price.
+- Largest loss per trade if the stop is hit, largest single position, largest sector, minimum cash, most positions, most new positions in a day, most turnover in a day.
+- Circuit breakers: after a day's loss or a drawdown beyond the limit, no new buying. Exits still go through.
+- Kill switch: while the file `data_store/HALT` exists, or `TRADING_HALT=1` is set, no order of any kind is placed. The analysis still runs and is recorded.
+
+**The paper broker.** A simulated account matched against daily bars. Per session, in this order: dividends are paid; stops on existing positions trigger (at the open if the session gaps below the stop, otherwise at the stop); limit orders fill at the limit or better; market orders fill at the open, sells before buys; and a position opened that day is then checked against its own stop. Orders fill whole or not at all, and market and stop fills are made worse by `PAPER_SLIPPAGE_BPS`. A buy carries its protective stop, which becomes a standing order when the buy fills and follows the position through trims and splits; adding to a position never loosens it. A buy that would fill at or below its own stop is not made: the stop was set from the last close, and a session that opens through it has undone the reason for the trade. There is no intraday path, no partial fill and no fee, so results are kinder than a real market's.
+
+The gate checks its limits against the last close, and orders fill at the next open. A gap can therefore leave a position somewhat larger, or its risk to the stop somewhat greater, than what was approved. A buy the cash cannot pay for is rejected whole.
+
+Splits: the price source restates all earlier prices after a split, so positions and their orders are moved onto each new snapshot's share scale before anything is matched. The move is only made when the listed split and the restated prices agree; when they do not, the position is left unvalued, its orders wait, and the run is marked degraded. A position that syncs have found without a usable, consistent price for more than `PAPER_STALE_DAYS` days, such as a delisted one, is closed at the last close it could be matched to.
+
+**When to run it.** After the close, once closing prices are published, and before the next session opens. Yahoo Finance can take hours after the close to publish them; until then the run fails with a message saying so and can simply be repeated. Once the next session has opened the run is refused: its signals would rest on that day's news and prices, and would be filled at an open that has already passed. The same check is made again after the data is collected and before orders are placed. With a local 7B model a run takes five to eight minutes.
+
+**Running it again.** A session that already has signals is skipped, so the command is safe to schedule and to repeat. A run that was killed or crashed is taken up where it stopped: the data it collected and every model answer it received were saved as they arrived, so nothing is fetched or asked twice, and every order has an id fixed by the decision behind it, so none is placed twice. While another process is still running the same session, the command reports `blocked` and exits non-zero, `--force` included. `--force` starts the session over from scratch.
+
+Whenever a session is decided again, for whatever reason, the orders that stand are the ones the latest decision asks for: just before placing, anything an earlier attempt placed that is no longer wanted, or is wanted differently, is taken back. Setting the kill switch and running again therefore also takes back orders that were already placed for that session.
+
+**When a run does not count.** A run fails, and places nothing, when the price source is down, when fewer than half the universe has usable prices for the session, when the next session is already trading, when the model is unreachable, or when the cost limit is reached. A run that finished but lost model calls, had outputs refused, had data missing, or could not analyse or price something the account holds is marked `degraded`.
 
 **Checked citations.** The analyst names the data points it relied on (`rsi14`, `sma50`, `trailing_pe`, ...) with their values. Code compares each with the snapshot and records mismatches on the view, along with any figure in the text that appears nowhere in the data shown. The portfolio manager and the judge see these warnings.
 
-**What is recorded.** Each run writes `signals.json` and `signals.md` under `data_store/runs/<session>/<run id>/`, and everything goes into the SQLite journal at `data_store/journal.sqlite3`: runs with their cost, every event (who said what to whom, in order, in the model's own words), macro views, and the shadow book with its trades. Orders, the fills a run reported and the run's final status are saved in one transaction. The journal carries a format number, and a file written under another format is refused, not misread. It uses SQLite's write-ahead log, which adds `-wal` and `-shm` files beside it and needs a local disk: do not point `JOURNAL_PATH` at a network or synced folder.
+**What is recorded.** Each run writes `signals.json` and `signals.md` under `data_store/runs/<session>/<run id>/`, and everything goes into the SQLite journal at `data_store/journal.sqlite3`: runs with their cost, every event (who said what to whom, in order, in the model's own words), macro views, and the paper account's positions, orders, fills and daily equity. The journal carries a format number, and a file written under another format is refused, not misread. It uses SQLite's write-ahead log, which adds `-wal` and `-shm` files beside it and needs a local disk: do not point `JOURNAL_PATH` at a network or synced folder.
 
-**Comparing models.** Each `--arm` is a model configuration. All arms read the same data snapshot; each keeps its own signals and its own shadow book.
+**Comparing models.** Each `--arm` is a model configuration. All arms read the same data snapshot; each keeps its own signals and its own paper account.
 
-Each stage of the larger plan has an exit test. For this one it is five trading sessions in a row without error, with at least one sell or trim accepted along the way; `--status` shows where that stands.
+Each stage of the larger plan has an exit test; `--status` shows where the signal stage's stands (five trading sessions in a row without error, with at least one sell or trim accepted along the way).
 
 ## Configuration
 
@@ -360,13 +380,31 @@ Set these in `.env` (see `.env.example`):
 | `PIPELINE_DEBATE_TOP` | `3` | New candidates debated each day |
 | `PIPELINE_DEBATE_ROUNDS` | `1` | Rounds per debate |
 | `PIPELINE_MAX_COST_USD` | `2.0` | A run stops once its model calls have cost this much |
-| `SHADOW_POSITION_USD` | `10000` | Dollars per shadow position |
-| `SHADOW_MAX_POSITIONS` | `10` | Most positions the shadow book may hold |
-| `SHADOW_PENDING_MAX_DAYS` | `10` | An order with no usable price is dropped after this many days, and a position with none is closed |
+| `PAPER_INITIAL_CASH` | `100000` | Cash a new paper account starts with |
+| `PAPER_SLIPPAGE_BPS` | `5` | Every market and stop fill is worse by this many basis points |
+| `PAPER_STALE_DAYS` | `10` | An order with no usable price is cancelled after this many days, and a position with none is closed |
+| `SIZING_RISK_PCT` | `1.0` | Percent of equity risked on a new position at full confidence |
+| `SIZING_STOP_ATR_MULTIPLE` | `2.0` | Without a usable stop from the analyst, the protective stop is this many ATRs below the last close |
+| `SIZING_MIN_STOP_PCT` | `1.0` | The stop is never closer to the price than this percent |
+| `SIZING_STOP_MIN_ATR_MULTIPLE` | `1.0` | The analyst's own stop is used only when it is at least this many ATRs below the last close |
+| `SIZING_STOP_MAX_ATR_MULTIPLE` | `4.0` | And at most this many |
+| `RISK_MAX_POSITION_PCT` | `10` | Largest single position, percent of equity |
+| `RISK_MAX_SECTOR_PCT` | `30` | Largest sector, percent of equity |
+| `RISK_MAX_POSITIONS` | `10` | Most positions held at once |
+| `RISK_MIN_CASH_PCT` | `10` | Cash kept back, percent of equity |
+| `RISK_MAX_TRADE_RISK_PCT` | `1.0` | Largest loss on one new position if its stop is hit, percent of equity |
+| `RISK_MAX_NEW_POSITIONS_PER_DAY` | `3` | Most positions opened in one day |
+| `RISK_MAX_DAILY_TURNOVER_PCT` | `30` | Value of one day's orders, percent of equity |
+| `RISK_DAILY_LOSS_LIMIT_PCT` | `3` | A day's loss at which new buying stops |
+| `RISK_MAX_DRAWDOWN_PCT` | `10` | Drawdown from the high at which new buying stops |
+| `RISK_MIN_PRICE` | `5` | Lowest share price the gate lets through |
+| `RISK_MIN_DOLLAR_VOLUME` | `20000000` | Lowest 20-day average dollar volume the gate lets through |
+| `RISK_MAX_LIMIT_DEVIATION_PCT` | `5` | Furthest a limit price may be from the last close |
+| `KILL_SWITCH_FILE` | `data_store/HALT` | While this file exists no order is placed. `TRADING_HALT=1` does the same |
 | `JOURNAL_PATH` | `data_store/journal.sqlite3` | The SQLite journal |
 | `RUNS_DIR` | `data_store/runs` | Where signal tables are written |
 
-The pipeline's numbers are placeholders, not recommendations.
+The pipeline's numbers, the risk limits included, are conservative placeholders, not recommendations. Set them before relying on any result.
 
 ## Example Scenarios
 
@@ -390,14 +428,21 @@ financial-market-sim/
 ├── .env                   # API key (not committed)
 ├── .env.example           # Template for .env
 ├── pipeline/
-│   ├── daily.py           # The fixed daily pipeline (shadow mode) and its command line
+│   ├── daily.py           # The fixed daily pipeline (paper trading) and its command line
 │   ├── universe.py        # Ticker universe and the rule-based candidate screen
 │   ├── macro.py           # Combines the macro agents' assessments by rule
 │   ├── checks.py          # Rules between model output and what is kept
-│   ├── shadow.py          # Shadow book: hypothetical fills at the next open
 │   └── report.py          # Briefings and the Markdown signal table
+├── portfolio/
+│   └── sizing.py          # How many shares an accepted proposal becomes, and its stop
+├── risk/
+│   └── gate.py            # Hard limits on every order; kill switch
+├── execution/
+│   ├── broker.py          # What the pipeline needs from any broker
+│   ├── paper.py           # Paper broker: matching against daily bars, splits, dividends, equity
+│   └── placement.py       # Three-step order placement that survives a crash
 ├── journal/
-│   └── store.py           # SQLite journal: runs, events, macro views, shadow book
+│   └── store.py           # SQLite journal: runs, events, macro views, paper books, checkpoints
 ├── agents/
 │   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager
 │   ├── base.py            # BaseAgent: scenario analysis, deliberation, current-state assessment
@@ -423,7 +468,8 @@ financial-market-sim/
 ├── models/
 │   ├── scenario.py        # Pydantic model for parsed scenarios
 │   ├── report.py          # Pydantic models for agent output and reports
-│   └── signals.py         # Pydantic models for the pipeline's signals
+│   ├── signals.py         # Pydantic models for the pipeline's signals
+│   └── trading.py         # Orders, fills, positions, accounts, risk decisions
 └── utils/
     ├── llm_client.py      # One LLM interface over Ollama, OpenAI-compatible and Claude
     ├── text_overlap.py    # Detects agents copying each other's text

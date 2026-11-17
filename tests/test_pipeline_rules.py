@@ -1,17 +1,20 @@
-"""The deterministic parts of the daily pipeline: screen, macro view, output checks, shadow book."""
+"""The deterministic parts of the daily pipeline: screen, macro view, output checks, journal."""
 
 from datetime import date
 
 import pytest
 
-from data.models import CorporateAction
+import config
+from agents.ticker.analyst import TickerAnalyst
 from data.snapshot import SnapshotBuilder
 from journal.store import Journal, JournalError
-from models.signals import DomainAssessment, Holding, SectorCall, TradeProposal
+from models import signals
+from models.signals import DomainAssessment, Draft, SectorCall
+from models.trading import Position
 from pipeline import universe as universe_rules
 from pipeline.checks import check_assessment, check_proposals, check_ruling, check_view
 from pipeline.macro import combine, render_regime
-from pipeline.shadow import ShadowBook
+from pipeline.report import render_view
 from tests.pipeline_fakes import (
     Clock, NoNews, SteadyMacro, SyntheticMarket, assessment, day, proposals, ruling, session, view,
 )
@@ -233,6 +236,112 @@ def test_a_view_built_with_a_non_finite_number_is_still_refused():
     assert checked is None and "a cited value is not a number" in reason
 
 
+def test_every_field_a_model_fills_in_is_required():
+    # Hosts that enforce the schema strictly refuse one with optional fields, so "may be null" is
+    # written as a required field that allows null.
+    drafts = [c for c in vars(signals).values() if isinstance(c, type) and issubclass(c, Draft) and c is not Draft]
+    assert len(drafts) >= 6
+    for draft in drafts:
+        schema = draft.model_json_schema()
+        assert set(schema["required"]) == set(schema["properties"]), draft.__name__
+
+
+def test_the_analyst_is_told_the_range_its_stop_has_to_be_in():
+    low, high = config.SIZING_STOP_MIN_ATR_MULTIPLE, config.SIZING_STOP_MAX_ATR_MULTIPLE
+    assert f"between {low:g} and {high:g} times the ATR(14) shown in the data" in TickerAnalyst.system_prompt
+    assert "The one exception is stop_price" in TickerAnalyst.system_prompt
+
+
+def stop_below(item, atrs):
+    """A stop this many ATRs under the item's last close, as a model reading the data would give it."""
+    return round(item.price.close - atrs * item.technicals.atr14, 2)
+
+
+def test_a_proposed_stop_inside_the_range_is_kept_with_its_reason():
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    stop = stop_below(item, 3)
+
+    checked, reason = check_view("UPA", session(13), False, view(stop=stop), item, [])
+
+    assert reason == "" and checked.data_warnings == []
+    assert (checked.proposed_stop, checked.stop_reason) == (stop, "Just below the 50-day average.")
+    assert f"Proposed stop for a new position: {stop:,.2f}. Just below the 50-day average." in render_view(checked)
+
+
+@pytest.mark.parametrize("atrs, why", [
+    (0.5, "and the nearest allowed is"), (5, "and the furthest allowed is"), (-1, "it is not below the"),
+])
+def test_a_proposed_stop_outside_the_range_is_left_out_and_the_view_is_kept(atrs, why):
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    stop = stop_below(item, atrs)
+
+    checked, reason = check_view("UPA", session(13), False, view(stop=stop), item, [])
+
+    assert reason == "" and checked.direction == "bullish"
+    assert (checked.proposed_stop, checked.stop_reason) == (None, "")
+    [warning] = checked.data_warnings
+    assert warning.startswith(f"The proposed stop of {stop:,.2f} is not used: ") and why in warning
+    assert "Proposed stop" not in render_view(checked).split("(Automatic data check")[0]
+
+
+@pytest.mark.parametrize("direction, held", [("bearish", False), ("neutral", False), ("bullish", True)])
+def test_a_stop_is_only_for_opening_a_position(direction, held):
+    # Not bullish: nothing will be bought. Already held: the position keeps the stop it was opened with.
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+
+    checked, _ = check_view("UPA", session(13), held, view(direction, stop=stop_below(item, 3)), item, [])
+
+    assert (checked.proposed_stop, checked.stop_reason, checked.data_warnings) == (None, "", [])
+    assert "stop" not in render_view(checked).lower()
+
+
+def test_a_proposed_stop_cannot_be_judged_without_an_atr():
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    stop = stop_below(item, 3)
+
+    checked, _ = check_view("UPA", session(13), False, view(stop=stop), item.model_copy(update={"technicals": None}), [])
+
+    assert checked.proposed_stop is None
+    assert checked.data_warnings == [
+        f"The proposed stop of {stop:,.2f} is not used: there is no usable close and ATR to judge it by."
+    ]
+
+
+def test_figures_in_the_reason_for_a_stop_are_traced_like_any_other_claim_about_the_data():
+    # The reason reaches the debaters and the manager, who would otherwise take a made-up level as data.
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    stop = stop_below(item, 3)
+    draft = view(stop=stop)
+    draft.stop_reason = f"At {stop:.2f}, just below support at 31,415.92."
+
+    checked, _ = check_view("UPA", session(13), False, draft, item, [])
+    assert checked.proposed_stop == stop
+    [warning] = checked.data_warnings
+    assert "1 figure(s) not found" in warning and "31,415.92" in warning and f"{stop:.2f}" not in warning
+
+    checked, _ = check_view("UPA", session(13), False, draft, item, ["a level of 31,415.92"])
+    assert checked.data_warnings == []
+
+
+def test_the_stop_is_the_analysts_own_number_only_while_it_is_kept():
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    kept, refused = stop_below(item, 3), stop_below(item, 0.5)
+
+    checked, _ = check_view("UPA", session(13), False, view(thesis=f"I would be out at {kept:.2f}.", stop=kept), item, [])
+    assert checked.data_warnings == []
+
+    checked, _ = check_view("UPA", session(13), False, view(thesis=f"I would be out at {refused:.2f}.", stop=refused), item, [])
+    assert len(checked.data_warnings) == 2
+    assert f"{refused:.2f}" in checked.data_warnings[0] and "not found in the data" in checked.data_warnings[0]
+    assert "is not used" in checked.data_warnings[1]
+
+
+def test_a_view_without_a_stop_says_nothing_about_one():
+    item = snapshot_for(["UPA"]).tickers["UPA"]
+    checked, _ = check_view("UPA", session(13), False, view(), item, [])
+    assert checked.proposed_stop is None and checked.data_warnings == [] and "stop" not in render_view(checked).lower()
+
+
 def test_ruling_with_bad_confidence_is_refused():
     record, reason = check_ruling("UPA", "top_candidate", [], ruling(confidence=3))
     assert record is None and "judge's confidence" in reason
@@ -243,7 +352,7 @@ def test_ruling_with_bad_confidence_is_refused():
 # ── Proposals ────────────────────────────────────────────────────────────────
 
 def holding(ticker):
-    return Holding(ticker=ticker, shares=10, entry_price=100.0, entry_date=session(10))
+    return Position(ticker=ticker, shares=10, avg_cost=100.0, entry_date=session(10), value=1000.0)
 
 
 def checked_view(ticker, direction="bullish"):
@@ -380,473 +489,59 @@ def test_a_position_being_sold_and_a_waiting_buy_both_still_take_room():
     assert room[("UPA", "buy")].status == "accepted"
 
 
-# ── Shadow book ──────────────────────────────────────────────────────────────
+# ── The journal's guarantees ─────────────────────────────────────────────────
 
 @pytest.fixture
 def journal(tmp_path):
     return Journal(tmp_path / "journal.sqlite3")
 
 
-def order(ticker, action):
-    return TradeProposal(ticker=ticker, action=action, confidence=0.6, reason="r", status="accepted")
+def put(journal, key):
+    journal.write("INSERT INTO checkpoints VALUES ('a', '2026-11-13', ?, 'x')", (key,))
 
 
-def open_on(snapshot, ticker, when):
-    bars = snapshot.tickers[ticker].bars
-    return bars.open[bars.dates.index(when)]
-
-
-def test_buy_fills_at_the_next_open_for_a_fixed_amount(journal):
-    book = ShadowBook(journal, "a", position_usd=10_000)
-    book.queue([order("UPA", "buy")], session(13), "run1")
-
-    assert book.settle(snapshot_for(["UPA"], on=13)) == ([], [])       # its fill price does not exist yet
-    snapshot = snapshot_for(["UPA"], on=16)
-    fills, notes = book.settle(snapshot)
-
-    price = open_on(snapshot, "UPA", session(16))
-    assert notes == [] and len(fills) == 1
-    assert (fills[0].action, fills[0].trade_date, fills[0].price, fills[0].pnl_pct) == ("buy", session(16), price, None)
-    assert fills[0].shares == pytest.approx(10_000 / price)
-    held = book.holdings(snapshot)[0]
-    assert held.entry_date == session(16) and held.entry_price == pytest.approx(price, abs=1e-4)
-    assert held.sessions_held == 1 and held.unrealized_pct == pytest.approx(0.3, abs=0.01)
-    assert book.settle(snapshot) == ([], [])                           # nothing fills twice
-
-
-def test_a_skipped_day_still_fills_at_the_first_open_after_the_proposal(journal):
-    book = ShadowBook(journal, "a")
-    book.queue([order("UPA", "buy")], session(13), "run1")
-
-    fills, _ = book.settle(snapshot_for(["UPA"], on=18))
-    assert fills[0].trade_date == session(16)
-
-
-def test_sell_closes_the_position_and_trim_halves_it(journal):
-    book = ShadowBook(journal, "a", position_usd=10_000)
-    book.queue([order("UPA", "buy"), order("UPB", "buy")], session(13), "run1")
-    book.settle(snapshot_for(["UPA", "UPB"], on=16))
-    book.queue([order("UPA", "sell"), order("UPB", "trim")], session(16), "run2")
-
-    snapshot = snapshot_for(["UPA", "UPB"], on=17)
-    fills, _ = book.settle(snapshot)
-    by_ticker = {fill.ticker: fill for fill in fills}
-
-    assert by_ticker["UPA"].action == "sell" and by_ticker["UPA"].pnl_pct == pytest.approx(0.3, abs=0.01)
-    assert by_ticker["UPB"].action == "trim" and by_ticker["UPB"].pnl_pct == pytest.approx(0.2, abs=0.01)
-    held = book.holdings(snapshot)
-    assert [h.ticker for h in held] == ["UPB"]
-    assert held[0].shares == pytest.approx(by_ticker["UPB"].shares)       # half was sold, half remains
-    assert [row["action"] for row in journal.trades("a")] == ["buy", "buy", "sell", "trim"]
-
-
-def test_order_waits_when_there_is_no_usable_price_and_is_dropped_after_the_limit(journal):
-    book = ShadowBook(journal, "a", pending_max_days=5)
-    book.queue([order("GONE", "buy")], session(13), "run1")
-
-    assert book.settle(snapshot_for(["GONE"], on=17)) == ([], [])
-    assert book.waiting(before=session(17)) == {"GONE": "buy"}
-    fills, notes = book.settle(snapshot_for(["GONE"], on=19))
-
-    assert fills == [] and "was dropped, no usable opening price" in notes[0]
-    assert book.waiting(before=session(20)) == {}
-
-
-def test_nothing_is_filled_from_data_the_quality_checks_rejected(journal):
-    book = ShadowBook(journal, "a")
-    book.queue([order("UPA", "buy")], session(13), "run1")
-
-    broken = snapshot_for(["UPA"], on=16, market=SyntheticMarket(volume={"UPA": 0.0}))
-    assert not broken.tickers["UPA"].usable and session(16) in broken.tickers["UPA"].bars.dates
-    assert book.settle(broken) == ([], [])
-    assert book.waiting(before=session(17)) == {"UPA": "buy"}
-
-    fills, _ = book.settle(snapshot_for(["UPA"], on=17))            # the data is good again the next day
-    assert fills[0].trade_date == session(16)
-
-
-def test_orders_that_no_longer_make_sense_are_dropped_with_a_note(journal):
-    book = ShadowBook(journal, "a")
-    book.queue([order("UPA", "sell")], session(13), "run1")
-    fills, notes = book.settle(snapshot_for(["UPA"], on=16))
-    assert fills == [] and "there is no position" in notes[0]
-
-
-def bought_on_16(journal):
-    book = ShadowBook(journal, "a", position_usd=10_000)
-    book.queue([order("UPA", "buy")], session(13), "run1")
-    snapshot = snapshot_for(["UPA"], on=16)
-    book.settle(snapshot)
-    return book, book.holdings(snapshot)[0]
-
-
-def split_on(number, ratio=2.0):
-    return SyntheticMarket(splits={("UPA", session(number)): ratio})
-
-
-def test_fake_prices_are_restated_after_a_split_as_the_real_source_does():
-    before = snapshot_for(["UPA"], on=16).tickers["UPA"].bars
-    after = snapshot_for(["UPA"], on=17, market=split_on(17)).tickers["UPA"].bars
-
-    assert after.close[-2] == pytest.approx(before.close[-1] / 2, abs=1e-3)     # the 16th, restated
-    assert after.close[-1] / after.close[-2] == pytest.approx(1.003)             # no gap on the split day
-
-
-def test_split_changes_share_count_and_entry_price_but_not_the_result(journal):
-    book, before = bought_on_16(journal)
-
-    snapshot = snapshot_for(["UPA"], on=17, market=split_on(17))
-    assert CorporateAction(date=session(17), kind="split", value=2.0) in snapshot.tickers["UPA"].actions
-    book.settle(snapshot)
-    after = book.holdings(snapshot)[0]
-
-    assert after.shares == pytest.approx(before.shares * 2)
-    assert after.entry_price == pytest.approx(before.entry_price / 2, abs=1e-3)
-    assert after.unrealized_pct == pytest.approx(0.6, abs=0.02)          # two sessions of +0.3%, not -50%
-    book.settle(snapshot)
-    assert book.holdings(snapshot)[0].shares == pytest.approx(after.shares)   # applied once
-
-    # The day after, the position is checked against its close on the split day, on the new scale.
-    following = snapshot_for(["UPA"], on=18, market=split_on(17))
-    assert book.settle(following) == ([], [])
-    later = book.holdings(following)[0]
-    assert later.shares == pytest.approx(after.shares) and later.unrealized_pct == pytest.approx(0.9, abs=0.03)
-
-
-def test_a_buy_filled_from_a_bar_before_the_split_is_not_adjusted_twice(journal):
-    # Proposed on the 13th, no run on the 16th, settled on the 17th, the day of a split.
-    # The 16th's open in that snapshot is already on the new share scale.
-    split_book = ShadowBook(journal, "split", position_usd=10_000)
-    plain_book = ShadowBook(journal, "plain", position_usd=10_000)
-    for book in (split_book, plain_book):
-        book.queue([order("UPA", "buy")], session(13), "run1")
-    split_snapshot = snapshot_for(["UPA"], on=17, market=split_on(17))
-    plain_snapshot = snapshot_for(["UPA"], on=17)
-    split_fills, _ = split_book.settle(split_snapshot)
-    plain_book.settle(plain_snapshot)
-
-    with_split, without = split_book.holdings(split_snapshot)[0], plain_book.holdings(plain_snapshot)[0]
-    assert split_fills[0].trade_date == session(16)
-    assert with_split.shares == pytest.approx(without.shares * 2)
-    assert with_split.entry_price == pytest.approx(without.entry_price / 2, abs=1e-3)
-    assert with_split.unrealized_pct == pytest.approx(0.6, abs=0.02) == pytest.approx(without.unrealized_pct, abs=0.01)
-    assert with_split.shares * with_split.entry_price == pytest.approx(10_000, rel=1e-4)
-
-    # The next day must not apply the split a second time.
-    split_next, plain_next = snapshot_for(["UPA"], on=18, market=split_on(17)), snapshot_for(["UPA"], on=18)
-    split_book.settle(split_next)
-    plain_book.settle(plain_next)
-    with_split, without = split_book.holdings(split_next)[0], plain_book.holdings(plain_next)[0]
-    assert with_split.shares == pytest.approx(without.shares * 2)
-    assert with_split.unrealized_pct == pytest.approx(0.9, abs=0.03) == pytest.approx(without.unrealized_pct, abs=0.01)
-
-
-def test_sale_on_the_day_of_a_split_uses_the_new_share_count(journal):
-    book, before = bought_on_16(journal)
-    book.queue([order("UPA", "sell")], session(16), "run2")
-
-    fills, _ = book.settle(snapshot_for(["UPA"], on=17, market=split_on(17)))
-
-    assert fills[0].shares == pytest.approx(before.shares * 2)
-    assert fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)
-
-
-def test_a_sale_filled_from_a_bar_before_the_split_keeps_its_true_result(journal):
-    # Sell proposed on the 16th, no run on the 17th, settled on the 18th, the day of a split.
-    book, before = bought_on_16(journal)
-    book.queue([order("UPA", "sell")], session(16), "run2")
-
-    fills, _ = book.settle(snapshot_for(["UPA"], on=18, market=split_on(18)))
-
-    assert fills[0].trade_date == session(17)
-    assert fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)               # not about -50%
-    assert fills[0].shares == pytest.approx(before.shares * 2)
-
-
-def test_trim_then_split_leaves_half_the_position_on_the_new_scale(journal):
-    book, before = bought_on_16(journal)
-    book.queue([order("UPA", "trim")], session(16), "run2")
-    book.settle(snapshot_for(["UPA"], on=17))
-
-    snapshot = snapshot_for(["UPA"], on=18, market=split_on(18))
-    book.settle(snapshot)
-    after = book.holdings(snapshot)[0]
-
-    assert after.shares == pytest.approx(before.shares / 2 * 2)
-    assert after.unrealized_pct == pytest.approx(0.9, abs=0.03)
-
-
-def test_a_split_on_a_day_the_data_was_unusable_is_applied_when_the_data_returns(journal):
-    book, before = bought_on_16(journal)
-
-    # The 17th: the split has happened but the ticker's data is rejected.
-    broken = snapshot_for(["UPA"], on=17, market=SyntheticMarket(splits={("UPA", session(17)): 2.0}, volume={"UPA": 0.0}))
-    assert not broken.tickers["UPA"].usable
-    book.settle(broken)
-    unpriced = book.holdings(broken)[0]
-    assert unpriced.shares == pytest.approx(before.shares)                # untouched, and not valued
-    assert unpriced.last_close is None and unpriced.unrealized_pct is None
-
-    snapshot = snapshot_for(["UPA"], on=18, market=split_on(17))
-    book.settle(snapshot)
-    after = book.holdings(snapshot)[0]
-    assert after.shares == pytest.approx(before.shares * 2)
-    assert after.unrealized_pct == pytest.approx(0.9, abs=0.03)
-
-
-def test_two_splits_between_runs_are_both_applied(journal):
-    book, before = bought_on_16(journal)
-    market = SyntheticMarket(splits={("UPA", session(17)): 2.0, ("UPA", session(18)): 3.0})
-
-    snapshot = snapshot_for(["UPA"], on=18, market=market)                # no run on the 17th
-    assert book.settle(snapshot) == ([], [])
-    after = book.holdings(snapshot)[0]
-
-    assert after.shares == pytest.approx(before.shares * 6)
-    assert after.entry_price == pytest.approx(before.entry_price / 6, abs=1e-3)
-    assert after.unrealized_pct == pytest.approx(0.9, abs=0.03)
-
-
-def test_a_reverse_split_shrinks_the_share_count(journal):
-    book, before = bought_on_16(journal)
-
-    snapshot = snapshot_for(["UPA"], on=17, market=split_on(17, ratio=0.25))
-    assert book.settle(snapshot) == ([], [])
-    after = book.holdings(snapshot)[0]
-
-    assert after.shares == pytest.approx(before.shares / 4)
-    assert after.entry_price == pytest.approx(before.entry_price * 4, abs=1e-2)
-    assert after.unrealized_pct == pytest.approx(0.6, abs=0.02)
-
-
-def test_an_exit_waiting_through_unusable_days_and_two_splits_fills_with_its_true_result(journal):
-    book, before = bought_on_16(journal)
-    book.queue([order("UPA", "trim")], session(16), "run2")
-    splits = {("UPA", session(17)): 2.0, ("UPA", session(18)): 3.0}
-
-    for number in (17, 18):                                               # data rejected on both split days
-        broken = snapshot_for(["UPA"], on=number, market=SyntheticMarket(splits=splits, volume={"UPA": 0.0}))
-        assert book.settle(broken) == ([], [])
-
-    snapshot = snapshot_for(["UPA"], on=19, market=SyntheticMarket(splits=splits))
-    fills, notes = book.settle(snapshot)
-
-    assert notes == [] and fills[0].trade_date == session(17)
-    assert fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)
-    assert fills[0].shares == pytest.approx(before.shares * 6 / 2)
-    assert book.holdings(snapshot)[0].shares == pytest.approx(before.shares * 6 / 2)
-
-
-def test_prices_restated_without_a_listed_split_leave_the_position_unvalued(journal):
-    book, before = bought_on_16(journal)
-    book.queue([order("UPA", "sell")], session(16), "run2")
-    bad = SyntheticMarket(unlisted_splits={("UPA", session(17)): 2.0})
-
-    snapshot = snapshot_for(["UPA"], on=17, market=bad)
-    assert snapshot.tickers["UPA"].usable and snapshot.tickers["UPA"].actions == []
-    fills, notes = book.settle(snapshot)
-    held = book.holdings(snapshot)[0]
-
-    assert fills == []                                                    # the sale would have shown about -50%
-    assert len(notes) == 1 and "listed splits and its restated prices do not agree" in notes[0]
-    assert held.shares == pytest.approx(before.shares) and held.unrealized_pct is None
-    assert book.waiting(before=session(18)) == {"UPA": "sell"}
-
-    # Once the source lists the split, the position moves to the new scale and the sale fills.
-    fixed = snapshot_for(["UPA"], on=18, market=split_on(17))
-    fills, notes = book.settle(fixed)
-    assert notes == [] and fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)
-    assert fills[0].shares == pytest.approx(before.shares * 2)
-
-
-def test_a_listed_split_the_prices_do_not_reflect_is_also_refused(journal):
-    book, before = bought_on_16(journal)
-
-    class ListedOnly(SyntheticMarket):
-        def path(self, symbol, end):
-            frame = super().path(symbol, end)
-            if symbol == "UPA" and session(17) in frame.index:
-                frame.loc[session(17), "splits"] = 2.0                    # listed, but no price was restated
-            return frame
-
-    snapshot = snapshot_for(["UPA"], on=17, market=ListedOnly())
-    fills, notes = book.settle(snapshot)
-
-    assert "do not agree" in notes[0] and "split factor of 2" in notes[0]
-    assert book.holdings(snapshot)[0].shares == pytest.approx(before.shares)
-
-
-def test_a_position_out_of_step_for_too_long_is_closed_at_its_last_trusted_close(journal):
-    book, before = bought_on_16(journal)
-    book.pending_max_days = 2
-    book.queue([order("UPA", "trim")], session(18), "run2")
-    bad = SyntheticMarket(unlisted_splits={("UPA", session(17)): 2.0})
-
-    for number in (17, 18, 19):                                           # first seen on the 17th; two days is not too long
-        fills, notes = book.settle(snapshot_for(["UPA"], on=number, market=bad))
-        assert fills == [] and len(notes) == 1 and "do not agree" in notes[0]
-    snapshot = snapshot_for(["UPA"], on=20, market=bad)
-    fills, notes = book.settle(snapshot)
-
-    assert len(fills) == 1 and fills[0].action == "close"
-    assert fills[0].trade_date == session(16) and fills[0].shares == pytest.approx(before.shares)
-    assert fills[0].price == pytest.approx(before.last_close)                 # the close of the 16th, old scale
-    assert fills[0].pnl_pct == pytest.approx(0.3, abs=0.01)                    # not the -50% the bad data implies
-    assert len(notes) == 2 and "do not agree" in notes[0]                 # the waiting trim goes without a third note
-    assert "in any run since 2026-11-17" in notes[1] and "closed at its 2026-11-16 close" in notes[1]
-    assert book.holdings(snapshot) == [] and book.waiting(before=session(21)) == {}
-
-    assert book.settle(snapshot_for(["UPA"], on=23, market=bad)) == ([], [])   # and the matter is over
-
-
-def test_days_without_a_run_do_not_count_against_a_position(journal):
-    # Bought on the 16th, then the pipeline is off for two weeks. On the first
-    # run back, the ticker's data happens to be unusable for one evening.
-    book, before = bought_on_16(journal)
-    late = snapshot_for(["UPA"], on=30, market=SyntheticMarket(volume={"UPA": 0.0}))
-    assert not late.tickers["UPA"].usable
-    assert book.settle(late) == ([], [])                                  # not closed at a two-week-old price
-    assert book.holdings(late)[0].shares == pytest.approx(before.shares)
-
-    back = snapshot_for(["UPA"], on=30)                                   # the same session, data now fine
-    assert book.settle(back) == ([], [])
-    held = book.holdings(back)[0]
-    assert held.unrealized_pct == pytest.approx(3.04, abs=0.05)           # ten sessions of +0.3% since entry
-    assert journal.positions("a")[0]["out_of_sync_since"] is None         # and the count starts afresh
-
-
-def test_an_exit_waiting_on_an_unmatched_position_is_dropped_with_the_real_reason(journal):
-    book, _ = bought_on_16(journal)
-    book.pending_max_days = 2
-    book.queue([order("UPA", "sell")], session(16), "run2")
-    bad = SyntheticMarket(unlisted_splits={("UPA", session(17)): 2.0})
-
-    book.settle(snapshot_for(["UPA"], on=17, market=bad))
-    fills, notes = book.settle(snapshot_for(["UPA"], on=19, market=bad))
-
-    assert fills == [] and len(notes) == 2
-    assert "sell proposed on 2026-11-16 was dropped, its position could not be matched to current prices" in notes[1]
-    assert len(journal.positions("a")) == 1                               # the position itself has two more days
-
-
-def test_a_position_whose_data_stops_coming_is_closed_the_same_way(journal):
-    book, before = bought_on_16(journal)
-    book.pending_max_days = 3
-    gone = SyntheticMarket(missing={"UPA"})
-
-    assert book.settle(snapshot_for(["UPA"], on=17, market=gone)) == ([], [])  # first run to find it missing
-    assert book.settle(snapshot_for(["UPA"], on=20, market=gone)) == ([], [])  # three days on: not yet
-    fills, notes = book.settle(snapshot_for(["UPA"], on=23, market=gone))
-
-    assert [(f.action, f.trade_date) for f in fills] == [("close", session(16))]
-    assert "no longer tracked" in notes[0] and journal.positions("a") == []
-
-
-def test_a_small_revision_of_an_old_price_is_accepted_as_a_correction(journal):
-    book, before = bought_on_16(journal)
-
-    class Revised(SyntheticMarket):
-        def path(self, symbol, end):
-            frame = super().path(symbol, end)
-            if end > session(16):                                          # the 16th is restated 2% higher
-                for column in ("open", "high", "low", "close", "adj_close"):
-                    frame.loc[session(16), column] *= 1.02
-            return frame
-
-    snapshot = snapshot_for(["UPA"], on=17, market=Revised())
-    fills, notes = book.settle(snapshot)
-    held = book.holdings(snapshot)[0]
-
-    assert fills == [] and len(notes) == 1
-    assert "Taken as a price correction by the source" in notes[0] and "2.0% apart" in notes[0]
-    assert held.shares == pytest.approx(before.shares) and held.unrealized_pct == pytest.approx(0.6, abs=0.02)
-    assert book.settle(snapshot_for(["UPA"], on=18, market=Revised())) == ([], [])     # nothing to say the next day
-
-
-def test_a_revision_too_large_to_be_a_correction_is_refused(journal):
-    book, before = bought_on_16(journal)
-
-    class Revised(SyntheticMarket):
-        def path(self, symbol, end):
-            frame = super().path(symbol, end)
-            if end > session(16):
-                for column in ("open", "high", "low", "close", "adj_close"):
-                    frame.loc[session(16), column] *= 1.08
-            return frame
-
-    snapshot = snapshot_for(["UPA"], on=17, market=Revised())
-    _, notes = book.settle(snapshot)
-    assert "do not agree" in notes[0] and book.holdings(snapshot)[0].unrealized_pct is None
-
-
-def test_a_position_with_no_data_at_all_is_left_alone(journal):
-    book, before = bought_on_16(journal)
-    book.settle(snapshot_for(["UPB"], on=17))                             # UPA is not in the snapshot
-
-    snapshot = snapshot_for(["UPA"], on=18, market=split_on(17))
-    book.settle(snapshot)
-    assert book.holdings(snapshot)[0].shares == pytest.approx(before.shares * 2)
-
-
-# ── What a finished run reports ──────────────────────────────────────────────
-
-def test_fills_stay_unreported_until_a_run_claims_them(journal):
-    book, _ = bought_on_16(journal)
-    assert [(f.ticker, f.action) for f in book.unreported_fills()] == [("UPA", "buy")]
-
-    with journal.transaction():
-        journal.mark_trades_reported("a", "run2")
-    assert book.unreported_fills() == []
-    assert journal.trades("a")[0]["reported_run_id"] == "run2"
-
-
-def positions_on_disk(journal):
+def keys_on_disk(journal):
     """What another process would see: only what has been committed."""
     other = Journal(journal.path)
     try:
-        return [row["ticker"] for row in other.positions("a")]
+        return [row["key"] for row in other.rows("SELECT key FROM checkpoints ORDER BY key")]
     finally:
         other.close()
 
 
-def put(journal, ticker):
-    journal.put_position("a", ticker, 1, 1, session(13), session(13), 1.0)
-
-
 def test_nested_transactions_commit_once_and_roll_back_together(journal):
     with journal.transaction():
-        put(journal, "UPA")
+        put(journal, "one")
         with journal.transaction():
-            put(journal, "UPB")
-        assert positions_on_disk(journal) == []                           # the inner block did not commit
-    assert positions_on_disk(journal) == ["UPA", "UPB"]
+            put(journal, "two")
+        assert keys_on_disk(journal) == []                                # the inner block did not commit
+    assert keys_on_disk(journal) == ["one", "two"]
 
     with pytest.raises(RuntimeError, match="outer block fails"):
         with journal.transaction():
-            put(journal, "UPC")
+            put(journal, "three")
             with journal.transaction():
-                journal.drop_position("a", "UPA")
+                journal.write("DELETE FROM checkpoints WHERE key = 'one'")
             raise RuntimeError("the outer block fails after the inner one finished")
-    assert positions_on_disk(journal) == ["UPA", "UPB"]
-    assert [row["ticker"] for row in journal.positions("a")] == ["UPA", "UPB"]
+    assert keys_on_disk(journal) == ["one", "two"]
 
 
 def test_an_inner_failure_that_is_caught_still_saves_nothing(journal):
     with pytest.raises(JournalError, match="none of it was saved"):
         with journal.transaction():
-            put(journal, "UPA")
+            put(journal, "one")
             try:
                 with journal.transaction():
-                    put(journal, "UPB")
+                    put(journal, "two")
                     raise ValueError("inner step fails")
             except ValueError:
                 pass                                                      # swallowed, as careless code might
-            put(journal, "UPC")
-    assert positions_on_disk(journal) == [] and journal.positions("a") == []
+            put(journal, "three")
+    assert keys_on_disk(journal) == []
 
     with journal.transaction():                                           # the journal is usable afterwards
-        put(journal, "UPA")
-    assert positions_on_disk(journal) == ["UPA"]
+        put(journal, "one")
+    assert keys_on_disk(journal) == ["one"]
 
 
 def test_a_transaction_holds_the_write_lock_from_its_first_line(journal):
@@ -856,11 +551,11 @@ def test_a_transaction_holds_the_write_lock_from_its_first_line(journal):
     with journal.transaction():                                           # nothing written yet
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             with other.transaction():
-                other.put_position("a", "UPB", 1, 1, session(13), session(13), 1.0)
+                put(other, "theirs")
     with other.transaction():
-        other.put_position("a", "UPB", 1, 1, session(13), session(13), 1.0)
+        put(other, "theirs")
     other.close()
-    assert [row["ticker"] for row in journal.positions("a")] == ["UPB"]
+    assert keys_on_disk(journal) == ["theirs"]
 
 
 def test_a_failed_commit_saves_nothing_and_leaves_the_journal_usable(journal, monkeypatch):
@@ -870,44 +565,35 @@ def test_a_failed_commit_saves_nothing_and_leaves_the_journal_usable(journal, mo
     monkeypatch.setattr(journal, "_commit", locked)
     with pytest.raises(RuntimeError, match="database is locked"):
         with journal.transaction():
-            put(journal, "UPA")
+            put(journal, "one")
     monkeypatch.undo()
 
-    assert journal.positions("a") == [] and positions_on_disk(journal) == []
+    assert keys_on_disk(journal) == []
     with journal.transaction():                                           # no transaction was left open
-        put(journal, "UPB")
-    assert positions_on_disk(journal) == ["UPB"]
+        put(journal, "two")
+    assert keys_on_disk(journal) == ["two"]
 
 
-def test_the_shadow_book_cannot_be_changed_outside_a_transaction(journal):
-    for write in (
-        lambda: put(journal, "UPA"),
-        lambda: journal.drop_position("a", "UPA"),
-        lambda: journal.put_pending("a", "UPA", "buy", session(13), "run"),
-        lambda: journal.drop_pending("a", "UPA"),
-        lambda: journal.drop_pending_from("a", session(13)),
-        lambda: journal.add_trade("a", "UPA", "buy", 1, 1, session(13), session(13), None),
-        lambda: journal.mark_trades_reported("a", "run"),
-    ):
-        with pytest.raises(JournalError, match="only be changed inside"):
-            write()
+def test_books_cannot_be_changed_outside_a_transaction(journal):
+    with pytest.raises(JournalError, match="only be changed inside"):
+        put(journal, "one")
     with journal.transaction():                                           # and nothing was left half open
-        put(journal, "UPA")
-    assert positions_on_disk(journal) == ["UPA"]
+        put(journal, "one")
+    assert keys_on_disk(journal) == ["one"]
 
 
 def test_a_reader_does_not_block_the_journal_from_saving(journal):
     import sqlite3
 
-    assert journal._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert journal.rows("PRAGMA journal_mode")[0][0] == "wal"
     reader = sqlite3.connect(journal.path, timeout=0.05)
     reader.execute("BEGIN")
-    reader.execute("SELECT * FROM shadow_positions").fetchall()          # a read transaction left open
+    reader.execute("SELECT * FROM checkpoints").fetchall()               # a read transaction left open
     with journal.transaction():
-        put(journal, "UPA")
-    assert reader.execute("SELECT COUNT(*) FROM shadow_positions").fetchone()[0] == 0    # its own snapshot
+        put(journal, "one")
+    assert reader.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0     # its own snapshot
     reader.close()
-    assert positions_on_disk(journal) == ["UPA"]
+    assert keys_on_disk(journal) == ["one"]
 
 
 def test_a_journal_in_another_format_is_refused_not_misread(tmp_path):
@@ -915,14 +601,30 @@ def test_a_journal_in_another_format_is_refused_not_misread(tmp_path):
 
     path = tmp_path / "old.sqlite3"
     old = sqlite3.connect(path)
-    old.execute("CREATE TABLE shadow_trades (id INTEGER PRIMARY KEY, arm TEXT)")
+    old.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY)")
     old.commit()
     old.close()
-    with pytest.raises(JournalError, match="journal format 0; this program uses format 1"):
+    with pytest.raises(JournalError, match="journal format 0; this program uses format 2"):
         Journal(path)
 
     fresh = tmp_path / "new.sqlite3"
     Journal(fresh).close()
-    assert Journal(fresh).positions("a") == []                            # reopening its own format is fine
+    assert Journal(fresh).arms() == []                                    # reopening its own format is fine
 
 
+def test_checkpoints_are_kept_per_arm_and_session_and_can_be_cleared(journal):
+    journal.save_checkpoint("a", session(13), "view:UPA", "one")
+    journal.save_checkpoint("a", session(13), "view:UPA", "two")          # saved again: the later one stands
+    journal.save_checkpoint("b", session(13), "view:UPA", "theirs")
+    journal.save_checkpoint("a", session(16), "view:UPA", "later")
+
+    assert journal.checkpoint("a", session(13), "view:UPA") == "two"
+    assert journal.checkpoint("a", session(13), "view:UPB") is None
+
+    journal.clear_checkpoints("a", session(13))
+    assert journal.checkpoint("a", session(13), "view:UPA") is None
+    assert journal.checkpoint("b", session(13), "view:UPA") == "theirs"
+
+    journal.prune_checkpoints(session(16))
+    assert journal.checkpoint("b", session(13), "view:UPA") is None
+    assert journal.checkpoint("a", session(16), "view:UPA") == "later"

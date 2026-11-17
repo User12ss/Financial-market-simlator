@@ -81,7 +81,7 @@ MEMORY_RETRIEVE_K: int = int(os.getenv("MEMORY_RETRIEVE_K", "3"))
 MARKET_DATA_ENABLED: bool = os.getenv("MARKET_DATA_ENABLED", "true").lower() == "true"
 SNAPSHOT_DIR: str = os.getenv("SNAPSHOT_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "snapshots")
 
-# --- Daily trading pipeline (shadow mode: signals only, no orders) ---
+# --- Daily trading pipeline (paper trading: simulated orders only) ---
 # Every number here is a placeholder until the user sets it.
 JOURNAL_PATH: str = os.getenv("JOURNAL_PATH", "").strip() or str(PROJECT_ROOT / "data_store" / "journal.sqlite3")
 RUNS_DIR: str = os.getenv("RUNS_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "runs")
@@ -102,14 +102,51 @@ PIPELINE_DEBATE_ROUNDS: int = int(os.getenv("PIPELINE_DEBATE_ROUNDS", "1"))
 # Local models have no per-token price and never reach it.
 PIPELINE_MAX_COST_USD: float = float(os.getenv("PIPELINE_MAX_COST_USD", "2.0"))
 
-# Shadow book: a hypothetical portfolio kept so that exits get exercised
-# before there is a paper broker. Fixed dollars per position, filled at the
-# next session's open.
-SHADOW_POSITION_USD: float = float(os.getenv("SHADOW_POSITION_USD", "10000"))
-SHADOW_MAX_POSITIONS: int = int(os.getenv("SHADOW_MAX_POSITIONS", "10"))
-# An order with no price to fill at is dropped after this many calendar days,
-# and a position with no usable price for as long is closed at its last good one.
-SHADOW_PENDING_MAX_DAYS: int = int(os.getenv("SHADOW_PENDING_MAX_DAYS", "10"))
+# --- Paper broker ---
+# A simulated account matched against daily bars. No real money and no real orders.
+PAPER_INITIAL_CASH: float = float(os.getenv("PAPER_INITIAL_CASH", "100000"))
+# Every fill is worse than the quoted price by this many basis points.
+PAPER_SLIPPAGE_BPS: float = float(os.getenv("PAPER_SLIPPAGE_BPS", "5"))
+# An order with no usable price is cancelled after this many calendar days, and
+# a position that syncs have found without one for as long is closed at its
+# last good close.
+PAPER_STALE_DAYS: int = int(os.getenv("PAPER_STALE_DAYS", "10"))
+
+# --- Position sizing ---
+# Share of equity put at risk on one new position when confidence is 1.0.
+# Lower confidence scales it down in proportion.
+SIZING_RISK_PCT: float = float(os.getenv("SIZING_RISK_PCT", "1.0"))
+# The protective stop sits this many ATRs below the last close, and never
+# closer than this percent of the price: a stop a few cents away fires on noise.
+SIZING_STOP_ATR_MULTIPLE: float = float(os.getenv("SIZING_STOP_ATR_MULTIPLE", "2.0"))
+SIZING_MIN_STOP_PCT: float = float(os.getenv("SIZING_MIN_STOP_PCT", "1.0"))
+# The analyst may propose a stop of its own for a new position. It is used only
+# when it sits between this many ATRs below the last close; outside that range
+# it is refused and the stop above is used instead.
+SIZING_STOP_MIN_ATR_MULTIPLE: float = float(os.getenv("SIZING_STOP_MIN_ATR_MULTIPLE", "1.0"))
+SIZING_STOP_MAX_ATR_MULTIPLE: float = float(os.getenv("SIZING_STOP_MAX_ATR_MULTIPLE", "4.0"))
+
+# --- Risk gate ---
+# Hard limits enforced in code on every order. All of them are conservative
+# placeholders for the user to set. Percentages are of account equity.
+RISK_MAX_POSITION_PCT: float = float(os.getenv("RISK_MAX_POSITION_PCT", "10"))
+RISK_MAX_SECTOR_PCT: float = float(os.getenv("RISK_MAX_SECTOR_PCT", "30"))
+RISK_MAX_POSITIONS: int = int(os.getenv("RISK_MAX_POSITIONS", "10"))
+RISK_MIN_CASH_PCT: float = float(os.getenv("RISK_MIN_CASH_PCT", "10"))
+# Largest loss one new position may take if its stop is hit.
+RISK_MAX_TRADE_RISK_PCT: float = float(os.getenv("RISK_MAX_TRADE_RISK_PCT", "1.0"))
+RISK_MAX_NEW_POSITIONS_PER_DAY: int = int(os.getenv("RISK_MAX_NEW_POSITIONS_PER_DAY", "3"))
+# Value of all of a day's orders, buys and sells together.
+RISK_MAX_DAILY_TURNOVER_PCT: float = float(os.getenv("RISK_MAX_DAILY_TURNOVER_PCT", "30"))
+# Circuit breakers: once tripped, no new positions are opened. Exits still go through.
+RISK_DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("RISK_DAILY_LOSS_LIMIT_PCT", "3"))
+RISK_MAX_DRAWDOWN_PCT: float = float(os.getenv("RISK_MAX_DRAWDOWN_PCT", "10"))
+RISK_MIN_PRICE: float = float(os.getenv("RISK_MIN_PRICE", "5"))
+RISK_MIN_DOLLAR_VOLUME: float = float(os.getenv("RISK_MIN_DOLLAR_VOLUME", "20000000"))
+# A limit price may not be further than this from the last close.
+RISK_MAX_LIMIT_DEVIATION_PCT: float = float(os.getenv("RISK_MAX_LIMIT_DEVIATION_PCT", "5"))
+# Kill switch: while this file exists, or TRADING_HALT is set to 1, no order of any kind is placed.
+KILL_SWITCH_FILE: str = os.getenv("KILL_SWITCH_FILE", "").strip() or str(PROJECT_ROOT / "data_store" / "HALT")
 
 
 # --- Agent Definitions ---

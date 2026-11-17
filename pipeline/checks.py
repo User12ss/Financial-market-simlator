@@ -14,8 +14,10 @@ from typing import Iterable
 from data.models import TickerSnapshot
 from models.signals import (
     CheckedCitation, DebateRecord, DebateRulingDraft, DebateTurn, DomainAssessment, DomainAssessmentDraft,
-    Holding, ProposalSetDraft, TickerView, TickerViewDraft, TradeProposal,
+    ProposalSetDraft, TickerView, TickerViewDraft, TradeProposal,
 )
+from models.trading import Position
+from portfolio.sizing import usable_stop
 from utils.grounding import unsupported_figures
 
 MIN_HORIZON_DAYS, MAX_HORIZON_DAYS = 1, 60
@@ -124,14 +126,31 @@ def check_view(
             for c in wrong
         )
         warnings.append(f"{len(wrong)} of {len(evidence)} cited data point(s) do not match the data: {details}.")
+    # A stop is for opening a position: it means nothing on a view that is not
+    # bullish, and a position already held keeps the stop it was opened with.
+    stop, stop_refused = None, []
+    if draft.stop_price is not None and draft.direction == "bullish" and not held:
+        stop, refusal = usable_stop(
+            item.price.close if item.price else None, item.technicals.atr14 if item.technicals else None,
+            draft.stop_price,
+        )
+        if stop is None:
+            stop_refused = [f"The proposed stop of {draft.stop_price:,.2f} is not used: {refusal}"]
+
     # The invalidation line is left out: it names a level to watch, which is
-    # a condition the analyst sets, not a claim about the data.
-    warnings += figure_warning(f"{draft.thesis}\n{draft.catalysts}", shown)
+    # a condition the analyst sets, not a claim about the data. The reason for
+    # a stop is checked, because it says which level in the data the stop sits
+    # under; the stop itself is the analyst's own number and may be stated.
+    stated, sources = f"{draft.thesis}\n{draft.catalysts}", list(shown)
+    if stop is not None:
+        stated, sources = f"{stated}\n{draft.stop_reason}", sources + [f"{stop:.2f}"]
+    warnings += figure_warning(stated, sources) + stop_refused
 
     return TickerView(
         ticker=ticker, session_date=session, held=held, direction=draft.direction,
         confidence=draft.confidence, horizon_days=draft.horizon_days, thesis=draft.thesis,
-        catalysts=draft.catalysts, invalidation=draft.invalidation, evidence=evidence,
+        catalysts=draft.catalysts, invalidation=draft.invalidation, proposed_stop=stop,
+        stop_reason=draft.stop_reason if stop is not None else "", evidence=evidence,
         remark=draft.remark, data_warnings=warnings,
     ), ""
 
@@ -157,7 +176,7 @@ def check_proposals(
     candidates: Iterable[str],
     views: dict[str, TickerView],
     rulings: dict[str, DebateRecord],
-    holdings: dict[str, Holding],
+    holdings: dict[str, Position],
     waiting: dict[str, str],
     regime_available: bool,
     max_positions: int,
@@ -195,7 +214,7 @@ def check_proposals(
         held = ticker in holdings
         if item.action == "buy":
             if held:
-                return "Already held. Shadow positions have a fixed size."
+                return "Already held. A position is sized once, when it is opened."
             if waiting.get(ticker) == "buy":
                 return "A buy from an earlier session is still waiting to fill."
             if ticker not in views:

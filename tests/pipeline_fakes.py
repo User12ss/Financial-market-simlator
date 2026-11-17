@@ -61,6 +61,8 @@ class SyntheticMarket:
         missing: set[str] | None = None,
         splits: dict[tuple[str, date], float] | None = None,
         unlisted_splits: dict[tuple[str, date], float] | None = None,
+        turns: dict[str, tuple[date, float]] | None = None,
+        sectors: dict[str, str] | None = None,
         fail: bool = False,
     ) -> None:
         self.drift = {"UPA": 0.003, "UPB": 0.002, "UPC": 0.001, "DOWN": -0.002, **(drift or {})}
@@ -70,6 +72,9 @@ class SyntheticMarket:
         self.splits = splits or {}
         # Splits the source applies to its prices without listing them: bad data.
         self.unlisted_splits = unlisted_splits or {}
+        # From the given date on, the ticker compounds at the given daily rate instead.
+        self.turns = turns or {}
+        self.sectors = sectors or {}
         self.fail = fail
         self.requested: list[list[str]] = []
 
@@ -80,10 +85,12 @@ class SyntheticMarket:
         for (ticker, split_date), ratio in {**self.splits, **self.unlisted_splits}.items():
             if ticker == symbol and split_date <= end:
                 scale *= ratio
-        rows = []
-        for index, bar_date in enumerate(sessions):
-            close = base * (1 + drift) ** index / scale
-            open_ = base * (1 + drift) ** max(index - 1, 0) / scale
+        turn_date, turn_drift = self.turns.get(symbol, (None, drift))
+        rows, level = [], base / (1 + drift)
+        for bar_date in sessions:
+            previous = level
+            level *= 1 + (turn_drift if turn_date is not None and bar_date >= turn_date else drift)
+            close, open_ = level / scale, (previous if rows else level) / scale
             rows.append({
                 "open": open_, "high": max(open_, close) * 1.002, "low": min(open_, close) * 0.998,
                 "close": close, "adj_close": close, "volume": self.volume.get(symbol, 5_000_000.0),
@@ -104,7 +111,7 @@ class SyntheticMarket:
         return frames
 
     def fundamentals(self, symbol):
-        return Fundamentals(name=f"{symbol} Corp", quote_type="EQUITY", sector="Technology",
+        return Fundamentals(name=f"{symbol} Corp", quote_type="EQUITY", sector=self.sectors.get(symbol, "Technology"),
                             market_cap=250e9, trailing_pe=24.0, forward_pe=21.0, profit_margin=0.2, beta=1.1)
 
     def next_earnings(self, symbol, after):
@@ -134,10 +141,11 @@ def assessment(stance="supportive", confidence=0.6, tilts=(), summary="Condition
 
 
 def view(direction="bullish", confidence=0.6, horizon=10, thesis="The trend is intact and nothing argues against it.",
-         evidence=()):
+         evidence=(), stop=None):
     return TickerViewDraft(
         direction=direction, confidence=confidence, horizon_days=horizon, thesis=thesis,
         catalysts="Continued demand.", invalidation="A close below the 50-day average.",
+        stop_price=stop, stop_reason="" if stop is None else "Just below the 50-day average.",
         evidence=[Citation(metric=metric, value=value) for metric, value in evidence],
         remark="I would own this one.",
     )
