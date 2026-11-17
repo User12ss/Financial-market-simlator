@@ -39,6 +39,9 @@ class SimulationReport(BaseModel):
     risk_factors: str = ""
     synthesis: str = ""
     data_sources: list[str] = Field(default_factory=list, description="External data and memory used")
+    quality_warnings: list[str] = Field(
+        default_factory=list, description="Problems the code detected in the agents' output"
+    )
 
     def to_markdown(self) -> str:
         """Render the full report as Markdown."""
@@ -49,6 +52,12 @@ class SimulationReport(BaseModel):
             lines.append("## Data Sources Used\n")
             for src in self.data_sources:
                 lines.append(f"- {src}")
+            lines.append("")
+
+        if self.quality_warnings:
+            lines.append("## Quality Warnings\n")
+            for warning in self.quality_warnings:
+                lines.append(f"- {warning}")
             lines.append("")
 
         lines.append("## Policy Scenario Summary\n")

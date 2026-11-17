@@ -1,0 +1,15 @@
+{
+ "name": "Apple Inc.",
+ "quote_type": "EQUITY",
+ "sector": "Technology",
+ "industry": "Consumer Electronics",
+ "market_cap": 5113627803648.0,
+ "trailing_pe": 39.185192,
+ "forward_pe": 33.285942,
+ "eps_ttm": 8.98,
+ "profit_margin": 0.27604,
+ "revenue_growth": 0.117,
+ "earnings_growth": 0.141,
+ "beta": 1.089,
+ "dividend_yield": 0.3
+}

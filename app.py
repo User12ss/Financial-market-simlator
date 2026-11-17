@@ -3,7 +3,23 @@
 from __future__ import annotations
 import streamlit as st
 from orchestrator import Orchestrator
+from utils.llm_client import LLMError, PROVIDER_NAMES
+import config
 from config import AGENT_ROSTER
+
+
+def build_orchestrator(provider: str, model: str, api_key: str) -> Orchestrator:
+    """Create the orchestrator, or stop the page with a readable error."""
+    try:
+        orch = Orchestrator(provider=provider, model=model or None, api_key=api_key or None)
+    except LLMError as e:
+        st.error(str(e))
+        st.stop()
+    problems = [line for line in orch.status_lines() if line.startswith("LLM PROBLEM")]
+    if problems:
+        st.error("\n\n".join(problems))
+        st.stop()
+    return orch
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -19,8 +35,20 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("⚙️ Configuration")
-    api_key = st.text_input("Anthropic API Key", type="password", help="Required. Get one at console.anthropic.com")
-    model = st.selectbox("Model", ["claude-sonnet-4-20250514", "claude-opus-4-20250514"], index=0)
+    provider = st.selectbox(
+        "LLM provider",
+        PROVIDER_NAMES,
+        index=PROVIDER_NAMES.index(config.LLM_PROVIDER) if config.LLM_PROVIDER in PROVIDER_NAMES else 0,
+        help="ollama runs open-source models on this machine. The default comes from LLM_PROVIDER in .env.",
+    )
+    default_model = config.LLM_MODEL if provider == config.LLM_PROVIDER else config.provider_default(provider, "model")
+    model = st.text_input("Model", value=default_model, help="Model name as the provider knows it")
+    api_key = ""
+    if provider != "ollama":
+        api_key = st.text_input(
+            "API key", type="password",
+            help="Leave empty to use the key from .env. Not needed for local models.",
+        )
     economy = st.selectbox("Base Economy", ["US", "EU", "UK", "China", "Japan", "India", "Brazil", "Global"])
 
     st.divider()
@@ -30,7 +58,7 @@ with st.sidebar:
             st.caption(a["domain"])
 
     st.divider()
-    st.caption("Built with Claude API • Multi-Agent Simulation")
+    st.caption("Multi-Agent Simulation • model provider is configurable")
 
 # ---------------------------------------------------------------------------
 # Header
@@ -67,29 +95,26 @@ with tab_single:
         if col.button(ex[:50] + "...", key=f"ex_{i}", use_container_width=True):
             scenario_input = ex
 
-    if st.button("🚀 Run Simulation", type="primary", disabled=not api_key, use_container_width=True):
+    if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
         if not scenario_input:
             st.warning("Please enter a scenario.")
         else:
-            try:
-                orch = Orchestrator(api_key=api_key, model=model)
-            except ValueError as e:
-                st.error(str(e))
-                st.stop()
+            orch = build_orchestrator(provider, model, api_key)
 
             progress_bar = st.progress(0, text="Parsing & routing scenario (fast model)...")
             status_container = st.empty()
-            completed = {"n": 0, "total": 0}
+            completed = {"n": 0}
 
             def on_start(name):
                 status_container.info(f"🔄 Running **{name}**...")
 
             def on_done(name):
+                # The orchestrator decides how many agents to consult, so there
+                # is no fixed total. The bar advances per finished agent and
+                # waits below 100% until the report is built.
                 completed["n"] += 1
-                if completed["total"] == 0:
-                    completed["total"] = len(AGENT_ROSTER)
-                pct = int((completed["n"] / completed["total"]) * 75) + 10
-                progress_bar.progress(min(pct, 85), text=f"✅ {name} complete ({completed['n']} agents done)")
+                pct = min(10 + completed["n"] * 8, 85)
+                progress_bar.progress(pct, text=f"✅ {name} complete ({completed['n']} agents done)")
 
             try:
                 report = orch.run(
@@ -101,10 +126,14 @@ with tab_single:
                 )
                 progress_bar.progress(100, text="✅ Simulation complete!")
                 status_container.empty()
+                st.caption(orch.llm.usage.summary())
 
                 # --- Display Report ---
                 st.divider()
                 st.header("📊 Simulation Report")
+
+                for warning in report.quality_warnings:
+                    st.warning(warning)
 
                 # Summary
                 st.subheader("Policy Scenario Summary")
@@ -185,15 +214,11 @@ with tab_compare:
     with col_b:
         scenario_b = st.text_area("Scenario B", placeholder="e.g., Fed raises rates 100bps", height=100, key="cmp_b")
 
-    if st.button("⚖️ Compare Scenarios", type="primary", disabled=not api_key, use_container_width=True):
+    if st.button("⚖️ Compare Scenarios", type="primary", use_container_width=True):
         if not scenario_a or not scenario_b:
             st.warning("Please enter both scenarios.")
         else:
-            try:
-                orch = Orchestrator(api_key=api_key, model=model)
-            except ValueError as e:
-                st.error(str(e))
-                st.stop()
+            orch = build_orchestrator(provider, model, api_key)
 
             with st.spinner("Running Scenario A..."):
                 report_a = orch.run(scenario_a, base_economy=economy, parallel=True)

@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from orchestrator import Orchestrator
+from utils.llm_client import LLMError, PROVIDER_NAMES
 
 console = Console()
 
@@ -21,6 +22,20 @@ def print_banner():
     banner.append("║   Multi-Agent AI Framework                       ║\n", style="bold cyan")
     banner.append("╚══════════════════════════════════════════════════╝\n", style="bold cyan")
     console.print(banner)
+
+
+def print_status(orch: Orchestrator) -> bool:
+    """Show what is actually working. Returns False if the model cannot be used."""
+    usable = True
+    for line in orch.status_lines():
+        if line.startswith("LLM PROBLEM"):
+            usable = False
+            console.print(f"[red]{line}[/red]")
+        elif "OFF" in line:
+            console.print(f"[yellow]{line}[/yellow]")
+        else:
+            console.print(f"[dim]{line}[/dim]")
+    return usable
 
 
 def run_simulation(orch: Orchestrator, scenario_text: str, economy: str = "US", preferences: dict | None = None):
@@ -66,10 +81,9 @@ def run_simulation(orch: Orchestrator, scenario_text: str, economy: str = "US", 
     )
 
     console.print()
-
-    # Print the report
-    md = Markdown(report.to_markdown())
-    console.print(md)
+    console.print(Markdown(report.to_markdown()))
+    console.print()
+    console.print(f"[dim]{orch.llm.usage.summary()}[/dim]")
 
     return report
 
@@ -91,6 +105,8 @@ def run_comparison(orch: Orchestrator, scenario_a: str, scenario_b: str, economy
     comparison = orch._compare_reports(report_a, report_b)
     console.print()
     console.print(Markdown(comparison))
+    console.print()
+    console.print(f"[dim]{orch.llm.usage.summary()}[/dim]")
 
 
 def parse_preferences(pref_str: str) -> dict:
@@ -112,14 +128,15 @@ def parse_preferences(pref_str: str) -> dict:
                 prefs["time_horizon"] = val
             elif key == "no_debate":
                 prefs["skip_debate"] = True
-        else:
+        elif part == "no_debate":
+            prefs["skip_debate"] = True
+        elif part:
             prefs.setdefault("focus_domains", []).append(part)
     return prefs
 
 
 def interactive_mode(orch: Orchestrator):
     """Run in interactive REPL mode."""
-    print_banner()
     console.print("[dim]Type a policy scenario to simulate. Type 'quit' to exit.[/dim]")
     console.print("[dim]Type 'compare' to compare two scenarios side-by-side.[/dim]")
     console.print("[dim]Type 'prefs <options>' to set preferences (e.g. 'prefs depth=deep,focus=equity_market')[/dim]")
@@ -177,17 +194,23 @@ def main():
     parser.add_argument("--scenario-a", type=str, help="First scenario for comparison")
     parser.add_argument("--scenario-b", type=str, help="Second scenario for comparison")
     parser.add_argument("--economy", "-e", type=str, default="US", help="Base economy (default: US)")
-    parser.add_argument("--model", "-m", type=str, default=None, help="Override Claude model name")
+    parser.add_argument("--provider", type=str, default=None, choices=PROVIDER_NAMES,
+                        help="LLM provider (default: LLM_PROVIDER from .env)")
+    parser.add_argument("--model", "-m", type=str, default=None, help="Override the main model name")
     parser.add_argument("--preferences", "-p", type=str, default=None, help="Preferences (e.g. 'depth=deep,focus=equity_market')")
-    parser.add_argument("--api-key", type=str, default=None, help="Anthropic API key (overrides .env)")
+    parser.add_argument("--api-key", type=str, default=None, help="API key for a hosted provider (overrides .env)")
 
     args = parser.parse_args()
 
     try:
-        orch = Orchestrator(api_key=args.api_key, model=args.model)
-    except ValueError as e:
+        orch = Orchestrator(api_key=args.api_key, model=args.model, provider=args.provider)
+    except LLMError as e:
         console.print(f"[red]{e}[/red]")
-        console.print("[dim]Set ANTHROPIC_API_KEY in .env or pass --api-key[/dim]")
+        console.print("[dim]Check LLM_PROVIDER and its settings in .env (see .env.example).[/dim]")
+        sys.exit(1)
+
+    print_banner()
+    if not print_status(orch):
         sys.exit(1)
 
     prefs = parse_preferences(args.preferences) if args.preferences else None

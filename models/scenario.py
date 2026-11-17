@@ -25,8 +25,3 @@ class Scenario(BaseModel):
     base_economy: str = Field(default="US", description="Target economy")
     baseline_conditions: str = Field(default="", description="Assumed starting macro conditions")
     time_horizon: str = Field(default="12 months", description="Simulation time horizon")
-
-    @classmethod
-    def from_raw(cls, user_input: str, base_economy: str = "US") -> Scenario:
-        """Create a scenario from raw user input. Fields will be filled by the orchestrator."""
-        return cls(raw_input=user_input, base_economy=base_economy)

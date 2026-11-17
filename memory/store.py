@@ -1,7 +1,6 @@
 """Vector memory store for simulation history — enables cross-run learning."""
 
 from __future__ import annotations
-import json
 import time
 from pathlib import Path
 
@@ -9,7 +8,7 @@ import chromadb
 from chromadb.config import Settings
 
 from models.scenario import Scenario
-from models.report import SimulationReport, AgentAnalysis
+from models.report import SimulationReport
 
 
 class SimulationMemory:
@@ -128,25 +127,3 @@ class SimulationMemory:
         if results and results["documents"]:
             return results["documents"][0]
         return []
-
-    def format_memories_for_prompt(self, scenario: Scenario) -> str:
-        """Retrieve and format past memories into a prompt-ready string."""
-        memories = self.retrieve_similar(scenario)
-        reflections = self.retrieve_reflections(scenario)
-
-        if not memories and not reflections:
-            return ""
-
-        lines = ["PAST SIMULATION MEMORY (similar scenarios this system has analyzed before):"]
-
-        if memories:
-            for i, mem in enumerate(memories, 1):
-                lines.append(f"\n--- Past Simulation {i} ---")
-                lines.append(mem["document"])
-
-        if reflections:
-            lines.append("\n--- Lessons Learned from Past Runs ---")
-            for ref in reflections:
-                lines.append(ref)
-
-        return "\n".join(lines)

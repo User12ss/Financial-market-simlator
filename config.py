@@ -1,33 +1,67 @@
 """Configuration for the financial market simulation framework."""
 
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- API ---
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# --- LLM providers ---
+# "ollama"        local open-source models through Ollama
+# "openai_compat" any hosted service exposing the OpenAI chat-completions API
+# "anthropic"     Claude through the official SDK
+#
+# Two tiers are configured: the main model does the analysis, the fast model
+# does cheap parsing. Each tier can use a different provider.
+_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+    "ollama": {"model": "qwen2.5-coder:7b", "fast": "llama3.2:latest"},
+    "openai_compat": {"model": "", "fast": ""},
+    "anthropic": {"model": "claude-sonnet-5-5", "fast": "claude-haiku-5-5"},
+}
+
+
+def provider_default(provider: str, key: str) -> str:
+    """Default model name for a provider tier ("model" or "fast")."""
+    return _PROVIDER_DEFAULTS.get(provider, {}).get(key, "")
+
+
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+LLM_MODEL: str = os.getenv("LLM_MODEL", "").strip() or provider_default(LLM_PROVIDER, "model")
+LLM_PROVIDER_FAST: str = os.getenv("LLM_PROVIDER_FAST", "").strip().lower() or LLM_PROVIDER
+LLM_MODEL_FAST: str = (
+    os.getenv("LLM_MODEL_FAST", "").strip()
+    or provider_default(LLM_PROVIDER_FAST, "fast")
+    or LLM_MODEL
+)
+
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-sonnet-4-20250514")
-MODEL_FAST: str = os.getenv("MODEL_FAST", "claude-haiku-4-5-20251001")
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OPENAI_COMPAT_BASE_URL: str = os.getenv("OPENAI_COMPAT_BASE_URL", "").rstrip("/")
+OPENAI_COMPAT_API_KEY: str = os.getenv("OPENAI_COMPAT_API_KEY", "")
+
 MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
-MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4096"))
+# Extra attempts when a reply does not validate against the requested schema.
+LLM_SCHEMA_RETRIES: int = int(os.getenv("LLM_SCHEMA_RETRIES", "2"))
+LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "900"))
+# Sampling temperature for open-source providers. Never sent to Claude:
+# current Claude models reject non-default sampling parameters.
+LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+
+# Ollama truncates prompts longer than the context window without any error,
+# so the client refuses prompts that would not fit in OLLAMA_NUM_CTX.
+OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
+# A local machine runs one generation at a time; extra requests wait their turn.
+OLLAMA_MAX_PARALLEL: int = int(os.getenv("OLLAMA_MAX_PARALLEL", "1"))
+
+# Output cap for Claude. Thinking counts against it, so it must stay generous.
+ANTHROPIC_MAX_TOKENS: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "16000"))
 
 # --- Simulation Defaults ---
 BASE_ECONOMY: str = os.getenv("BASE_ECONOMY", "US")
-TIME_HORIZONS: list[str] = ["immediate (0-1 week)", "short-term (1-3 months)", "medium-term (3-12 months)"]
-
-# --- Token Budgets (right-size each call) ---
-TOKEN_BUDGET: dict[str, int] = {
-    "tier1": 2048,
-    "tier2": 1536,
-    "deliberation": 1536,
-    "debate_argue": 2048,
-    "debate_judge": 2048,
-    "synthesis_draft": 4096,
-    "synthesis_critic": 2048,
-    "scenario_parse": 1024,
-    "comparison": 4096,
-}
 
 # --- Orchestrator Configuration ---
 MAX_ORCHESTRATOR_ITERATIONS: int = int(os.getenv("MAX_ORCHESTRATOR_ITERATIONS", "25"))
@@ -40,65 +74,13 @@ MEMORY_ENABLED: bool = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 MEMORY_DIR: str = os.getenv("MEMORY_DIR", ".memory")
 MEMORY_RETRIEVE_K: int = int(os.getenv("MEMORY_RETRIEVE_K", "3"))
 
-# --- MCP Configuration ---
-MCP_ENABLED: bool = os.getenv("MCP_ENABLED", "false").lower() == "true"
-MCP_SERVERS: list[dict] = [
-    {
-        "name": "market-data",
-        "transport": "stdio",
-        "command": "python",
-        "args": ["mcp_tools/yfinance_server.py"],
-        "enabled": True,
-    },
-    # Example: database server (requires npx/Node.js)
-    # {
-    #     "name": "postgres",
-    #     "transport": "stdio",
-    #     "command": "npx",
-    #     "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://..."],
-    #     "enabled": True,
-    # },
-]
+# --- Market Data ---
+# Prices, fundamentals and headlines come from Yahoo Finance, macro series
+# from FRED. Both are free and need no key. Every fetch is saved as a
+# point-in-time snapshot under SNAPSHOT_DIR.
+MARKET_DATA_ENABLED: bool = os.getenv("MARKET_DATA_ENABLED", "true").lower() == "true"
+SNAPSHOT_DIR: str = os.getenv("SNAPSHOT_DIR", str(PROJECT_ROOT / "data_store" / "snapshots"))
 
-# --- Agent Tiers (Optimization 1: upstream agents produce signals first) ---
-AGENT_TIERS: dict[str, list[str]] = {
-    "tier1": ["central_bank", "fiscal_policy", "commodities_inflation"],
-    "tier2": ["fixed_income", "equity_market", "forex", "sentiment"],
-}
-
-# --- Agent Routing by Policy Type (Optimization 2: selective activation) ---
-AGENT_ROUTING: dict[str, dict[str, list[str]]] = {
-    "monetary": {
-        "tier1": ["central_bank", "commodities_inflation"],
-        "tier2": ["fixed_income", "forex", "equity_market", "sentiment"],
-        "skip": ["fiscal_policy"],
-    },
-    "fiscal": {
-        "tier1": ["fiscal_policy", "central_bank"],
-        "tier2": ["fixed_income", "equity_market", "sentiment"],
-        "skip": ["forex", "commodities_inflation"],
-    },
-    "trade": {
-        "tier1": ["commodities_inflation", "fiscal_policy"],
-        "tier2": ["forex", "equity_market", "fixed_income", "sentiment"],
-        "skip": [],
-    },
-    "regulatory": {
-        "tier1": ["fiscal_policy"],
-        "tier2": ["equity_market", "fixed_income", "sentiment"],
-        "skip": ["central_bank", "forex", "commodities_inflation"],
-    },
-    "supply_shock": {
-        "tier1": ["commodities_inflation", "central_bank"],
-        "tier2": ["equity_market", "fixed_income", "forex", "sentiment"],
-        "skip": ["fiscal_policy"],
-    },
-    "mixed": {
-        "tier1": ["central_bank", "fiscal_policy", "commodities_inflation"],
-        "tier2": ["fixed_income", "equity_market", "forex", "sentiment"],
-        "skip": [],
-    },
-}
 
 # --- Agent Definitions ---
 AGENT_ROSTER: list[dict] = [

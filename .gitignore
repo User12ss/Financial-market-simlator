@@ -3,6 +3,12 @@
 venv/
 .venv/
 
+# Runtime data
+.memory/
+data_store/
+.pytest_cache/
+.omc/
+
 # Python
 __pycache__/
 *.pyc
