@@ -28,6 +28,10 @@ if [ "$1" = "-c" ]; then
     exit 0
 fi
 echo "$*" >> "$FAKE_DIR/python_runs"
+case "${3:-}" in        # the desk's two quick questions, asked by scripts/desk_tick.sh
+    watch) cat "$FAKE_DIR/watch.txt" 2>/dev/null; exit "$(cat "$FAKE_DIR/watch_exit" 2>/dev/null || echo 0)" ;;
+    due) cat "$FAKE_DIR/due.txt" 2>/dev/null; exit 0 ;;
+esac
 echo $$ > "$FAKE_DIR/python_pid"
 cat "$FAKE_DIR/output.txt"
 [ ! -f "$FAKE_DIR/stubborn" ] || trap '' TERM
@@ -85,7 +89,7 @@ class Sandbox:
         bin_dir = tmp_path / "bin"
         for folder in (self.project / "scripts", self.project / "venv" / "bin", self.fake, bin_dir):
             folder.mkdir(parents=True, exist_ok=True)
-        for name in ("daily_run.sh", "schedule.sh"):
+        for name in ("daily_run.sh", "schedule.sh", "desk_tick.sh"):
             shutil.copy(SCRIPTS / name, self.project / "scripts" / name)
         for name, body in STUBS.items():
             target = (self.project / "venv" / "bin" if name == "python" else bin_dir) / name

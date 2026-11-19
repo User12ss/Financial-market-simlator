@@ -4,23 +4,38 @@
 
 import {
   el, clear, getJSON, usd, signedUsd, pct, signedPct, rate, num, when, span, bytes, word, delta, state, runState,
-  tile, card, empty, table, DASH,
+  tile, card, empty, table, hideTip, DASH,
 } from "./dom.js";
 import { lineChart, rateBars, quantileStrip, meter } from "./charts.js";
+import { dayStrip } from "./day.js";
+import { buildTrail, fateText, funnel, outcome, outcomeText } from "./decisions.js";
 import { roomFeed } from "./live.js";
 import { meetingRoom } from "./meeting.js";
+import { countUp } from "./motion.js";
+import { decisionTrail, funnelBar } from "./trail.js";
 
 const SERIES = { account: "var(--series-1)", benchmark: "var(--series-2)", candidates: "var(--series-3)" };
 const money = (value, short) => usd(value, short ? 0 : 2);
 
-/** A page that shows one answer from the server and repaints only when the answer has changed. */
-function dataPage(ctx, path, paint) {
+/** A figure that runs up to its value when it first appears. It always ends on exactly that value. */
+function counted(value, write) {
+  const node = el("span", {});
+  countUp(node, value, write);
+  return node;
+}
+
+/**
+ * A page that shows one answer from the server and repaints only when the answer has changed.
+ * `source` is the address to read, or a function that reads and returns the answer.
+ */
+function dataPage(ctx, source, paint) {
+  const read = typeof source === "function" ? source : () => getJSON(source, { arm: ctx.arm });
   const warning = el("p", { class: "banner", hidden: true });
   const body = el("div", { class: "stack" });
   const node = el("div", { class: "stack" }, warning, body);
   let last = null;                                   // what is on the page now, when it was read successfully
   async function refresh() {
-    const answer = await getJSON(path, { arm: ctx.arm });
+    const answer = await read();
     if (answer.status === 0 && last !== null) {
       // The server cannot be reached. What was last read stays up, marked as such, rather than vanishing.
       warning.textContent = `⚠ ${answer.data.error}下面是最后一次读到的内容，可能已经过时。`;
@@ -85,13 +100,13 @@ function paintOverview(node, data) {
     return;
   }
   node.append(el("div", { class: "kpis" },
-    tile("账户净值", usd(account.equity), `截至 ${account.as_of || DASH} 收盘`, true),
-    tile("累计收益", delta(account.return_pct, signedPct(account.return_pct)), `初始资金 ${usd(account.initial_cash, 0)}`),
-    tile("当日盈亏", delta(account.day_change_pct, signedPct(account.day_change_pct)),
+    tile("账户净值", counted(account.equity, usd), `截至 ${account.as_of || DASH} 收盘`, true),
+    tile("累计收益", delta(account.return_pct, counted(account.return_pct, signedPct)), `初始资金 ${usd(account.initial_cash, 0)}`),
+    tile("当日盈亏", delta(account.day_change_pct, counted(account.day_change_pct, signedPct)),
       account.day_change_pct === null ? "只有一个交易日，还算不出" : "相对上一个交易日"),
-    tile("现金", usd(account.cash), account.equity ? `占净值 ${pct((account.cash / account.equity) * 100, 1)}` : null),
-    tile("持仓市值", usd(account.positions_value), `${data.positions} 只持仓，${data.open_orders} 张订单等待成交`),
-    tile("距最高点回撤", pct(account.drawdown_pct), `最高点 ${usd(account.high_water)}`)));
+    tile("现金", counted(account.cash, usd), account.equity ? `占净值 ${pct((account.cash / account.equity) * 100, 1)}` : null),
+    tile("持仓市值", counted(account.positions_value, usd), `${data.positions} 只持仓，${data.open_orders} 张订单等待成交`),
+    tile("距最高点回撤", counted(account.drawdown_pct, pct), `最高点 ${usd(account.high_water)}`)));
 
   const series = data.curves.map((curve) => ({ name: curve.name, color: SERIES[curve.key], points: curve.points }));
   const about = data.evaluated_as_of
@@ -100,9 +115,35 @@ function paintOverview(node, data) {
   node.append(el("div", { class: "grid cols-2" },
     card("净值和基准", about, lineChart({ series, valueText: money, label: "账户净值和基准的走势" })),
     guards(data)));
+  if (data.meeting && data.meeting.run) node.append(lastDecisions(data.meeting));
 }
 
-export const overviewPage = (ctx) => dataPage(ctx, "/api/overview", paintOverview);
+/** The latest session in one row: how many views became how many orders, and which ones. */
+function lastDecisions(meeting) {
+  const trail = buildTrail(meeting.events);
+  const bar = funnelBar();
+  bar.set(funnel(trail));
+  const placed = trail.filter((row) => outcome(row).kind === "ordered");
+  // The address starts with "#replay/" and ends in a date the server sent, so it can only lead to this page's own replay.
+  return card(`${meeting.session} 收盘会的决策`, "从分析师的观点到最后下的订单，每一步剩下多少只。",
+    bar.node,
+    el("p", { class: "small" }, placed.length ? "下了订单的：" : "这一场没有下订单。",
+      placed.map((row) => el("span", { class: "chip", text: `${row.ticker} ${outcomeText(outcome(row), true).replace("已下单：", "")}` }))),
+    el("p", { class: "small" }, el("a", { href: `#replay/${meeting.session}`, text: "去回放看这一场是怎么讨论出来的 →" })));
+}
+
+/**
+ * The first page needs the account and, for its last card, the record of the latest close meeting: the meeting
+ * that decides what is bought. (A desk's check-ins in between can only cut or take back, and have the room.)
+ */
+async function readOverview(ctx) {
+  const [overview, meeting] = await Promise.all([
+    getJSON("/api/overview", { arm: ctx.arm }), getJSON("/api/meeting", { arm: ctx.arm, kind: "close" })]);
+  if (!overview.ok) return overview;
+  return { ...overview, data: { ...overview.data, meeting: meeting.ok ? meeting.data : null } };
+}
+
+export const overviewPage = (ctx) => dataPage(ctx, () => readOverview(ctx), paintOverview);
 
 // ── 持仓和订单 ───────────────────────────────────────────────────────────────
 
@@ -399,26 +440,90 @@ export const statusPage = (ctx) => dataPage(ctx, "/api/status", paintStatus);
 
 // ── 会议室 ───────────────────────────────────────────────────────────────────
 
-/** A room and what keeps it in step with the server (the rules are in live.js), with a place to say what went wrong. */
-function fedRoom(ctx) {
+/**
+ * A room and what keeps it in step with the server (the rules are in live.js), with a place to say what went
+ * wrong, and above it the day's strip: the meetings held that day and the watch's last round. `pick(day, id)`
+ * is what choosing a meeting on the strip does (by default the room simply opens it); `now`, when given, is how
+ * the reader gets back to what the desk is at.
+ */
+function fedRoom(ctx, { pick = null, now = null } = {}) {
   const room = meetingRoom({ roster: ctx.roster });
   const problem = el("p", { class: "banner", hidden: true });
+  // The day in the room. Read again whenever the room is loaded, and once a minute: the watch goes on
+  // between meetings, and its line would otherwise stand still.
+  const day = { session: null, asked: 0 };
+  const strip = dayStrip({
+    onPick: (session, id) => (pick ? pick(session, id) : feed.open({ session, run_id: id })),
+    onNow: now,
+  });
+  async function readDay() {
+    const mine = day.asked += 1;
+    const answer = await getJSON("/api/day", day.session ? { arm: ctx.arm, day: day.session } : { arm: ctx.arm });
+    if (mine !== day.asked || !answer.ok) return;        // asked again since, or not readable just now: keep what is shown
+    strip.load(answer.data, room.runId(), Boolean(feed.target().run_id));
+  }
+  const minutely = window.setInterval(readDay, 60000);
+  // The market data of whichever run is in the room. A run's snapshot does not change while it goes on, so it
+  // is read once per run; if it could not be read, it is asked for again the next time the room is loaded.
+  // The tape along the top goes with the room: it shows the prices of the run in the room, never those of a
+  // later session while an earlier one is being played. Until they have been read it shows nothing.
+  const market = { run: null, asked: 0 };
+  ctx.tape(null);
+  async function readMarket() {
+    const run = room.runId();
+    if (run === market.run) return;
+    market.run = run;
+    const mine = market.asked += 1;
+    if (!run) {
+      room.setMarket(null);
+      ctx.tape(null);
+      return;
+    }
+    const answer = await getJSON("/api/market", { arm: ctx.arm, run_id: run });
+    if (mine !== market.asked) return;                // the room has moved on to another run since
+    if (!answer.ok) market.run = null;
+    room.setMarket(answer.ok ? answer.data : { available: false, reason: "unreachable" });
+    ctx.tape(answer.ok ? answer.data : null);
+  }
   const feed = roomFeed({
-    room, live: ctx.live,
+    room: {
+      ...room,
+      load: (meeting) => {
+        room.load(meeting);
+        day.session = meeting.session;
+        readMarket();
+        readDay();
+      },
+    },
+    live: ctx.live,
     fetchMeeting: (target) => getJSON("/api/meeting", { arm: ctx.arm, ...target }),
     onProblem: (text) => {
       problem.hidden = text === null;
       problem.textContent = text === null ? "" : `⚠ ${text}`;
     },
   });
-  return { room, feed, problem, close: () => { feed.stop(); room.destroy(); } };
+  const close = () => {
+    window.clearInterval(minutely);
+    day.asked += 1;
+    feed.stop();
+    market.asked += 1;
+    room.destroy();
+  };
+  return { room, feed, problem, strip, close };
 }
 
-/** The latest session, live while its run is going: new lines arrive over the stream and appear by themselves. */
+/**
+ * What the desk is at now: the meeting that is going, live, or the last one that was held. New lines arrive
+ * over the stream and appear by themselves. An earlier meeting of the day can be opened from the strip.
+ */
 export function roomPage(ctx) {
-  const { room, feed, problem, close } = fedRoom(ctx);
+  const fed = fedRoom(ctx, { now: () => fed.feed.open({}) });
+  const { room, feed, problem, strip, close } = fed;
   feed.open({});
-  return { node: el("div", { class: "stack" }, problem, room.node), onStream: feed.hear, refresh: feed.reload, destroy: close };
+  return {
+    node: el("div", { class: "stack" }, problem, strip.node, room.node), onStream: feed.hear, refresh: feed.reload,
+    destroy: close,
+  };
 }
 
 // ── 回放 ─────────────────────────────────────────────────────────────────────
@@ -430,12 +535,13 @@ export function roomPage(ctx) {
  * going is followed as in the meeting room.
  */
 export function replayPage(ctx) {
-  const { room, feed, problem, close } = fedRoom(ctx);
+  const { room, feed, problem, strip, close } = fedRoom(ctx, { pick: (session, id) => open(session, id) });
   const picker = el("div", { class: "sessions" });
   const node = el("div", { class: "stack" },
     el("h1", { text: "回放" }),
-    card("选一个交易日", "选一天，放的是当天算数的那一次运行。要看某一次失败或被取代的运行，从“运行状态”页点进来。", picker),
-    problem, room.node);
+    card("选一个交易日", "选一天，放的是当天的收盘会（还没开收盘会的那天，放最近一场）；当天别的会议在下面那一条里选。"
+      + "要看某一次失败或被取代的运行，从“运行状态”页点进来。", picker),
+    problem, strip.node, room.node);
   let sessions = [];
   let started = false;
 
@@ -451,8 +557,9 @@ export function replayPage(ctx) {
   }
   function open(session, run = null) {
     window.history.replaceState(null, "", run ? `#replay/${session}/${encodeURIComponent(run)}` : `#replay/${session}`);
-    feed.open(run ? { session, run_id: run } : { session });
+    const loaded = feed.open(run ? { session, run_id: run } : { session });
     paintPicker();
+    return loaded;
   }
   async function refresh() {
     const answer = await getJSON("/api/sessions", { arm: ctx.arm });
@@ -464,11 +571,114 @@ export function replayPage(ctx) {
     } else if (sessions.length) {
       started = true;
       const asked = sessions.some((item) => item.session === ctx.param);
-      open(asked ? ctx.param : sessions[0].session, asked ? ctx.run : null);
+      const loaded = open(asked ? ctx.param : sessions[0].session, asked ? ctx.run : null);
+      // Sent here for one particular line (from the decisions page): go straight to it.
+      if (asked && ctx.line) loaded.then((there) => { if (there) room.seek(ctx.line - 1); });
     } else {
       paintPicker();
     }
   }
   refresh();
   return { node, refresh, onStream: feed.hear, destroy: close };
+}
+
+// ── 决策 ─────────────────────────────────────────────────────────────────────
+
+/**
+ * One ticker on one day: which way the analyst leaned, what was done about it, and whether that differs from the
+ * day before. It leads to the replay of the very run the cell was read from. (The address starts with "#replay/",
+ * so whatever a run is called it can only lead to this page's own replay.)
+ */
+function matrixCell(now, before, day) {
+  if (!now) return el("span", { class: "cell-none", "aria-label": "这一场没有涉及", text: "·" });
+  const way = { bullish: "up", bearish: "down" }[now.direction] || null;
+  const glyph = { bullish: "▲ ", neutral: "◆ ", bearish: "▼ " }[now.direction] || "";
+  const turned = Boolean(before && before.direction && now.direction && before.direction !== now.direction);
+  const did = fateText(now);
+  return el("a", {
+    class: ["cell-box", now.held ? "held" : "", turned ? "changed" : ""].filter(Boolean).join(" "),
+    href: `#replay/${day.session}/${encodeURIComponent(day.run_id)}`,
+  },
+    el("b", { class: way },
+      now.direction ? `${glyph}${word("direction", now.direction)} ${num(now.confidence, 2)}` : "没有观点"),
+    did ? el("span", { text: did }) : null,
+    now.repeats ? el("span", { text: `另有 ${now.repeats} 条重复提案不算` }) : null,
+    now.held ? el("span", { text: "当时持仓" }) : null,
+    turned ? el("span", { class: "mark", text: `上一场是${word("direction", before.direction)}` }) : null);
+}
+
+function matrix(history) {
+  if (history.sessions.length === 0) return empty("还没有完成过一场，没有可以比的。");
+  const head = el("tr", {}, el("th", {}),
+    history.sessions.map((item) => el("th", { class: "day" }, item.session.slice(5),
+      el("small", { text: item.regime
+        ? `${word("appetite", item.regime.risk_appetite)} ${num(item.regime.confidence, 2)}` : "没有宏观结论" }),
+      item.halted ? el("small", { text: "当时停机" }) : null)));
+  const rows = history.tickers.map((ticker) => el("tr", {},
+    el("th", { class: "name", text: ticker }),
+    history.sessions.map((item, at) => el("td", {},
+      matrixCell(item.tickers[ticker], at ? history.sessions[at - 1].tickers[ticker] : null, item)))));
+  return el("div", { class: "scroll" }, el("table", { class: "matrix" }, el("thead", {}, head), el("tbody", {}, rows)));
+}
+
+/**
+ * How decisions changed from session to session, and how one session's were
+ * made: a grid of every ticker against every finished session, and under it
+ * the trail of whichever session is picked.
+ */
+export function decisionsPage(ctx) {
+  const grid = el("div", {});
+  const picker = el("div", { class: "sessions" });
+  let chosen = null;                                 // the day whose trail is shown, with the run the grid read it from
+  let shown = { history: null, meeting: null };
+  const trail = decisionTrail({
+    // To the same run the grid and the trail were read from, at the line the cell stands for.
+    onSeek: (line) => { window.location.hash = `#replay/${chosen.session}/${encodeURIComponent(chosen.run_id)}/${line + 1}`; },
+    lead: "每只股票一行，从左到右是它走过的每一步。点任一格，到回放里看那一句原话。",
+    whole: true,                                     // a finished run, shown as it ended
+  });
+  const node = el("div", { class: "stack" },
+    el("h1", { text: "决策" }),
+    card("每只股票的决策是怎么变的",
+      "一列是一个交易日，日期下面是当天的宏观结论。一格里是分析师的方向和把握度、当天对它做了什么。"
+      + "“风控放行”是订单通过了风控，取自当天的信号表；成交情况在“持仓和订单”页。"
+      + "左边有色条的是当时持仓；框起来并带黑色标记的，是方向和上一场不一样。点一格，回放那一天。", grid),
+    card("看哪一场的决策过程", "和上面那张表读的是同一次运行：当天算数的那一次。", picker),
+    trail.node);
+
+  async function open(day) {
+    chosen = day;
+    for (const item of picker.querySelectorAll("button")) item.setAttribute("aria-pressed", String(item.dataset.day === day.session));
+    const answer = await getJSON("/api/meeting", { arm: ctx.arm, run_id: day.run_id });
+    if (!answer.ok || !answer.data.run || chosen !== day) return;
+    const text = JSON.stringify(answer.data.events);
+    if (text === shown.meeting) return;
+    shown.meeting = text;
+    // A run in this grid has finished, so its record is over at its last line.
+    trail.load(answer.data.events, answer.data.run.run_id, false);
+    trail.update(answer.data.events.length - 1);      // its last line; this trail shows the whole record wherever it is
+  }
+  async function refresh() {
+    const answer = await getJSON("/api/history", { arm: ctx.arm });
+    if (!answer.ok) {
+      clear(grid).append(empty(answer.data.error || "读不到数据。"));
+      return;
+    }
+    const days = answer.data.sessions;
+    const text = JSON.stringify(answer.data);
+    if (text !== shown.history) {
+      shown.history = text;
+      clear(grid).append(matrix(answer.data));
+      clear(picker);
+      if (days.length === 0) picker.append(empty("还没有完成过一场。"));
+      for (const day of days.slice().reverse()) {
+        picker.append(el("button", { type: "button", "data-day": day.session, "aria-pressed": "false", onclick: () => open(day), text: day.session }));
+      }
+    }
+    // Keep the day that was picked, read again from the run that stands for it now; else the latest.
+    const kept = chosen ? days.find((day) => day.session === chosen.session) : null;
+    if (days.length) open(kept || days[days.length - 1]);
+  }
+  refresh();
+  return { node, refresh, destroy: hideTip };
 }

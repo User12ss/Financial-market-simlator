@@ -89,9 +89,9 @@ class OnlyNamed:
 
 def create_app(
     journal_path: str | Path | None = None, evaluation_dir: str | Path | None = None, poll_seconds: float = 1.0,
-    host: str | None = None,
+    host: str | None = None, ledger_path: str | Path | None = None,
 ) -> Starlette:
-    reader = Reader(journal_path, evaluation_dir)
+    reader = Reader(journal_path, evaluation_dir, ledger_path)
 
     def reply(data: dict, status: int = 200) -> JSONResponse:
         return JSONResponse(data, status_code=status, headers=NO_STORE)
@@ -181,15 +181,24 @@ def create_app(
 
     def meeting(arm: str, request: Request) -> dict:
         params = request.query_params
-        return reader.meeting(arm, params.get("session") or None, params.get("run_id") or None)
+        return reader.meeting(arm, params.get("session") or None, params.get("run_id") or None,
+                              close_only=params.get("kind") == "close")
+
+    def market(arm: str, request: Request) -> dict:
+        params = request.query_params
+        return reader.market(arm, params.get("session") or None, params.get("run_id") or None)
 
     routes = [
         Route("/api/roster", roster, methods=["GET"]),
         Route("/api/arms", arms, methods=["GET"]),
         Route("/api/sessions", page(lambda arm, request: {"arm": arm, "sessions": reader.sessions(arm)}), methods=["GET"]),
         Route("/api/meeting", page(meeting), methods=["GET"]),
+        Route("/api/day", page(lambda arm, request: reader.day(arm, request.query_params.get("day") or None)),
+              methods=["GET"]),
+        Route("/api/market", page(market), methods=["GET"]),
         Route("/api/overview", page(lambda arm, request: reader.overview(arm)), methods=["GET"]),
         Route("/api/book", page(lambda arm, request: reader.book(arm)), methods=["GET"]),
+        Route("/api/history", page(lambda arm, request: reader.history(arm)), methods=["GET"]),
         Route("/api/evaluation", page(lambda arm, request: reader.evaluation(arm)), methods=["GET"]),
         Route("/api/status", page(lambda arm, request: reader.status(arm)), methods=["GET"]),
         Route("/api/stream", stream, methods=["GET"]),

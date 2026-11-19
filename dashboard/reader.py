@@ -23,6 +23,8 @@ from typing import Iterator
 
 import config
 from dashboard.personas import STAGES, title_of
+from data.ledger import Ledger
+from data.models import Bars, Snapshot
 from journal.store import COMPLETED
 from models.evaluation import Evaluation
 from models.signals import SignalTable
@@ -31,6 +33,11 @@ from risk.gate import halted
 STAGE_TITLES = dict(STAGES)
 FILLS_SHOWN = 100
 RUNS_SHOWN = 60
+SESSIONS_SHOWN = 30                 # how far back the page that sets sessions side by side goes
+BARS_SHOWN = 120                    # daily bars of a ticker sent to the page: about half a year
+AFTER_SHOWN = 60                    # bars after a session, from later sessions' snapshots
+SNAPSHOTS_KEPT = SESSIONS_SHOWN + 2 # snapshots held in memory once read
+SAME_PRICE = 0.005                  # two snapshots agree on a day's close when they are this close (as a share of it)
 # Not a status the journal holds. It is what the page calls a run that is on record as
 # running although the process that was running it no longer exists.
 INTERRUPTED = "interrupted"
@@ -68,11 +75,42 @@ def _status(row: sqlite3.Row) -> str:
     return row["status"]
 
 
+# A check-in of the desk, read as if it were a run: the same columns under the same names, so
+# the page shows the two alike. Its `session_date` is the trading day it was held on, and
+# `built_on` the session whose close meeting it asked about. Close meetings are runs already.
+_CHECKINS = (
+    "SELECT meeting_id AS run_id, arm, day AS session_date, started_at, finished_at, status, error, pid, "
+    "NULL AS snapshot_path, llm_calls, input_tokens, output_tokens, model_seconds, cost_usd, NULL AS signals_json, "
+    "kind, as_of, session_date AS built_on FROM meetings WHERE kind != 'close' AND arm = ?"
+)
+
+
+def _kind(row: sqlite3.Row) -> str:
+    """Which meeting a row is: a run is the close meeting, a check-in says its own kind."""
+    return row["kind"] if "kind" in row.keys() else "close"
+
+
+def _shown(rows: list[sqlite3.Row]) -> sqlite3.Row | None:
+    """Of several attempts, newest first: one still going, else the one that stands, else the last attempt."""
+    for wanted in (("running",), COMPLETED):
+        for row in rows:
+            if _status(row) in wanted:
+                return row
+    return rows[0] if rows else None
+
+
 class Reader:
-    def __init__(self, journal_path: str | Path | None = None, evaluation_dir: str | Path | None = None) -> None:
+    def __init__(
+        self, journal_path: str | Path | None = None, evaluation_dir: str | Path | None = None,
+        ledger_path: str | Path | None = None,
+    ) -> None:
         self.journal_path = Path(journal_path or config.JOURNAL_PATH)
         self.evaluation_dir = Path(evaluation_dir or config.EVALUATION_DIR)
+        # The desk's ledger lies beside the journal it belongs to, unless it is named.
+        self.ledger_path = Path(ledger_path) if ledger_path else (
+            self.journal_path.with_name("ledger.sqlite3") if journal_path else Path(config.LEDGER_PATH))
         self._report: tuple[Path, bytes, Evaluation] | None = None      # the last report read, to read it only once
+        self._snapshots: dict[str, tuple[tuple[int, int], Snapshot]] = {}    # data snapshots read, by the file's path
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
@@ -94,53 +132,174 @@ class Reader:
     @staticmethod
     def _shown_run(db: sqlite3.Connection, arm: str, session: str) -> sqlite3.Row | None:
         """The run to show for a session: one still going, else the one that stands, else the last attempt."""
-        rows = db.execute(
+        return _shown(db.execute(
             "SELECT * FROM runs WHERE arm = ? AND session_date = ? ORDER BY started_at DESC, rowid DESC", (arm, session)
-        ).fetchall()
-        for wanted in (("running",), COMPLETED):
-            for row in rows:
-                if _status(row) in wanted:
-                    return row
-        return rows[0] if rows else None
+        ).fetchall())
+
+    @staticmethod
+    def _checkins(db: sqlite3.Connection, arm: str, where: str = "", params: tuple = ()) -> list[sqlite3.Row]:
+        """An arm's check-ins, newest first. None for a journal no desk has written to: it has no such table."""
+        try:
+            return db.execute(f"{_CHECKINS}{where} ORDER BY started_at DESC, rowid DESC", (arm, *params)).fetchall()
+        except sqlite3.OperationalError as error:
+            if "no such table" in str(error):
+                return []
+            raise
+
+    @staticmethod
+    def _cutoff(db: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+        """A meeting's cut-off: nothing first seen after it was shown. Only the desk's meetings have one."""
+        if "as_of" in row.keys():
+            return row["as_of"]
+        try:
+            found = db.execute("SELECT as_of FROM meetings WHERE meeting_id = ?", (row["run_id"],)).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" in str(error):
+                return None
+            raise
+        return found["as_of"] if found else None
+
+    def _day_meetings(self, db: sqlite3.Connection, arm: str, day: str) -> list[sqlite3.Row]:
+        """The meetings of one trading day, in the order they were held: for each kind, the one that is shown."""
+        by_kind: dict[str, list[sqlite3.Row]] = {}
+        for row in self._checkins(db, arm, " AND day = ?", (day,)):
+            by_kind.setdefault(row["kind"], []).append(row)
+        found = [_shown(rows) for rows in by_kind.values()]
+        close = self._shown_run(db, arm, day)
+        if close is not None:
+            found.append(close)
+        return sorted(found, key=lambda row: datetime.fromisoformat(row["started_at"]))
+
+    def _shown_for_day(self, db: sqlite3.Connection, arm: str, day: str) -> sqlite3.Row | None:
+        """The meeting to show for a day: its close meeting, else the last check-in held so far."""
+        close = self._shown_run(db, arm, day)
+        if close is not None:
+            return close
+        held = self._day_meetings(db, arm, day)
+        return held[-1] if held else None
+
+    def _stands(self, db: sqlite3.Connection, arm: str, row: sqlite3.Row) -> bool:
+        """Whether a meeting is the one shown for its day and kind, or another attempt at it."""
+        if _kind(row) == "close":
+            return self._shown_run(db, arm, row["session_date"])["run_id"] == row["run_id"]
+        attempts = self._checkins(db, arm, " AND day = ? AND kind = ?", (row["session_date"], row["kind"]))
+        return _shown(attempts)["run_id"] == row["run_id"]
+
+    def _latest(self, db: sqlite3.Connection, arm: str) -> sqlite3.Row | None:
+        """What the desk is at now: a meeting still going, else the last one that was held.
+
+        For an arm that holds no check-ins this is the run shown for its
+        latest session, as it always was.
+        """
+        session = db.execute("SELECT MAX(session_date) FROM runs WHERE arm = ?", (arm,)).fetchone()[0]
+        run = self._shown_run(db, arm, session) if session else None
+        checkins = self._checkins(db, arm)
+        going = [row for row in checkins if _status(row) == "running"]
+        if going:
+            return going[0]
+        held = next((row for row in checkins if row["status"] in COMPLETED), None)
+        if run is None or held is None or _status(run) == "running":
+            return run if run is not None else (held or (checkins[0] if checkins else None))
+        later = datetime.fromisoformat(held["started_at"]) > datetime.fromisoformat(run["started_at"])
+        return held if later else run
+
+    def _named_run(
+        self, db: sqlite3.Connection, arm: str, session: str | None, run_id: str | None, close_only: bool = False,
+    ) -> sqlite3.Row | None:
+        """The meeting that is asked for: one by name, else the one shown for a day, else what the desk is at now.
+
+        With `close_only` and nothing named, it is the close meeting of the latest session that has one.
+        """
+        if run_id is not None:
+            run = db.execute("SELECT * FROM runs WHERE run_id = ? AND arm = ?", (run_id, arm)).fetchone()
+            if run is not None:
+                return run
+            found = self._checkins(db, arm, " AND meeting_id = ?", (run_id,))
+            return found[0] if found else None
+        if session is None and close_only:
+            latest = db.execute("SELECT MAX(session_date) FROM runs WHERE arm = ?", (arm,)).fetchone()[0]
+            return self._shown_run(db, arm, latest) if latest else None
+        if session is None:
+            return self._latest(db, arm)
+        return self._shown_for_day(db, arm, session)
+
+    def _days(self, db: sqlite3.Connection, arm: str) -> list[str]:
+        """Every trading day an arm held a meeting on, newest first."""
+        days = {row["session_date"] for row in db.execute("SELECT DISTINCT session_date FROM runs WHERE arm = ?", (arm,))}
+        days |= {row["session_date"] for row in self._checkins(db, arm)}
+        return sorted(days, reverse=True)
+
+    @staticmethod
+    def _lines(db: sqlite3.Connection, run_id: str) -> int:
+        return db.execute("SELECT COUNT(*) FROM events WHERE run_id = ?", (run_id,)).fetchone()[0]
 
     def sessions(self, arm: str) -> list[dict]:
-        """Every session an arm has a run for, newest first, with the run that is shown for it."""
+        """Every trading day an arm held a meeting on, newest first, with the meeting that is shown for it."""
         with self._db() as db:
-            days = [row["session_date"] for row in db.execute(
-                "SELECT DISTINCT session_date FROM runs WHERE arm = ? ORDER BY session_date DESC", (arm,))]
             found = []
-            for day in days:
-                run = self._shown_run(db, arm, day)
-                count = db.execute("SELECT COUNT(*) FROM events WHERE run_id = ?", (run["run_id"],)).fetchone()[0]
-                found.append({"session": day, **_run(run), "events": count})
+            for day in self._days(db, arm):
+                run = self._shown_for_day(db, arm, day)
+                found.append({"session": day, **_run(run), "events": self._lines(db, run["run_id"])})
             return found
+
+    def day(self, arm: str, day: str | None = None) -> dict:
+        """One trading day at the desk: its meetings in the order they were held, and the watch's last round.
+
+        Without a day it is the latest one any meeting was held on. For each
+        kind of meeting the one that is shown is listed, as for a session's
+        run. `watch` is the last round of the watch on record for this arm,
+        whatever day it was on; None when there is no ledger or no round.
+        """
+        with self._db() as db:
+            if day is None:
+                days = self._days(db, arm)
+                day = days[0] if days else None
+            meetings = [] if day is None else [
+                {"session": day, **_run(row, self._cutoff(db, row)), "events": self._lines(db, row["run_id"])}
+                for row in self._day_meetings(db, arm, day)
+            ]
+        return {"arm": arm, "day": day, "meetings": meetings, "watch": self.watch(arm)}
+
+    def watch(self, arm: str) -> dict | None:
+        """The last round of the desk's watch, as the ledger recorded it. The ledger is only read."""
+        try:
+            ledger = Ledger(self.ledger_path, read_only=True)
+        except (sqlite3.Error, OSError, ValueError):
+            return None
+        try:
+            rounds = ledger.watches(arm, limit=1)
+        except (sqlite3.Error, ValueError):
+            return None
+        finally:
+            ledger.close()
+        return rounds[0] if rounds else None
 
     # ── The meeting ──────────────────────────────────────────────────────
 
-    def meeting(self, arm: str, session: str | None = None, run_id: str | None = None) -> dict:
-        """One run and everything said in it, in order.
+    def meeting(
+        self, arm: str, session: str | None = None, run_id: str | None = None, close_only: bool = False,
+    ) -> dict:
+        """One meeting and everything said in it, in order.
 
-        Named by `run_id`, it is that run, whichever attempt at its session
-        it was. Otherwise it is the run shown for `session`, or for the
-        latest session when none is named. A run or session this arm does
-        not have comes back empty, with no run. `stands` says whether the
-        run is the one shown for its session, or another attempt at it.
+        Named by `run_id`, it is that run or check-in, whichever attempt it
+        was. Otherwise it is the meeting shown for the day `session`: its
+        close meeting, or its last check-in while there is none yet. With
+        nothing named it is what the desk is at now, or, with `close_only`,
+        the latest close meeting. A meeting or day this arm does not have
+        comes back empty, with no run. `stands` says whether the meeting is
+        the one shown for its day and kind, or another attempt at it.
         """
         with self._db() as db:
-            if run_id is not None:
-                run = db.execute("SELECT * FROM runs WHERE run_id = ? AND arm = ?", (run_id, arm)).fetchone()
-            else:
-                if session is None:
-                    session = db.execute("SELECT MAX(session_date) FROM runs WHERE arm = ?", (arm,)).fetchone()[0]
-                run = self._shown_run(db, arm, session)
-            events, stands = [], None
+            run = self._named_run(db, arm, session, run_id, close_only)
+            events, stands, cutoff = [], None, None
             if run is not None:
                 events = [_event(row) for row in db.execute(
                     "SELECT event_json FROM events WHERE run_id = ? ORDER BY seq", (run["run_id"],))]
-                stands = self._shown_run(db, arm, run["session_date"])["run_id"] == run["run_id"]
+                stands = self._stands(db, arm, run)
+                cutoff = self._cutoff(db, run)
         return {
             "arm": arm, "session": None if run is None else run["session_date"],
-            "run": None if run is None else _run(run), "stands": stands,
+            "run": None if run is None else _run(run, cutoff), "stands": stands,
             "events": events, "today": today(events), "records": self.records(arm),
         }
 
@@ -189,14 +348,19 @@ class Reader:
                 "SELECT event_json FROM events WHERE run_id = ? AND seq > ? ORDER BY seq", (of_run, after))]
 
         with self._db() as db:
+            # The newest meeting of either sort: a run, or a check-in of the desk.
             newest = db.execute(
                 "SELECT * FROM runs WHERE arm = ? ORDER BY started_at DESC, rowid DESC LIMIT 1", (arm,)
             ).fetchone()
+            checkin = next(iter(self._checkins(db, arm)), None)
+            if checkin is not None and (newest is None or datetime.fromisoformat(checkin["started_at"])
+                                        > datetime.fromisoformat(newest["started_at"])):
+                newest = checkin
             if newest is None:
                 return [], run_id, seq, status
             messages = []
             if newest["run_id"] != run_id:
-                left = db.execute("SELECT * FROM runs WHERE run_id = ? AND arm = ?", (run_id, arm)).fetchone()
+                left = None if run_id is None else self._named_run(db, arm, None, run_id)
                 if left is not None:
                     messages += unseen(run_id, seq)
                     if _status(left) != status:
@@ -416,6 +580,214 @@ class Reader:
             "lessons": lessons, "lessons_shown": config.PIPELINE_USE_LESSONS,
         }
 
+    # ── How decisions changed from session to session ────────────────────
+
+    def history(self, arm: str) -> dict:
+        """What was decided about each ticker in each of the last finished sessions, oldest first.
+
+        Read from the signal table each standing run left: the analyst's
+        direction and confidence, whether the ticker was held, what was
+        proposed, what the checks and the risk gate did with it, and the
+        order that passed the gate. Tickers are listed with the most
+        recently active first.
+
+        Only the first proposal for a ticker counts, as in the pipeline:
+        `action`, `source` and `check` are that one's, and later ones are
+        counted in `repeats`. `kept_by_default` says the checks kept the
+        holding by their own default after turning the proposal back.
+        """
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT run_id, session_date, signals_json FROM runs WHERE arm = ? AND status IN ('ok', 'degraded') "
+                "AND signals_json IS NOT NULL ORDER BY session_date DESC, started_at DESC, rowid DESC", (arm,)
+            ).fetchall()
+        sessions: list[dict] = []
+        taken: set[str] = set()
+        for row in rows:
+            if row["session_date"] in taken:
+                continue                                # an older finished run of a day already taken: never twice
+            if len(sessions) == SESSIONS_SHOWN:
+                break
+            taken.add(row["session_date"])
+            table = SignalTable.model_validate_json(row["signals_json"])
+            tickers: dict[str, dict] = {}
+
+            def of(ticker: str) -> dict:
+                return tickers.setdefault(ticker, {
+                    "direction": None, "confidence": None, "held": False, "action": None, "source": None,
+                    "check": None, "repeats": 0, "kept_by_default": False, "verdict": None, "approved_shares": None,
+                    "ordered": None,
+                })
+
+            for position in table.holdings:
+                of(position.ticker)["held"] = True
+            for view in table.views:
+                of(view.ticker).update(direction=view.direction, confidence=view.confidence)
+                if view.held:
+                    of(view.ticker)["held"] = True      # the view says so itself, for a table that lists no holdings
+            for proposal in table.proposals:            # the manager's own first, in the order given, then the defaults
+                if not proposal.ticker:
+                    continue                            # written for no ticker at all: it is no ticker's decision
+                cell = of(proposal.ticker)
+                if cell["action"] is None:
+                    cell.update(action=proposal.action, source=proposal.source, check=proposal.status)
+                elif proposal.source == "default":
+                    cell["kept_by_default"] = True
+                else:
+                    cell["repeats"] += 1
+            for decision in table.risk:
+                of(decision.ticker).update(verdict=decision.verdict, approved_shares=decision.approved_shares)
+            for order in table.orders:
+                of(order.ticker)["ordered"] = {"side": order.side, "shares": order.shares}
+            sessions.append({
+                "session": row["session_date"], "run_id": row["run_id"], "status": table.status,
+                "halted": bool(table.halted),
+                "regime": None if table.regime is None else {
+                    "risk_appetite": table.regime.risk_appetite, "confidence": table.regime.confidence,
+                },
+                "tickers": tickers,
+            })
+        sessions.reverse()
+        last_seen = {ticker: at for at, item in enumerate(sessions) for ticker in item["tickers"]}
+        return {
+            "arm": arm, "sessions": sessions,
+            "tickers": sorted(last_seen, key=lambda ticker: (-last_seen[ticker], ticker)),
+        }
+
+    # ── The market data a run worked from ────────────────────────────────
+
+    def _snapshot(self, path: str | None) -> Snapshot | None:
+        """The data snapshot a run recorded, read from the file the journal names. None when it cannot be read.
+
+        The file is only read. A snapshot that has been read is kept, and read
+        again only when the file has changed.
+        """
+        if not path:
+            return None
+        file = Path(path)
+        try:
+            found = file.stat()
+            stamp = (found.st_mtime_ns, found.st_size)
+            kept = self._snapshots.get(path)
+            if kept is None or kept[0] != stamp:
+                kept = (stamp, Snapshot.model_validate_json(file.read_text(encoding="utf-8")))
+                if len(self._snapshots) >= SNAPSHOTS_KEPT:
+                    self._snapshots.pop(next(iter(self._snapshots)))      # the one read longest ago
+                self._snapshots[path] = kept
+            return kept[1]
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _snapshot_path(db: sqlite3.Connection, run: sqlite3.Row) -> str | None:
+        """Where a run's data snapshot was saved, or None when that is not on record for this run.
+
+        A run writes it down when it ends. While it is still going, the
+        place is on record in the session's data checkpoint, which the
+        pipeline saves before any model is called and which all model
+        configurations share. That checkpoint is the session's, not the
+        run's: once a run is no longer going (it failed before it had data,
+        or was killed and the session was run again with fresh data) the
+        checkpoint may hold another run's data, so it is not used.
+        """
+        if run["snapshot_path"]:
+            return run["snapshot_path"]
+        if _status(run) != "running":
+            return None
+        try:
+            saved = db.execute(
+                "SELECT value_json FROM checkpoints WHERE arm = '*' AND session_date = ? AND key = 'data'",
+                (run["session_date"],)).fetchone()
+            return json.loads(saved["value_json"])["snapshot_path"] if saved else None
+        except (sqlite3.OperationalError, ValueError, KeyError, TypeError):
+            return None
+
+    def _after(self, ticker: str, last_day: date, last_close: float, later: list[str]) -> dict | None:
+        """The bars a later session's snapshot holds for the days after `last_day`, newest snapshot first.
+
+        Taken only from a snapshot that has the same close for `last_day`, so
+        the two series are on one scale: a split in between changes the
+        earlier prices, and such a snapshot is passed over.
+        """
+        for path in later:
+            snapshot = self._snapshot(path)
+            item = snapshot.tickers.get(ticker) if snapshot else None
+            if item is None or last_day not in item.bars.dates:
+                continue
+            at = item.bars.dates.index(last_day)
+            same_scale = abs(item.bars.close[at] - last_close) <= SAME_PRICE * abs(last_close)
+            if not same_scale or at + 1 >= len(item.bars.dates):
+                continue
+            return {"through": snapshot.session_date.isoformat(), **_bars(item.bars, at + 1, at + 1 + AFTER_SHOWN)}
+        return None
+
+    def market(self, arm: str, session: str | None = None, run_id: str | None = None) -> dict:
+        """The prices and market figures one run worked from, as its own data snapshot recorded them.
+
+        Named like `meeting`: one run by `run_id`, else the run shown for
+        `session`, else for the latest session. For each ticker in the
+        snapshot: the daily bars up to that session, the price summary, the
+        indicators and the company figures the agents were shown. `after` is
+        what later sessions' snapshots recorded for the days that followed,
+        which nobody in that run could see; it is None when no later session
+        has that ticker. `available` is false, with the reason, when the run
+        left no snapshot or its file can no longer be read.
+        """
+        with self._db() as db:
+            asked = self._named_run(db, arm, session, run_id)
+            run = asked
+            if asked is not None and _kind(asked) != "close":
+                # A check-in worked from the data of the close meeting it asked about: the bars up to
+                # that session. What it saw of its own day is in its lines, not in a snapshot.
+                run = db.execute(
+                    "SELECT * FROM runs WHERE arm = ? AND session_date = ? AND status IN ('ok', 'degraded') "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1", (arm, asked["built_on"])).fetchone()
+            path = None if run is None else self._snapshot_path(db, run)
+            later = [] if run is None else [row["snapshot_path"] for row in db.execute(
+                "SELECT snapshot_path FROM runs WHERE arm = ? AND session_date > ? AND status IN ('ok', 'degraded') "
+                "AND snapshot_path IS NOT NULL ORDER BY session_date DESC, started_at DESC, rowid DESC LIMIT ?",
+                (arm, run["session_date"], SESSIONS_SHOWN))]
+        answer = {
+            "arm": arm, "session": None if run is None else run["session_date"],
+            "run_id": None if asked is None else asked["run_id"], "available": False, "reason": "no_run",
+            "captured_at": None, "tickers": {}, "market": [], "macro": [],
+        }
+        if asked is None:
+            return answer
+        if run is None:
+            return {**answer, "reason": "no_snapshot"}
+        snapshot = self._snapshot(path)
+        # Found through the session's checkpoint (the run has not written its own snapshot down yet): a run's
+        # data is always collected before the run starts, so a snapshot captured later is some other
+        # invocation's, saved over the checkpoint meanwhile. It is not shown as this run's.
+        if snapshot is not None and not run["snapshot_path"] and snapshot.created_at > datetime.fromisoformat(run["started_at"]):
+            snapshot = None
+        if snapshot is None:
+            return {**answer, "reason": "no_snapshot"}
+        tickers = {}
+        for ticker, item in snapshot.tickers.items():
+            count = len(item.bars.dates)
+            tickers[ticker] = {
+                "name": item.fundamentals.name if item.fundamentals else "",
+                "sector": item.fundamentals.sector if item.fundamentals else "",
+                "industry": item.fundamentals.industry if item.fundamentals else "",
+                "usable": item.usable,
+                "issues": [issue.model_dump(mode="json") for issue in item.issues],
+                "price": item.price.model_dump(mode="json") if item.price else None,
+                "technicals": item.technicals.model_dump(mode="json") if item.technicals else None,
+                "fundamentals": item.fundamentals.model_dump(
+                    mode="json", exclude={"name", "quote_type", "sector", "industry"}) if item.fundamentals else None,
+                "next_earnings": item.next_earnings.isoformat() if item.next_earnings else None,
+                "bars": _bars(item.bars, max(0, count - BARS_SHOWN), count),
+                "after": self._after(ticker, item.bars.dates[-1], item.bars.close[-1], later) if count else None,
+            }
+        return {
+            **answer, "available": True, "reason": None, "captured_at": snapshot.created_at.isoformat(),
+            "tickers": tickers,
+            "market": [point.model_dump(mode="json") for point in snapshot.market],
+            "macro": [point.model_dump(mode="json") for point in snapshot.macro],
+        }
+
     # ── How the runs went ────────────────────────────────────────────────
 
     def status(self, arm: str) -> dict:
@@ -449,7 +821,16 @@ class Reader:
 
 # ── Shapes ───────────────────────────────────────────────────────────────────
 
-def _run(row: sqlite3.Row) -> dict:
+def _bars(bars: Bars, start: int, stop: int) -> dict:
+    """Daily bars from `start` up to `stop`, as the snapshot recorded them: the prices as they traded, not adjusted."""
+    return {
+        "dates": [day.isoformat() for day in bars.dates[start:stop]],
+        **{column: getattr(bars, column)[start:stop] for column in ("open", "high", "low", "close", "volume")},
+    }
+
+
+def _run(row: sqlite3.Row, as_of: str | None = None) -> dict:
+    """A run, or a check-in read as one. `kind` says which meeting it is; `as_of` is its cut-off when it has one."""
     seconds = None
     if row["finished_at"]:
         seconds = (datetime.fromisoformat(row["finished_at"]) - datetime.fromisoformat(row["started_at"])).total_seconds()
@@ -457,7 +838,7 @@ def _run(row: sqlite3.Row) -> dict:
     return {
         "run_id": row["run_id"], "status": status, "started_at": row["started_at"],
         "finished_at": row["finished_at"], "seconds": seconds, "error": row["error"],
-        "live": status == "running",
+        "live": status == "running", "kind": _kind(row), "as_of": as_of,
     }
 
 
@@ -519,6 +900,31 @@ def today(events: list[dict]) -> dict[str, str]:
     if traded:
         lines["trader"] = (
             f"成交 {sum(1 for event in traded if event['kind'] == 'fill')} 笔，"
+            f"下单 {sum(1 for event in traded if event['kind'] == 'order_placed')} 张"
+        )
+
+    # A check-in of the desk: the analyst's updates, the manager's decisions, and what was left for the close.
+    updates = of("ticker_analyst", "view_update")
+    if updates:
+        count = {name: sum(1 for event in updates if event["payload"].get("effect") == name)
+                 for name in ("unchanged", "strengthened", "weakened", "broken")}
+        lines["ticker_analyst"] = (
+            f"{len(updates)} 条更新：不变 {count['unchanged']}，加强 {count['strengthened']}，"
+            f"削弱 {count['weakened']}，不成立 {count['broken']}"
+        )
+    for event in of("portfolio_manager", "checkin_decisions"):
+        items = event["payload"].get("decisions", [])
+        count = {name: sum(1 for item in items if item.get("action") == name)
+                 for name in ("keep", "trim", "sell", "withdraw")}
+        lines["portfolio_manager"] = (
+            f"{len(items)} 条决定：保留 {count['keep']}，减仓 {count['trim']}，卖出 {count['sell']}，"
+            f"撤回买单 {count['withdraw']}"
+        )
+    noted = of("trader", "noted")
+    taken_back = of("trader", "order_withdrawn")
+    if noted or (updates and taken_back):
+        lines["trader"] = (
+            f"留给收盘会 {len(noted)} 条，撤回买单 {len(taken_back)} 张，"
             f"下单 {sum(1 for event in traded if event['kind'] == 'order_placed')} 张"
         )
     return lines

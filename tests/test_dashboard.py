@@ -20,6 +20,8 @@ from dashboard import app as dashboard_app
 from dashboard import personas
 from dashboard.app import create_app, host_named, names_answered
 from dashboard.reader import NoJournal, Reader, _process_exists as process_exists, today
+from data.models import Snapshot
+from data.snapshot import MACRO_SERIES, MARKET_SERIES, load_snapshot
 from evaluation import run as evaluation_run
 from evaluation.run import evaluate, save
 from execution.paper import PaperBroker
@@ -28,7 +30,7 @@ from models.evaluation import Evaluation
 from models.signals import Event, ProposalSetDraft, TickerViewDraft, UsageSummary
 from pipeline.daily import Arm
 from risk.gate import RiskLimits, halted
-from tests.pipeline_fakes import ScriptedLLM, by_ticker, day, make_pipeline, proposals, session, view
+from tests.pipeline_fakes import ScriptedLLM, SyntheticMarket, by_ticker, day, make_pipeline, proposals, session, view
 from tests.test_evaluation import nov
 from tests.test_evaluation_run import a_lesson
 from tests.test_risk_gate import account as gate_account, buy, one
@@ -40,8 +42,8 @@ STATIC = Path(dashboard_app.__file__).parent / "static"
 # Text a model might write that a careless page would treat as markup.
 ODD = '<b>UPA</b> & "quoted" <script>alert(1)</script> 不改写'
 ADDRESSES = {
-    "/api/roster", "/api/arms", "/api/sessions", "/api/meeting", "/api/overview", "/api/book",
-    "/api/evaluation", "/api/status", "/api/stream",
+    "/api/roster", "/api/arms", "/api/sessions", "/api/meeting", "/api/day", "/api/market", "/api/overview", "/api/book",
+    "/api/history", "/api/evaluation", "/api/status", "/api/stream",
 }
 
 
@@ -197,7 +199,8 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
 
     scripts = {path.name: path.read_text(encoding="utf-8") for path in (STATIC / "js").glob("*.js")}
     assert set(scripts) == {
-        "app.js", "charts.js", "dom.js", "figures.js", "live.js", "meeting.js", "pages.js", "playback.js"}
+        "app.js", "charts.js", "day.js", "decisions.js", "dom.js", "emblems.js", "figures.js", "live.js", "market.js",
+        "meeting.js", "motion.js", "pages.js", "playback.js", "screen.js", "tape.js", "trail.js"}
     everything = "\n".join(scripts.values())
     # One place asks the server for anything, and it only reads.
     assert [name for name, text in scripts.items() if "fetch(" in text] == ["dom.js"]
@@ -211,13 +214,18 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed, so the page's own logic cannot be run here")
 def test_the_pages_own_logic_passes_its_tests():
-    """Playback, keeping a room in step with a live run, text kept as text, number formats, seats: tests/js, run by node."""
+    """Playback, keeping a room in step with a live run, how a decision came about, how the trail shows it line
+    by line, which run the 决策 page reads, what the market screens show and when, each figure's panel, text
+    kept as text and revealed unchanged, number formats, seats, a check-in of the desk read off its record, and
+    the strip of the day's meetings: tests/js, run by node."""
     files = sorted(path.name for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
-    assert files == ["dom.test.mjs", "format.test.mjs", "live.test.mjs", "playback.test.mjs"]
+    assert files == ["checkin.test.mjs", "day.test.mjs", "decisions.test.mjs", "decisions_page.test.mjs",
+                     "dom.test.mjs", "format.test.mjs", "live.test.mjs", "market.test.mjs", "motion.test.mjs",
+                     "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "trail.test.mjs"]
     result = subprocess.run([NODE, "--test", *(f"tests/js/{name}" for name in files)],
                             cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert int(re.search(r"pass (\d+)", result.stdout).group(1)) >= 37 and re.search(r"fail 0\b", result.stdout)
+    assert int(re.search(r"pass (\d+)", result.stdout).group(1)) >= 127 and re.search(r"fail 0\b", result.stdout)
 
 
 # ── Who is in the room ───────────────────────────────────────────────────────
@@ -232,8 +240,18 @@ def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear
     assert (seat["bear"] - seat["bull"]) % 14 == 7
     assert (seat["portfolio_manager"], seat["judge"]) == (0, 7)
     assert [stage["id"] for stage in body["stages"]] == [
-        "settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
+        "briefing", "settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
     assert all(figure["title"] and figure["does"] for figure in roster)
+    # Each has the mark of its field and what it is a specialist in, and no two share a mark.
+    assert all(figure["emblem"] and len(figure["craft"]) >= 3 for figure in roster)
+    assert len({figure["emblem"] for figure in roster}) == 14
+    # The series sorted under a macro analyst's field are ones the snapshot really records.
+    recorded = {symbol for _, _, symbol in MARKET_SERIES} | {series[0] for series in MACRO_SERIES} | {"sectors"}
+    reads = {figure["id"]: figure["reads"] for figure in roster}
+    assert all(set(series) <= recorded for series in reads.values())
+    assert {name for name, series in reads.items() if series} == {
+        figure["id"] for figure in roster if figure["group"] == "宏观组"}
+    assert all(len(reads[name]) >= 4 and len(set(reads[name])) == len(reads[name]) for name in reads if reads[name])
 
 
 def test_everyone_the_pipeline_records_has_a_place_in_the_room(week):
@@ -786,6 +804,449 @@ def test_what_a_halted_run_wrote_down_is_shown_beside_the_switch_as_it_is_now(tm
     assert reader.overview(ARM)["guards"]["kill_switch"] == {
         "on": False, "reason": "", "file": str(switch), "last_run": {"session": session(13).isoformat(), "halted": written}}
     assert reader.book(ARM)["signals"]["halted"] == written
+    # And where the sessions are set side by side, that one is marked as halted.
+    assert [(item["session"], item["halted"]) for item in reader.history(ARM)["sessions"]] == [(session(13).isoformat(), True)]
+
+
+# ── How decisions changed from session to session ────────────────────────────
+
+def test_the_decisions_page_sets_each_tickers_sessions_side_by_side_as_the_signal_tables_have_them(week, client, monkeypatch):
+    pipeline, _, _ = week
+    journal = pipeline.journal
+    status, body = get(client, "/api/history", arm=ARM)
+    days = [session(n) for n in (13, 16, 17, 18, 19, 20)]
+
+    assert status == 200 and [item["session"] for item in body["sessions"]] == [when.isoformat() for when in days]   # oldest first
+    assert body["tickers"] == ["UPA", "UPB", "UPC"]
+    for item, when in zip(body["sessions"], days):
+        assert item["run_id"] == journal.completed_run(ARM, when)          # the run each column was read from
+        table = journal.signal_table(item["run_id"])
+        assert (item["status"], item["halted"]) == (table.status, False)
+        assert item["regime"] == {"risk_appetite": table.regime.risk_appetite, "confidence": table.regime.confidence}
+        assert sorted(item["tickers"]) == sorted({view.ticker for view in table.views})
+        for view in table.views:
+            assert (item["tickers"][view.ticker]["direction"], item["tickers"][view.ticker]["confidence"]) == (view.direction, view.confidence)
+            assert item["tickers"][view.ticker]["held"] is view.held
+        for proposal in table.proposals:
+            mine = item["tickers"][proposal.ticker]
+            assert (mine["action"], mine["source"], mine["check"]) == (proposal.action, proposal.source, proposal.status)
+        for decision in table.risk:
+            assert (item["tickers"][decision.ticker]["verdict"], item["tickers"][decision.ticker]["approved_shares"]) == (
+                decision.verdict, decision.approved_shares)
+        assert {ticker: cell["ordered"] for ticker, cell in item["tickers"].items() if cell["ordered"]} == {
+            order.ticker: {"side": order.side, "shares": order.shares} for order in table.orders}
+
+    # What the week was: UPA bought on the first day and held from the next, the other two only ever viewed.
+    first, second = body["sessions"][0]["tickers"], body["sessions"][1]["tickers"]
+    assert first["UPA"]["action"] == "buy" and first["UPA"]["ordered"]["side"] == "buy" and first["UPA"]["held"] is False
+    assert first["UPA"]["verdict"] in ("approved", "reduced") and first["UPA"]["approved_shares"] == first["UPA"]["ordered"]["shares"]
+    assert (second["UPA"]["held"], second["UPA"]["action"], second["UPA"]["source"], second["UPA"]["ordered"]) == (True, "hold", "default", None)
+    assert first["UPB"] == {"direction": "bullish", "confidence": 0.6, "held": False, "action": None, "source": None,
+                            "check": None, "repeats": 0, "kept_by_default": False, "verdict": None,
+                            "approved_shares": None, "ordered": None}
+    assert (second["UPA"]["check"], second["UPA"]["repeats"], second["UPA"]["kept_by_default"]) == ("accepted", 0, False)
+
+    # Only so many sessions are set side by side: the most recent ones, still oldest first.
+    monkeypatch.setattr("dashboard.reader.SESSIONS_SHOWN", 2)
+    assert [item["session"] for item in get(client, "/api/history", arm=ARM)[1]["sessions"]] == [
+        session(19).isoformat(), session(20).isoformat()]
+
+
+def test_a_session_that_was_run_again_is_counted_once_and_tickers_are_listed_latest_first(tmp_path):
+    pipeline = a_week(tmp_path, days=(13, 16))
+    journal = pipeline.journal
+    # The 16th is run again, this time selling: the earlier run of that day no longer stands.
+    journal.supersede_runs(ARM, session(16))
+    pipeline.arms[0].llm.replies[ProposalSetDraft] = proposals(("UPA", "sell", 0.7))
+    pipeline._now.now = day(16)
+    [again] = pipeline.run(force=True)
+    assert again.status == "ok"
+    # And a session that only failed leaves nothing to set beside the others.
+    journal.start_run("failed", ARM, session(17), stamp(21))
+    journal.finish_run("failed", "failed", stamp(22), UsageSummary(), error="No data.")
+
+    history = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation").history(ARM)
+    assert [item["session"] for item in history["sessions"]] == [session(13).isoformat(), session(16).isoformat()]
+    assert history["sessions"][1]["tickers"]["UPA"]["action"] == "sell"                     # the run that stands
+    assert history["sessions"][1]["tickers"]["UPA"]["ordered"] == {"side": "sell", "shares": history["sessions"][1]["tickers"]["UPA"]["approved_shares"]}
+    assert history["sessions"][1]["run_id"] == again.run_id
+    assert history["tickers"] == ["UPA", "UPB", "UPC"]
+
+    # Should a day ever be left with two finished runs, it is still one column: that of the run started last.
+    with journal.transaction():
+        journal.write("UPDATE runs SET status = 'ok' WHERE status = 'superseded'")
+    twice = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation").history(ARM)
+    assert [(item["session"], item["run_id"]) for item in twice["sessions"]] == [
+        (item["session"], item["run_id"]) for item in history["sessions"]]
+    with journal.transaction():
+        journal.write("UPDATE runs SET status = 'superseded' WHERE session_date = ? AND run_id != ? AND status = 'ok'",
+                      (session(16).isoformat(), again.run_id))
+
+    # A ticker seen only on the first day comes after those seen on the last, whatever its name.
+    empty = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    with journal.transaction():
+        journal.write("UPDATE runs SET signals_json = REPLACE(signals_json, 'UPB', 'AAA') WHERE session_date = ? AND arm = ?",
+                      (session(13).isoformat(), ARM))
+    assert empty.history(ARM)["tickers"] == ["UPA", "UPB", "UPC", "AAA"]
+
+    # A holding the analyst could give no view of that day (its data was unusable) is still shown as held.
+    standing = journal.completed_run(ARM, session(16))
+    table = journal.signal_table(standing)
+    assert "UPA" in {position.ticker for position in table.holdings}
+    without_view = table.model_copy(update={"views": [view for view in table.views if view.ticker != "UPA"]})
+    with journal.transaction():
+        journal.write("UPDATE runs SET signals_json = ? WHERE run_id = ?", (without_view.model_dump_json(), standing))
+    unseen = empty.history(ARM)["sessions"][1]["tickers"]["UPA"]
+    assert (unseen["held"], unseen["direction"], unseen["confidence"], unseen["action"]) == (True, None, None, "sell")
+    # And a table that lists no holdings at all still shows a holding as held, because its view says so.
+    assert next(view for view in table.views if view.ticker == "UPA").held is True
+    with journal.transaction():
+        journal.write("UPDATE runs SET signals_json = ? WHERE run_id = ?",
+                      (table.model_copy(update={"holdings": []}).model_dump_json(), standing))
+    listed = empty.history(ARM)["sessions"][1]["tickers"]
+    assert (listed["UPA"]["held"], listed["UPA"]["direction"], listed["UPB"]["held"]) == (True, "bullish", False)
+    assert Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation").history("fake/b") == {
+        "arm": "fake/b", "sessions": [], "tickers": []}
+
+
+def an_awkward_week(folder):
+    """Three sessions in which the portfolio manager writes its list the ways the checks have to sort out.
+
+    13th: buys UPA. 16th (UPA now held): holds UPA, then asks to sell it as well, then asks to buy nothing at
+    all. 17th: asks to buy UPA, which is held already, writing the ticker in small letters with spaces, and
+    then to trim it.
+    """
+    pipeline = a_week(folder, days=(13,))
+    one_more(pipeline, 16, ("UPA", "hold", 0.5), ("UPA", "sell", 0.7), ("  ", "buy", 0.5))
+    one_more(pipeline, 17, (" upa ", "buy", 0.9), ("UPA", "trim", 0.4))
+    return pipeline
+
+
+def test_only_the_first_proposal_for_a_ticker_is_shown_as_the_decision_as_the_pipeline_counts_it(tmp_path):
+    pipeline = an_awkward_week(tmp_path)
+    journal = pipeline.journal
+    first, second, third = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation").history(ARM)["sessions"]
+
+    # What the pipeline itself made of the two lists.
+    made = [[(p.ticker, p.action, p.source, p.status) for p in journal.signal_table(item["run_id"]).proposals]
+            for item in (second, third)]
+    assert made == [
+        [("UPA", "hold", "portfolio_manager", "accepted"), ("UPA", "sell", "portfolio_manager", "rejected"),
+         ("", "buy", "portfolio_manager", "rejected")],
+        [("UPA", "buy", "portfolio_manager", "rejected"), ("UPA", "trim", "portfolio_manager", "rejected"),
+         ("UPA", "hold", "default", "accepted")],
+    ]
+    assert first["tickers"]["UPA"]["ordered"]["side"] == "buy" and first["tickers"]["UPA"]["repeats"] == 0
+
+    # The 16th: the hold stands. The sell that came after it does not count, and nothing was sold.
+    held = second["tickers"]["UPA"]
+    assert (held["held"], held["action"], held["source"], held["check"]) == (True, "hold", "portfolio_manager", "accepted")
+    assert (held["repeats"], held["kept_by_default"], held["verdict"], held["ordered"]) == (1, False, None, None)
+    assert journal.signal_table(second["run_id"]).orders == []
+    # The proposal written for no ticker at all is no ticker's decision: it gets no row of its own.
+    assert sorted(second["tickers"]) == ["UPA", "UPB", "UPC"]
+
+    # The 17th: the buy is the decision, and it was turned back; the trim does not count; the holding is kept
+    # by the checks' own default.
+    kept = third["tickers"]["UPA"]
+    assert (kept["action"], kept["source"], kept["check"]) == ("buy", "portfolio_manager", "rejected")
+    assert (kept["repeats"], kept["kept_by_default"], kept["ordered"]) == (1, True, None)
+    assert sorted(third["tickers"]) == ["UPA", "UPB", "UPC"]                # no column of its own for " upa "
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed, so the page's own logic cannot be run here")
+def test_the_page_reads_a_ticker_out_of_a_proposal_exactly_as_the_pipeline_does():
+    """The pipeline reads it with str.strip().upper() (pipeline/checks.py). The characters Python takes off the
+    ends are not quite the ones JavaScript's own trim() takes off, so the page is held to Python's, one by one."""
+    edges = sorted({point for point in range(sys.maxunicode + 1) if chr(point).isspace()}
+                   | set(range(0x21)) | set(range(0x7F, 0xA1)) | {0xAD, 0x180E, 0x200B, 0x2060, 0xFEFF})
+    written = [f"{chr(point)}upa{chr(point)}" for point in edges]
+    written += [" tmo ", "\tBrk.b\r\n", "upa", "", "   ", "u p a", "\x1f \x85upb　\x1c"]
+    result = subprocess.run([NODE, "tests/js/ticker_of.mjs"], input=json.dumps(written), cwd=ROOT,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [text.strip().upper() for text in written]
+    # The two languages do differ here, which is why this is checked: each strips something the other keeps.
+    assert "\x1fupa\x1f".strip() == "upa" and "﻿upa﻿".strip() != "upa"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed, so the page's own logic cannot be run here")
+def test_the_trail_and_the_grid_tell_the_same_story_of_the_same_run(tmp_path):
+    """The grid is read from a run's signal table, the trail from that run's events. Set side by side for
+    real runs, awkward lists included, they must agree on every ticker."""
+    an_awkward_week(tmp_path)
+    client = browser(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    history = get(client, "/api/history", arm=ARM)[1]
+    assert len(history["sessions"]) == 3
+    endings = []
+    for item in history["sessions"]:
+        status, meeting = get(client, "/api/meeting", arm=ARM, run_id=item["run_id"])
+        assert status == 200 and meeting["run"]["run_id"] == item["run_id"] and meeting["stands"] is True
+        result = subprocess.run([NODE, "tests/js/trail_of.mjs"], input=json.dumps(meeting["events"]), cwd=ROOT,
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        trail = {row["ticker"]: row for row in json.loads(result.stdout)}
+        assert sorted(trail) == sorted(item["tickers"])
+        for ticker, cell in item["tickers"].items():
+            row = trail[ticker]
+            assert (row["view"]["direction"], row["view"]["confidence"], row["view"]["held"]) == (
+                cell["direction"], cell["confidence"], cell["held"])
+            if cell["source"] == "portfolio_manager":
+                assert (row["proposal"]["action"], row["check"]["status"], row["check"]["action"]) == (
+                    cell["action"], cell["check"], cell["action"])
+            else:                                       # nothing proposed: no decision, or the checks' default
+                assert row["proposal"] is None
+                assert (row["check"] and (row["check"]["source"], row["check"]["action"])) == (
+                    ("default", cell["action"]) if cell["source"] == "default" else None)
+            assert row["repeats"] == cell["repeats"]
+            assert ((row["check"] or {}).get("kept") is not None) == cell["kept_by_default"]
+            assert (row["risk"] and row["risk"]["verdict"]) == cell["verdict"]
+            assert (row["risk"] and row["risk"]["approved"]) == cell["approved_shares"]
+            assert (row["order"] and {"side": row["order"]["side"], "shares": row["order"]["shares"]}) == cell["ordered"]
+        endings.append(trail["UPA"]["ended"])
+    shares = history["sessions"][0]["tickers"]["UPA"]["ordered"]["shares"]
+    assert endings == [
+        {"kind": "ordered", "side": "buy", "shares": shares},
+        {"kind": "kept", "source": "portfolio_manager"},
+        {"kind": "check_rejected", "action": "buy", "kept": True},
+    ]
+
+
+# ── The market data a run worked from ────────────────────────────────────────
+
+def snapshot_file(journal, run_id) -> Path:
+    return Path(journal.rows("SELECT snapshot_path FROM runs WHERE run_id = ?", (run_id,))[0]["snapshot_path"])
+
+
+def as_sent(bars, start=None, stop=None) -> dict:
+    """Bars the way the page is sent them."""
+    return {"dates": [day.isoformat() for day in bars.dates[start:stop]],
+            **{column: getattr(bars, column)[start:stop] for column in ("open", "high", "low", "close", "volume")}}
+
+
+def test_the_market_data_shown_for_a_run_is_what_its_own_snapshot_recorded(week, client):
+    pipeline, _, _ = week
+    journal = pipeline.journal
+    run_id = journal.completed_run(ARM, session(16))
+    snapshot = load_snapshot(snapshot_file(journal, run_id))
+    status, body = get(client, "/api/market", arm=ARM, session=session(16).isoformat())
+
+    assert status == 200 and (body["available"], body["reason"]) == (True, None)
+    assert (body["arm"], body["session"], body["run_id"]) == (ARM, session(16).isoformat(), run_id)
+    assert body["captured_at"] == snapshot.created_at.isoformat()
+    assert sorted(body["tickers"]) == sorted(snapshot.tickers) and len(snapshot.tickers) >= 3
+    for ticker, item in snapshot.tickers.items():
+        mine = body["tickers"][ticker]
+        assert len(item.bars.dates) > 120                          # more on record than the page is sent
+        assert mine["bars"] == as_sent(item.bars, -120)            # the latest ones, exactly as recorded
+        assert mine["bars"]["dates"][-1] == session(16).isoformat()        # and none from after the session
+        assert mine["price"] == item.price.model_dump(mode="json")
+        assert mine["technicals"] == item.technicals.model_dump(mode="json")
+        assert (mine["name"], mine["sector"], mine["industry"]) == (
+            item.fundamentals.name, item.fundamentals.sector, item.fundamentals.industry)
+        assert mine["fundamentals"] == item.fundamentals.model_dump(
+            mode="json", exclude={"name", "quote_type", "sector", "industry"})
+        assert mine["usable"] is item.usable and mine["issues"] == [issue.model_dump(mode="json") for issue in item.issues]
+        assert mine["next_earnings"] == (item.next_earnings.isoformat() if item.next_earnings else None)
+    assert body["market"] == [point.model_dump(mode="json") for point in snapshot.market]
+    assert body["macro"] == [point.model_dump(mode="json") for point in snapshot.macro]
+
+    # The same run by name, and with nothing named the latest session.
+    assert get(client, "/api/market", arm=ARM, run_id=run_id)[1] == body
+    assert get(client, "/api/market", arm=ARM)[1]["session"] == session(20).isoformat()
+    # A run that is not this configuration's, or not there at all, has no market data to show.
+    for asked in ({"arm": ARM, "run_id": "no-such-run"}, {"arm": ARM, "session": "1999-01-04"}):
+        empty = get(client, "/api/market", **asked)[1]
+        assert (empty["available"], empty["reason"], empty["tickers"], empty["market"], empty["macro"]) == (
+            False, "no_run", {}, [], [])
+
+
+def test_what_prices_did_after_a_session_is_read_from_later_sessions_snapshots(week, client):
+    pipeline, _, _ = week
+    journal = pipeline.journal
+    newest = load_snapshot(snapshot_file(journal, journal.completed_run(ARM, session(20))))
+    first = get(client, "/api/market", arm=ARM, session=session(13).isoformat())[1]
+    assert sorted(first["tickers"]) == sorted(newest.tickers)
+    for ticker, mine in first["tickers"].items():
+        later = newest.tickers[ticker].bars
+        cut = later.dates.index(session(13))
+        # Everything the newest snapshot has for the days after that session, and nothing of that day or before.
+        assert mine["after"] == {"through": session(20).isoformat(), **as_sent(later, cut + 1)}
+        assert mine["after"]["dates"][0] > mine["bars"]["dates"][-1] == session(13).isoformat()
+        assert mine["after"]["dates"] == [session(n).isoformat() for n in (16, 17, 18, 19, 20)]
+    # The newest session has nothing after it yet.
+    last = get(client, "/api/market", arm=ARM)[1]
+    assert last["tickers"] and all(item["after"] is None for item in last["tickers"].values())
+
+
+def test_bars_after_a_session_are_only_joined_on_when_they_are_on_the_same_price_scale(tmp_path, monkeypatch):
+    # UPB splits two for one on the 17th: from then on the source gives all of its prices, old ones too, halved.
+    llm = ScriptedLLM()
+    llm.replies[TickerViewDraft] = view(horizon=3)
+    llm.replies[ProposalSetDraft] = proposals()
+    pipeline = make_pipeline(tmp_path, llm, market=SyntheticMarket(splits={("UPB", session(17)): 2.0}))
+    for number in (13, 16, 17):
+        pipeline._now.now = day(number)
+        [result] = pipeline.run()
+        assert result.status in ("ok", "degraded"), result.message
+    journal = pipeline.journal
+    reader = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    files = {number: snapshot_file(journal, journal.completed_run(ARM, session(number))) for number in (13, 16, 17)}
+    kept = {number: file.read_bytes() for number, file in files.items()}
+    old, new = load_snapshot(files[13]).tickers["UPB"].bars, load_snapshot(files[17]).tickers["UPB"].bars
+    assert new.close[new.dates.index(session(13))] == pytest.approx(old.close[-1] / 2, rel=1e-3)      # the split, in the data
+
+    first = reader.market(ARM, session(13).isoformat())["tickers"]
+    # UPA is untouched: its later bars run to the newest session.
+    assert (first["UPA"]["after"]["through"], first["UPA"]["after"]["dates"]) == (
+        session(17).isoformat(), [session(16).isoformat(), session(17).isoformat()])
+    # UPB's newest snapshot is on the new scale, so it is passed over for the one before the split.
+    middle = load_snapshot(files[16]).tickers["UPB"].bars
+    assert first["UPB"]["after"] == {"through": session(16).isoformat(), **as_sent(middle, middle.dates.index(session(13)) + 1)}
+    assert first["UPB"]["after"]["close"] == [middle.close[-1]] and first["UPB"]["bars"]["close"][-1] == old.close[-1]
+    # From the 16th, the only later snapshot is on the other scale: nothing is joined on.
+    second = reader.market(ARM, session(16).isoformat())["tickers"]
+    assert second["UPB"]["after"] is None and second["UPA"]["after"]["dates"] == [session(17).isoformat()]
+
+    # Only so many bars are sent, the latest before the session and the first after it.
+    monkeypatch.setattr("dashboard.reader.BARS_SHOWN", 5)
+    monkeypatch.setattr("dashboard.reader.AFTER_SHOWN", 1)
+    short = reader.market(ARM, session(13).isoformat())["tickers"]["UPA"]
+    assert short["bars"] == as_sent(load_snapshot(files[13]).tickers["UPA"].bars, -5)
+    assert short["after"]["dates"] == [session(16).isoformat()]
+    # Reading changes none of the snapshot files.
+    assert {number: file.read_bytes() for number, file in files.items()} == kept
+
+
+def test_a_snapshot_is_read_once_and_one_that_is_gone_or_broken_is_said_to_be_missing(tmp_path, monkeypatch):
+    pipeline = a_week(tmp_path, days=(13, 16))
+    journal = pipeline.journal
+    reader = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    older, newer = (snapshot_file(journal, journal.completed_run(ARM, session(number))) for number in (13, 16))
+    read = []
+    parse = Snapshot.model_validate_json.__func__
+    monkeypatch.setattr(Snapshot, "model_validate_json",
+                        classmethod(lambda cls, text, **options: read.append(len(text)) or parse(cls, text, **options)))
+
+    whole = reader.market(ARM, session(13).isoformat())
+    assert len(read) == 2                                         # the run's own snapshot and the later one
+    assert reader.market(ARM, session(13).isoformat()) == whole and reader.market(ARM)["available"]
+    assert len(read) == 2                                         # nothing is read a second time
+    # A snapshot whose file has changed is read again.
+    changed = load_snapshot(older)
+    changed.tickers["UPA"].price.close = 1234.5
+    older.write_text(changed.model_dump_json(), encoding="utf-8")
+    os.utime(older, ns=(1, 1))
+    del read[:]                                                   # (this test's own reading above was counted too)
+    assert reader.market(ARM, session(13).isoformat())["tickers"]["UPA"]["price"]["close"] == 1234.5 and len(read) == 1
+    assert reader.market(ARM, session(13).isoformat())["tickers"]["UPA"]["price"]["close"] == 1234.5 and len(read) == 1
+    # No more are kept in memory than there is room for: the one read longest ago makes way.
+    monkeypatch.setattr("dashboard.reader.SNAPSHOTS_KEPT", 1)
+    fresh = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    fresh.market(ARM, session(13).isoformat())
+    assert list(fresh._snapshots) == [str(newer)]
+
+    # A later snapshot that cannot be read only means there is nothing to join on.
+    newer.write_text("{ not a snapshot", encoding="utf-8")
+    alone = reader.market(ARM, session(13).isoformat())
+    assert alone["available"] and all(item["after"] is None for item in alone["tickers"].values())
+    # The run's own snapshot unreadable, or gone, or never written: the page is told, and nothing is invented.
+    for spoil in (lambda: older.write_text("[]", encoding="utf-8"), older.unlink):
+        spoil()
+        gone = reader.market(ARM, session(13).isoformat())
+        assert (gone["available"], gone["reason"], gone["tickers"], gone["market"], gone["macro"], gone["captured_at"]) == (
+            False, "no_snapshot", {}, [], [], None)
+        assert gone["run_id"] == journal.completed_run(ARM, session(13))
+    journal.start_run("early", ARM, session(17), stamp(21))
+    journal.finish_run("early", "failed", stamp(22), UsageSummary(), error="No data.")
+    assert reader.market(ARM, run_id="early")["reason"] == "no_snapshot"
+    assert not older.exists()                                     # and the reader did not put a file back
+
+
+def test_while_a_run_is_going_its_market_data_is_found_where_the_session_saved_it(tmp_path):
+    """A run writes down where its snapshot is only when it ends. Until then the page finds it through the
+    session's data checkpoint, which the pipeline saves before the first model is called."""
+    reader = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    seen = []
+
+    def looking(system, user):                                    # the analyst is asked: the run is in full swing
+        with reader._db() as db:
+            row = db.execute("SELECT status, snapshot_path FROM runs WHERE arm = ?", (ARM,)).fetchone()
+        seen.append((row["status"], row["snapshot_path"], reader.market(ARM)))
+        return view(horizon=3)
+
+    llm = ScriptedLLM()
+    llm.replies[TickerViewDraft] = looking
+    llm.replies[ProposalSetDraft] = proposals()
+    pipeline = make_pipeline(tmp_path, llm)
+    [result] = pipeline.run()
+    assert result.status == "ok" and len(seen) >= 3
+    status, written, during = seen[0]
+    assert (status, written) == ("running", None)                 # nothing about the snapshot in the run's own row yet
+    finished = reader.market(ARM)
+    saved = snapshot_file(pipeline.journal, finished["run_id"])
+    assert during["available"] and during == finished             # the same snapshot, found both ways
+    assert sorted(during["tickers"]) == sorted(load_snapshot(saved).tickers)
+
+    # A run that never ended and whose session has no such checkpoint has nothing to show; nor has one whose
+    # checkpoint cannot be read. One that names a snapshot is shown that snapshot.
+    journal = pipeline.journal
+    captured = load_snapshot(saved).created_at                    # a run's data is collected before the run starts
+    journal.start_run("stuck", ARM, session(16), captured + timedelta(minutes=1), pid=os.getpid())
+    assert reader.market(ARM, run_id="stuck")["reason"] == "no_snapshot"
+    for broken in ("not json", "[]", json.dumps({"rows": []})):
+        journal.save_checkpoint("*", session(16), "data", broken)
+        assert reader.market(ARM, run_id="stuck")["reason"] == "no_snapshot"
+    journal.save_checkpoint("*", session(16), "data", json.dumps({"snapshot_path": str(saved)}))
+    stuck = reader.market(ARM, run_id="stuck")
+    assert (stuck["available"], stuck["run_id"], stuck["session"]) == (True, "stuck", session(16).isoformat())
+    assert stuck["tickers"] == finished["tickers"]
+    # A snapshot captured after a run began cannot be that run's: another invocation has saved its own data over
+    # the session's checkpoint meanwhile. A run that began at the very moment of the capture, or after it, is fine.
+    journal.start_run("before", ARM, session(16), captured - timedelta(seconds=1), pid=os.getpid())
+    journal.start_run("at", ARM, session(16), captured, pid=os.getpid())
+    assert reader.market(ARM, run_id="before")["reason"] == "no_snapshot"
+    assert reader.market(ARM, run_id="at")["available"] is True
+    # Once a run has written its own snapshot down, that is its data whenever it was captured.
+    journal.finish_run("before", "ok", captured, UsageSummary(), snapshot_path=str(saved))
+    assert reader.market(ARM, run_id="before")["available"] is True
+    # A configuration's own checkpoint is not the session's shared one, and another day's is not this day's.
+    journal.clear_checkpoints("*", session(16))
+    journal.save_checkpoint(ARM, session(16), "data", json.dumps({"snapshot_path": str(saved)}))
+    journal.save_checkpoint("*", session(17), "data", json.dumps({"snapshot_path": str(saved)}))
+    assert reader.market(ARM, run_id="stuck")["reason"] == "no_snapshot"
+
+
+def test_a_run_that_is_no_longer_going_is_never_shown_data_through_the_sessions_checkpoint(tmp_path):
+    """The checkpoint belongs to the session, not to one run. When a run was killed and the session is run
+    again, the checkpoint holds the new run's data: the killed run must not be shown it as its own."""
+    pipeline = a_week(tmp_path, days=(13,))
+    journal = pipeline.journal
+    reader = Reader(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    earlier = snapshot_file(journal, journal.completed_run(ARM, session(13)))
+    began = load_snapshot(earlier).created_at + timedelta(minutes=1)      # after its data was collected
+
+    # A run of the 16th that had collected its data and was then killed: on record as running, its process gone.
+    journal.start_run("killed", ARM, session(16), began, pid=a_process_that_has_ended())
+    journal.save_checkpoint("*", session(16), "data", json.dumps({"snapshot_path": str(earlier)}))
+    assert reader.market(ARM, run_id="killed")["reason"] == "no_snapshot"        # not going: the checkpoint is not its word
+    # While the same run was alive, the checkpoint was the way to its data.
+    journal.start_run("alive", ARM, session(16), began, pid=os.getpid())
+    assert reader.market(ARM, run_id="alive")["available"] is True
+    journal.finish_run("alive", "failed", stamp(22), UsageSummary(), error="Stopped.")
+    assert reader.market(ARM, run_id="alive")["reason"] == "no_snapshot"         # ended without writing its snapshot down
+
+    # The session is run again. That closes the killed run and saves the new run's data under the same checkpoint.
+    pipeline.arms[0].llm.replies[ProposalSetDraft] = proposals()
+    pipeline._now.now = day(16)
+    [again] = pipeline.run()
+    assert again.status == "ok", again.message
+    closed = journal.rows("SELECT status, snapshot_path FROM runs WHERE run_id = 'killed'")[0]
+    assert (closed["status"], closed["snapshot_path"]) == ("failed", None)
+    fresh = reader.market(ARM, run_id=again.run_id)
+    assert fresh["available"] and fresh["tickers"]["UPA"]["bars"]["dates"][-1] == session(16).isoformat()
+    gone = reader.market(ARM, run_id="killed")
+    assert (gone["available"], gone["reason"], gone["tickers"], gone["market"]) == (False, "no_snapshot", {}, [])
 
 
 # ── More than one model configuration ────────────────────────────────────────

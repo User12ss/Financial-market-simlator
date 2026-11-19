@@ -208,6 +208,125 @@ class TradeProposal(BaseModel):
     note: str = Field(default="", description="Why it was rejected, or why a default was filled in")
 
 
+class UsageSummary(BaseModel):
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model_seconds: float = 0.0
+    cost_usd: float | None = Field(default=None, description="None when the provider has no per-token price")
+
+
+# ── Check-ins: the short meetings between two close meetings ─────────────────
+
+Effect =Literal["unchanged", "strengthened", "weakened", "broken"]
+CheckinAction = Literal["keep", "trim", "sell", "withdraw"]
+MeetingKind = Literal["premarket", "midday", "afternoon", "close"]
+
+
+class ViewUpdateDraft(Draft):
+    effect: Effect = Field(
+        description="What the new information does to your standing view. unchanged: nothing that matters. "
+        "strengthened or weakened: the case is clearly better or worse. broken: the invalidation condition "
+        "has been met, or the thesis no longer holds"
+    )
+    reason: str = Field(description="What changed and why it matters, naming the headline or the move (1-2 sentences)")
+    cited: list[int] = Field(
+        description="The numbers of the NEW HEADLINES you relied on. An empty list when you relied on none"
+    )
+    remark: str = Field(description="One short sentence, in your own voice, said to the portfolio manager")
+
+
+class ShownItem(BaseModel):
+    """A headline exactly as a check-in showed it, with the number it was shown under."""
+
+    number: int
+    item_id: str
+    title: str
+    publisher: str = ""
+    published_at: datetime | None = None
+    first_seen: datetime = Field(description="When this system first had it. Never after the meeting's cut-off")
+
+
+class PriceNow(BaseModel):
+    """A ticker's price during the session, as the desk last fetched it."""
+
+    session: date
+    seen_at: datetime
+    last: float
+    previous_close: float
+    change_pct: float
+    usual_range_pct: float | None = Field(description="ATR(14) as a percent of the price, from the last snapshot")
+    beyond_usual: bool
+
+
+class TickerBriefing(BaseModel):
+    """What the news desk put in front of a check-in about one ticker in the book."""
+
+    ticker: str
+    held: bool
+    waiting: Literal["buy", "sell"] | None = Field(default=None, description="An order waiting to fill, if any")
+    new_items: list[ShownItem] = Field(default_factory=list, description="First seen since the last meeting")
+    not_shown: int = Field(default=0, description="New headlines beyond the number a prompt has room for")
+    trading: PriceNow | None = Field(default=None, description="Where it is trading on the day of the meeting")
+    affected: bool = Field(description="Whether there was anything to ask the analyst about")
+
+
+class ViewUpdate(BaseModel):
+    ticker: str
+    effect: Effect
+    reason: str
+    cited: list[str] = Field(default_factory=list, description="Ids of the headlines it relied on")
+    remark: str
+    data_warnings: list[str] = Field(default_factory=list)
+
+
+class CheckinDecisionDraft(Draft):
+    ticker: str
+    action: CheckinAction
+    reason: str = Field(description="Why, naming the analyst update it rests on (1 sentence)")
+
+
+class CheckinDraft(Draft):
+    decisions: list[CheckinDecisionDraft]
+    summary: str = Field(description="What this check-in found, as a whole (1-2 sentences)")
+    remark: str = Field(description="One short sentence, in your own voice, said to the desk")
+
+
+class CheckinDecision(BaseModel):
+    ticker: str
+    action: CheckinAction
+    reason: str
+    source: Literal["portfolio_manager", "default"] = "portfolio_manager"
+    status: Literal["accepted", "rejected"]
+    note: str = Field(default="", description="Why it was rejected, or why a default was filled in")
+
+
+class CheckinRecord(BaseModel):
+    """Everything one check-in saw, said and did."""
+
+    meeting_id: str
+    arm: str
+    kind: MeetingKind
+    day: date = Field(description="The trading day the meeting belongs to")
+    session_date: date = Field(description="The last completed session, whose close meeting it builds on")
+    as_of: datetime = Field(description="Cut-off: nothing first seen after this moment was shown")
+    since: datetime | None = Field(default=None, description="The cut-off of the meeting before it")
+    can_act: bool = Field(description="True before the open, when an order placed now fills at that open")
+    book: list[TickerBriefing] = Field(default_factory=list)
+    updates: list[ViewUpdate] = Field(default_factory=list)
+    decisions: list[CheckinDecision] = Field(default_factory=list)
+    pm_summary: str = ""
+    risk: list[RiskDecision] = Field(default_factory=list)
+    orders: list[OrderRequest] = Field(default_factory=list, description="Sells placed to fill at the open")
+    withdrawn: list[str] = Field(default_factory=list, description="Tickers whose waiting buy was taken back")
+    noted: list[CheckinDecision] = Field(
+        default_factory=list, description="What a check-in during the session left for the close meeting to decide",
+    )
+    halted: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    usage: UsageSummary = Field(default_factory=UsageSummary)
+
+
 # ── Run record ───────────────────────────────────────────────────────────────
 
 class ScreenRow(BaseModel):
@@ -222,20 +341,12 @@ class ScreenRow(BaseModel):
     return_3mo_pct: float | None = None
 
 
-class UsageSummary(BaseModel):
-    calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    model_seconds: float = 0.0
-    cost_usd: float | None = Field(default=None, description="None when the provider has no per-token price")
-
-
 class Event(BaseModel):
     """One thing said or done during a run. The dashboard replays these in order."""
 
     seq: int
     ts: datetime
-    stage: Literal["settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
+    stage: Literal["briefing", "settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
     speaker: str
     speaker_name: str
     is_llm: bool

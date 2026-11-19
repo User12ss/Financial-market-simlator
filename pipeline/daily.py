@@ -531,6 +531,10 @@ class DailyPipeline:
 
     # ── Stage 3: views ───────────────────────────────────────────────────
 
+    def _ticker_data(self, run: _Run, item) -> str:
+        """One ticker's data as the analyst and the debaters are shown it."""
+        return render_ticker(item)
+
     def _views(self, run: _Run, holdings: dict[str, Position], regime: MacroRegime | None) -> dict[str, TickerView]:
         snapshot = run.data.snapshot
         analyst = TickerAnalyst(run.arm.llm)
@@ -542,7 +546,7 @@ class DailyPipeline:
                 reasons = " ".join(i.message for i in item.issues if i.severity == "block") if item else ""
                 run.problem(f"{ticker}: no view today, its data is not usable. {reasons}".strip())
                 continue
-            ticker_data = render_ticker(item)
+            ticker_data = self._ticker_data(run, item)
             # What earlier, similar views turned out to be worth. Empty unless it is turned on,
             # and then the analyst is asked exactly what it was asked before lessons existed.
             lessons = ""
@@ -597,7 +601,7 @@ class DailyPipeline:
             held = ticker in holdings
             parts = [
                 render_regime(regime), render_market_brief(snapshot),
-                f"TICKER DATA\n{render_ticker(snapshot.tickers[ticker])}",
+                f"TICKER DATA\n{self._ticker_data(run, snapshot.tickers[ticker])}",
                 f"ANALYST VIEW\n{render_view(views[ticker])}",
                 f"THE DESK'S POSITION\n{render_holding(holdings[ticker])}" if held else "",
             ]

@@ -3,6 +3,7 @@
 // hair and one accessory. None is modelled on a real person.
 
 import { svg } from "./dom.js";
+import { emblemAt } from "./emblems.js";
 
 /**
  * Seats around an ellipse, evenly spaced along its edge (not by angle, which
@@ -27,8 +28,9 @@ export function seats(count, { cx, cy, rx, ry }) {
     const wanted = (seat / count) * along[steps];
     while (along[step] < wanted) step += 1;
     const [x, y] = at(step);
-    // At the two ends of the room people stand one above the other, so their name goes beside them, not below.
-    const side = Math.abs(x - cx) > 0.9 * rx ? Math.sign(x - cx) : 0;
+    // Away from the middle of the room a name goes beside its figure, on the outer side, not below it: at the two
+    // ends people stand one above the other, and nearer the middle the space under them belongs to the table.
+    const side = Math.abs(x - cx) > 0.6 * rx ? Math.sign(x - cx) : 0;
     found.push({ x, y, side, scale: 1.0 + 0.24 * ((y - (cy - ry)) / (2 * ry)) });
   }
   return found;
@@ -91,41 +93,62 @@ function accessory(kind) {
   return [];
 }
 
-/** One figure, standing on the point (0, 0), about a hundred units tall before scaling. */
-export function drawFigure(persona, seat) {
-  const body = svg("g", { class: "body", transform: `scale(${seat.scale.toFixed(3)})` },
+/** The parts of a figure standing on the point (0, 0), about a hundred units tall. The arms are their own groups so they can move. */
+function parts(persona) {
+  const worn = persona.extra === "glasses" || persona.extra === "headset" ? "none" : persona.extra;
+  const onFace = worn === "none" ? persona.extra : "none";
+  return [
     hairBehind(persona.hair),
     svg("rect", { class: "legs", x: -9.2, y: -45, width: 8.2, height: 43, rx: 3 }),
     svg("rect", { class: "legs", x: 1, y: -45, width: 8.2, height: 43, rx: 3 }),
     svg("rect", { class: "shoe", x: -10.6, y: -4.2, width: 10, height: 4.2, rx: 2 }),
     svg("rect", { class: "shoe", x: 0.6, y: -4.2, width: 10, height: 4.2, rx: 2 }),
-    svg("rect", { class: "cloth", x: -20.4, y: -76.5, width: 6.6, height: 31, rx: 3.3 }),
-    svg("rect", { class: "cloth", x: 13.8, y: -76.5, width: 6.6, height: 31, rx: 3.3 }),
-    svg("circle", { class: "skin", cx: -17.1, cy: -44.4, r: 3.3 }),
-    svg("circle", { class: "skin", cx: 17.1, cy: -44.4, r: 3.3 }),
+    svg("g", { class: "arm arm-left" },
+      svg("rect", { class: "cloth", x: -20.4, y: -76.5, width: 6.6, height: 31, rx: 3.3 }),
+      svg("circle", { class: "skin", cx: -17.1, cy: -44.4, r: 3.3 })),
+    svg("g", { class: "arm arm-right" },
+      svg("rect", { class: "cloth", x: 13.8, y: -76.5, width: 6.6, height: 31, rx: 3.3 }),
+      svg("circle", { class: "skin", cx: 17.1, cy: -44.4, r: 3.3 })),
     svg("rect", { class: "cloth", x: -14.5, y: -78.5, width: 29, height: 39, rx: 8 }),
+    svg("rect", { class: "shade", x: 6.5, y: -77, width: 8, height: 36, rx: 6 }),
     svg("rect", { class: "skin", x: -3.2, y: -82.5, width: 6.4, height: 7, rx: 2 }),
-    accessory(persona.extra === "glasses" || persona.extra === "headset" ? "none" : persona.extra),
+    accessory(worn),
     svg("circle", { class: "skin", cx: 0, cy: -89, r: 10 }),
     svg("circle", { class: "face", cx: -3.9, cy: -88.6, r: 1.15 }),
     svg("circle", { class: "face", cx: 3.9, cy: -88.6, r: 1.15 }),
     svg("path", { class: "mouth", d: "M-2.8,-84.2 Q0,-82.4 2.8,-84.2" }),
     svg("ellipse", { class: "mouth-open", cx: 0, cy: -83.6, rx: 2.3, ry: 1.7 }),
     hairOnTop(persona.hair),
-    accessory(persona.extra === "glasses" || persona.extra === "headset" ? persona.extra : "none"));
+    accessory(onFace),
+  ];
+}
 
+/** One figure in its seat. The pose group is what moves when it speaks or listens; the scale stays on the body. */
+export function drawFigure(persona, seat) {
   const kind = persona.kind === "rule" ? "规则" : "模型";
   const plate = seat.side
     ? { x: seat.side * (27 * seat.scale + 4), y: -52 * seat.scale, anchor: seat.side > 0 ? "start" : "end" }
     : { x: 0, y: 17, anchor: "middle" };
+  // The mark of its field goes in front of its title. A title is about 13 units a character.
+  const wide = persona.title.length * 13;
+  const mark = { size: 13, x: plate.anchor === "middle" ? -wide / 2 - 9 : plate.anchor === "start" ? plate.x : plate.x - wide - 17 };
+  if (plate.anchor !== "end") plate.x += plate.anchor === "start" ? 17 : 8;
   return svg("g", {
     class: `figure ${persona.kind}`, transform: `translate(${seat.x.toFixed(1)},${seat.y.toFixed(1)})`,
-    style: `--cloth: var(--tone-${persona.tone})`, tabindex: 0, role: "button", "data-id": persona.id,
-    "aria-label": `${persona.title}（${kind}）`,
+    style: `--cloth: var(--tone-${persona.tone}); --order: ${persona.seat}`, tabindex: 0, role: "button",
+    "data-id": persona.id, "aria-label": `${persona.title}（${kind}）`,
   },
+    svg("ellipse", { class: "ripple", cx: 0, cy: -1, rx: 31 * seat.scale, ry: 9.5 * seat.scale }),
     svg("ellipse", { class: "halo", cx: 0, cy: -1, rx: 31 * seat.scale, ry: 9.5 * seat.scale }),
     svg("ellipse", { class: "ground", cx: 0, cy: -1, rx: 21 * seat.scale, ry: 5.5 * seat.scale }),
-    body,
+    svg("g", { class: "pose" }, svg("g", { class: "body", transform: `scale(${seat.scale.toFixed(3)})` }, parts(persona))),
+    persona.emblem ? emblemAt(persona.emblem, mark.x, plate.y - 11.5, mark.size) : null,
     svg("text", { class: "plate", x: plate.x, y: plate.y, "text-anchor": plate.anchor, text: persona.title }),
     svg("text", { class: "role", x: plate.x, y: plate.y + 14, "text-anchor": plate.anchor, text: `${kind} · ${persona.group}` }));
+}
+
+/** The same figure's head and shoulders, small, for beside its words. */
+export function portrait(persona) {
+  return svg("svg", { class: "portrait figure", viewBox: "-15 -104 30 34", style: `--cloth: var(--tone-${persona.tone})`, "aria-hidden": "true" },
+    svg("g", { class: "body" }, parts(persona)));
 }

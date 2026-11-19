@@ -167,6 +167,33 @@ EVALUATION_MAX_LESSONS: int = int(os.getenv("EVALUATION_MAX_LESSONS", "5"))
 PIPELINE_USE_LESSONS: bool = os.getenv("PIPELINE_USE_LESSONS", "false").strip().lower() == "true"
 PIPELINE_LESSONS_PER_TICKER: int = int(os.getenv("PIPELINE_LESSONS_PER_TICKER", "3"))
 
+# --- The desk: meetings through the trading day (paper trading: simulated orders only) ---
+# A second group beside the daily pipeline, with its own paper account. It is
+# driven by a short job that runs every few minutes: python -m pipeline.desk.
+# Each round fetches headlines and prices for the book into the ledger, and
+# holds a meeting when one is due. The daily pipeline is not changed by it.
+LEDGER_PATH: str = os.getenv("LEDGER_PATH", "").strip() or str(PROJECT_ROOT / "data_store" / "ledger.sqlite3")
+# Check-ins, as New York times. One before the open and up to two during the
+# session; a time at or after the day's close is skipped on that day.
+DESK_PREMARKET: str = os.getenv("DESK_PREMARKET", "").strip() or "08:30"
+DESK_MIDDAY: str = os.getenv("DESK_MIDDAY", "").strip() or "12:00"
+DESK_AFTERNOON: str = os.getenv("DESK_AFTERNOON", "").strip() or "15:00"
+# (How often a round runs is the schedule's business: DESK_WATCH_MINUTES, read by scripts/schedule.sh.)
+# The close meeting is first tried this long after the close: the source
+# publishes final prices late. A failed try is repeated no sooner than
+# DESK_RETRY_MINUTES later, and at most DESK_CLOSE_TRIES times.
+DESK_CLOSE_DELAY_MINUTES: int = int(os.getenv("DESK_CLOSE_DELAY_MINUTES", "120"))
+DESK_RETRY_MINUTES: int = int(os.getenv("DESK_RETRY_MINUTES", "60"))
+DESK_CLOSE_TRIES: int = int(os.getenv("DESK_CLOSE_TRIES", "5"))
+DESK_CHECKIN_TRIES: int = int(os.getenv("DESK_CHECKIN_TRIES", "2"))
+# Headlines are shown for this many days after they appear, and at most this many per ticker.
+DESK_HEADLINE_DAYS: int = int(os.getenv("DESK_HEADLINE_DAYS", "7"))
+DESK_HEADLINES_SHOWN: int = int(os.getenv("DESK_HEADLINES_SHOWN", "8"))
+# A price move counts as worth a look when it is this many times the usual
+# daily range (ATR 14), or this many percent where the range is unknown.
+DESK_MOVE_ATR: float = float(os.getenv("DESK_MOVE_ATR", "1.0"))
+DESK_MOVE_PCT: float = float(os.getenv("DESK_MOVE_PCT", "3.0"))
+
 # --- Dashboard ---
 # A read-only web page over the journal: python -m dashboard. By default it
 # listens on this machine only. It has no login, so do not point it at a

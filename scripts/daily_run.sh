@@ -22,7 +22,14 @@ cd "$PROJECT" || exit 1
 PYTHON="$PROJECT/venv/bin/python"
 LOG_DIR="${DAILY_LOG_DIR:-$PROJECT/data_store/logs}"
 mkdir -p "$LOG_DIR" || exit 1
-LOG="$LOG_DIR/daily_$(date +%Y-%m-%d).log"
+# What is run, and what it is called. scripts/desk_tick.sh hands a desk meeting
+# to this script through these, so that the two never run a model at the same
+# time and start and stop Ollama in one and the same way.
+MODULE="${RUN_MODULE:-pipeline.daily}"
+ARGS="${RUN_ARGS:-}"
+NAME="${RUN_NAME:-Daily pipeline}"
+LABEL="${RUN_LABEL:-daily run}"
+LOG="$LOG_DIR/${RUN_LOG:-daily}_$(date +%Y-%m-%d).log"
 LOCK="$LOG_DIR/run.lock"
 now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 say() { echo "$*" >> "$LOG"; }
@@ -92,11 +99,11 @@ touch "$LOG"
 START="$(wc -c < "$LOG" | tr -d ' ')"
 this_run() { tail -c +"$((START + 1))" "$LOG"; }
 
-say "=== $(now) daily run starts"
+say "=== $(now) $LABEL starts"
 
 if [ ! -x "$PYTHON" ]; then
     say "Cannot start: no Python at $PYTHON."
-    notify "Daily pipeline did not run" "No Python at venv/bin/python. See $LOG"
+    notify "$NAME did not run" "No Python at venv/bin/python. See $LOG"
     exit 1
 fi
 
@@ -133,13 +140,15 @@ fi
 
 # In the background, so that a signal to this script is acted on at once and
 # the pipeline is stopped with it, not left running on its own.
-"$PYTHON" -m pipeline.daily >> "$LOG" 2>&1 &
+# $ARGS is left unquoted on purpose: it is a list of words, or nothing.
+# shellcheck disable=SC2086
+"$PYTHON" -m "$MODULE" $ARGS >> "$LOG" 2>&1 &
 PIPELINE_PID=$!
 caffeinate -i -w "$PIPELINE_PID" &           # the Mac does not go to sleep on its own while the run is going
 wait "$PIPELINE_PID"
 STATUS=$?
 PIPELINE_PID=""
-say "=== $(now) daily run ends, exit $STATUS"
+say "=== $(now) $LABEL ends, exit $STATUS"
 
 # How each model configuration ended. The pipeline prints one line for each,
 # "<provider>/<model>: <status>[. <message>]", and everything else it prints
@@ -154,10 +163,10 @@ ORDERS="$(this_run | sed -nE 's/^  [0-9]+ views, .* ([0-9]+) order\(s\) placed$/
 if [ "$STATUS" -ne 0 ]; then
     REASON="$(ended 'failed|blocked' | head -n 1)"
     [ -n "$REASON" ] || REASON="$(this_run | grep -v '^===' | tail -n 1)"
-    notify "Daily pipeline did not finish" "$(cut_to 220 "$REASON") The next scheduled run tries again."
+    notify "$NAME did not finish" "$(cut_to 220 "$REASON") The next scheduled run tries again."
 elif [ -n "$(ended 'ok|degraded')" ]; then
-    TITLE="Daily pipeline finished"
-    [ -z "$(ended 'degraded')" ] || TITLE="Daily pipeline finished with problems"
+    TITLE="$NAME finished"
+    [ -z "$(ended 'degraded')" ] || TITLE="$NAME finished with problems"
     SUMMARY="$(ended 'ok|degraded' | sed -E 's/^([^[:space:]]+: [a-z]+).*$/\1/' | paste -sd ';' - | sed 's/;/; /g')"
     notify "$TITLE" "$(cut_to 160 "$SUMMARY")${ORDERS:+, $ORDERS order(s) placed}"
 fi

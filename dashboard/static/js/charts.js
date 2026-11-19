@@ -94,7 +94,8 @@ export function lineChart({ series, valueText, label }) {
     const ends = shown.map((item) => {
       const path = item.points.map((point, index) =>
         `${index === 0 ? "M" : "L"}${x(days.indexOf(point.d)).toFixed(1)},${y(point.v).toFixed(1)}`).join(" ");
-      frame.append(svg("path", { class: "line", d: path, stroke: item.color }));
+      // The path is told its length is 1, so that it can be drawn in from its start whatever its real length.
+      frame.append(svg("path", { class: "line", d: path, stroke: item.color, pathLength: 1 }));
       const last = item.points[item.points.length - 1];
       return { name: item.name, color: item.color, x: x(days.indexOf(last.d)), y: y(last.v), text: valueText(last.v) };
     });
@@ -108,9 +109,9 @@ export function lineChart({ series, valueText, label }) {
     if (overflow > 0) for (const end of ends) end.labelY -= overflow;
     for (const end of ends) {
       frame.append(
-        svg("circle", { class: "dot", cx: end.x, cy: end.y, r: 5, fill: end.color }),
-        svg("text", { class: "label", x: end.x + 12, y: end.labelY - 1, text: end.name }),
-        svg("text", { class: "strong", x: end.x + 12, y: end.labelY + 13, text: end.text }));
+        svg("circle", { class: "dot end", cx: end.x, cy: end.y, r: 5, fill: end.color }),
+        svg("text", { class: "label end", x: end.x + 12, y: end.labelY - 1, text: end.name }),
+        svg("text", { class: "strong end", x: end.x + 12, y: end.labelY + 13, text: end.text }));
     }
 
     // One crosshair for every series: the reader aims at a day, not at a line.

@@ -106,7 +106,9 @@ test("fourteen people stand evenly round the room, the first at the top, opposit
   });
   assert.ok(Math.min(...gaps) > 130 && Math.max(...gaps) - Math.min(...gaps) < 12, `gaps ${gaps.map(Math.round)}`);
 
-  // Those at the back are drawn smaller, and only the four at the two ends carry their name beside them.
+  // Those at the back are drawn smaller. The three nearest the top and the three nearest the bottom have their
+  // name under them; the eight to either side carry it beside them, on the outer side, clear of the table and
+  // of the market screen that stands in its middle.
   assert.ok(places[0].scale < places[3].scale && places[3].scale < places[7].scale);
-  assert.deepEqual(places.map((place) => place.side), [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, -1, -1, 0, 0]);
+  assert.deepEqual(places.map((place) => place.side), [0, 0, 1, 1, 1, 1, 0, 0, 0, -1, -1, -1, -1, 0]);
 });

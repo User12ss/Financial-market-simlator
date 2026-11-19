@@ -1,32 +1,52 @@
 #!/bin/bash
-# The schedule that runs scripts/daily_run.sh on this Mac, through launchd.
+# The schedules on this Mac, through launchd. There are two, installed and
+# removed separately:
 #
-#   scripts/schedule.sh install     run every day at the times below
-#   scripts/schedule.sh uninstall   stop the schedule; nothing else is touched
-#   scripts/schedule.sh status      whether it is loaded, how the last run ended, the last log lines
-#   scripts/schedule.sh run         start one run now, the way the schedule would
+#   the daily pipeline   scripts/daily_run.sh, at set times of day
+#   the desk             scripts/desk_tick.sh, every few minutes
 #
-# The times are this Mac's local time and were chosen for US Eastern: several
-# tries from the evening on, because closing prices can be published hours
-# after the close, and one in the morning before the open. Trying again costs
-# nothing: a session that already has signals is skipped. Set DAILY_RUN_TIMES
-# ("HH:MM HH:MM ...") before `install` to use other times.
+#   scripts/schedule.sh install [desk]     load the schedule
+#   scripts/schedule.sh uninstall [desk]   stop it; nothing else is touched
+#   scripts/schedule.sh status [desk]      whether it is loaded, how the last run ended, the last log lines
+#   scripts/schedule.sh run [desk]         start one run now, the way the schedule would
+#
+# Without "desk" a command is about the daily pipeline.
+#
+# The daily pipeline's times are this Mac's local time and were chosen for US
+# Eastern: several tries from the evening on, because closing prices can be
+# published hours after the close, and one in the morning before the open.
+# Trying again costs nothing: a session that already has signals is skipped.
+# Set DAILY_RUN_TIMES ("HH:MM HH:MM ...") before `install` to use other times.
+#
+# The desk runs a round every DESK_WATCH_MINUTES minutes (15 unless set before
+# `install desk`), day and night. A round outside trading hours looks at the
+# clock and ends; it works out New York time itself, so this Mac's time zone
+# does not matter to it.
 #
 # launchd does not wake a sleeping Mac. A run that was due while it slept is
 # made once when it wakes; if that is after the next session has opened, the
-# pipeline refuses it and that session is missed. The schedule belongs to your
-# login session: nothing runs while you are logged out.
+# pipeline refuses it and that session is missed. During trading hours the
+# desk keeps the Mac from going to sleep on its own, but a closed lid still
+# puts it to sleep. The schedules belong to your login session: nothing runs
+# while you are logged out.
 #
 # macOS does not let scheduled jobs read the Desktop, Documents or Downloads
 # folders, so the project has to live somewhere else for this to work.
 
 set -eu
 
-LABEL="com.financial-market-sim.daily"
+usage() { echo "Usage: scripts/schedule.sh install | uninstall | status | run [desk]" >&2; exit 2; }
+
+case "${2:-daily}" in
+    daily) JOB="daily"; LABEL="com.financial-market-sim.daily"; SCRIPT="daily_run.sh" ;;
+    desk) JOB="desk"; LABEL="com.financial-market-sim.desk"; SCRIPT="desk_tick.sh" ;;
+    *) usage ;;
+esac
 PROJECT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 TIMES="${DAILY_RUN_TIMES:-18:00 20:00 22:00 23:45 07:00}"
+MINUTES="${DESK_WATCH_MINUTES:-15}"
 LOG_DIR="$PROJECT/data_store/logs"
 
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -65,19 +85,36 @@ install() {
             echo "macOS does not let scheduled jobs read Desktop, Documents or Downloads: move the project first." >&2
             exit 1 ;;
     esac
-    intervals=""
-    shown=""
-    for time in $TIMES; do
-        if ! [[ "$time" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
-            echo "Not a time of day (HH:MM): $time" >&2
+    if [ "$JOB" = "desk" ]; then
+        if ! [[ "$MINUTES" =~ ^[0-9]{1,2}$ ]] || [ "$((10#$MINUTES))" -lt 1 ] || [ "$((10#$MINUTES))" -gt 60 ]; then
+            echo "Not a number of minutes from 1 to 60: $MINUTES" >&2
             exit 1
         fi
-        hour=$((10#${BASH_REMATCH[1]})); minute=$((10#${BASH_REMATCH[2]}))
-        intervals="$intervals        <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>
+        every=$((10#$MINUTES))
+        # A round leaves a short-lived process behind that keeps the Mac awake until the
+        # next one. Without AbandonProcessGroup launchd would end it with the round.
+        when="    <key>StartInterval</key><integer>$((every * 60))</integer>
+    <key>AbandonProcessGroup</key><true/>
 "
-        shown="$shown$(printf '%02d:%02d' "$hour" "$minute") "
-    done
-    [ -n "$intervals" ] || { echo "No times given." >&2; exit 1; }
+    else
+        intervals=""
+        shown=""
+        for time in $TIMES; do
+            if ! [[ "$time" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+                echo "Not a time of day (HH:MM): $time" >&2
+                exit 1
+            fi
+            hour=$((10#${BASH_REMATCH[1]})); minute=$((10#${BASH_REMATCH[2]}))
+            intervals="$intervals        <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>
+"
+            shown="$shown$(printf '%02d:%02d' "$hour" "$minute") "
+        done
+        [ -n "$intervals" ] || { echo "No times given." >&2; exit 1; }
+        when="    <key>StartCalendarInterval</key>
+    <array>
+$intervals    </array>
+"
+    fi
     refuse_while_running
 
     mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
@@ -91,13 +128,10 @@ install() {
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$(xml "$PROJECT/scripts/daily_run.sh")</string>
+        <string>$(xml "$PROJECT/scripts/$SCRIPT")</string>
     </array>
     <key>WorkingDirectory</key><string>$(xml "$PROJECT")</string>
-    <key>StartCalendarInterval</key>
-    <array>
-$intervals    </array>
-    <key>StandardOutPath</key><string>$(xml "$LOG_DIR/launchd.log")</string>
+$when    <key>StandardOutPath</key><string>$(xml "$LOG_DIR/launchd.log")</string>
     <key>StandardErrorPath</key><string>$(xml "$LOG_DIR/launchd.log")</string>
 </dict>
 </plist>
@@ -111,7 +145,12 @@ EOF
         echo "launchd did not load the schedule. The file is at $PLIST; run install again." >&2
         exit 1
     fi
-    echo "Installed. The daily pipeline runs every day at: ${shown% } (this Mac's local time, $(date +%Z))."
+    if [ "$JOB" = "desk" ]; then
+        echo "Installed. The desk runs a round every $every minute(s). It fetches and meets on trading days only."
+        echo "Keep this Mac on, with the lid open, from before the open to after the close."
+    else
+        echo "Installed. The daily pipeline runs every day at: ${shown% } (this Mac's local time, $(date +%Z))."
+    fi
     echo "Logs: $LOG_DIR"
 }
 
@@ -123,7 +162,7 @@ uninstall() {
     refuse_while_running
     unload
     rm -f "$PLIST"
-    echo "Removed. Nothing runs on a schedule now; records and logs are untouched."
+    echo "Removed. Nothing runs on this schedule now; records and logs are untouched."
 }
 
 status() {
@@ -133,9 +172,14 @@ status() {
     fi
     echo "Installed: $PLIST"
     launchctl print "$DOMAIN/$LABEL" | grep -E $'^\t(state|runs|last exit code) =' | sed $'s/^\t/  /'
-    echo "  times (local): $(sed -n 's|.*<key>Hour</key><integer>\([0-9]*\)</integer><key>Minute</key><integer>\([0-9]*\)</integer>.*|\1:\2|p' "$PLIST" \
-        | awk -F: '{printf "%02d:%02d ", $1, $2}')"
-    latest="$(ls -t "$LOG_DIR"/daily_*.log 2>/dev/null | head -n 1 || true)"
+    if [ "$JOB" = "desk" ]; then
+        seconds="$(sed -n 's|.*<key>StartInterval</key><integer>\([0-9]*\)</integer>.*|\1|p' "$PLIST")"
+        echo "  a round every $(( ${seconds:-0} / 60 )) minute(s)"
+    else
+        echo "  times (local): $(sed -n 's|.*<key>Hour</key><integer>\([0-9]*\)</integer><key>Minute</key><integer>\([0-9]*\)</integer>.*|\1:\2|p' "$PLIST" \
+            | awk -F: '{printf "%02d:%02d ", $1, $2}')"
+    fi
+    latest="$(ls -t "$LOG_DIR"/"$JOB"_*.log 2>/dev/null | head -n 1 || true)"
     if [ -n "$latest" ]; then
         echo "Last lines of $latest:"
         tail -n 8 "$latest" | cut -c1-200 | sed 's/^/  /'
@@ -145,20 +189,20 @@ status() {
 }
 
 run() {
-    loaded || { echo "Not installed: run 'scripts/schedule.sh install' first." >&2; exit 1; }
+    loaded || { echo "Not installed: run 'scripts/schedule.sh install${2:+ $2}' first." >&2; exit 1; }
     if running; then
         echo "A run is already going."
     else
         launchctl kickstart "$DOMAIN/$LABEL"
         echo "Started."
     fi
-    echo "Follow it with: tail -f \"$LOG_DIR/daily_$(date +%Y-%m-%d).log\""
+    echo "Follow it with: tail -f \"$LOG_DIR/${JOB}_$(date +%Y-%m-%d).log\""
 }
 
 case "${1:-}" in
     install) install ;;
     uninstall) uninstall ;;
     status) status ;;
-    run) run ;;
-    *) echo "Usage: scripts/schedule.sh install | uninstall | status | run" >&2; exit 2 ;;
+    run) run "$@" ;;
+    *) usage ;;
 esac

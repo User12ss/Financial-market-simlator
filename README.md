@@ -364,6 +364,48 @@ The times were chosen for US Eastern and are this Mac's local time; set `DAILY_R
 
 Each stage of the larger plan has an exit test; `--status` shows where the signal stage's stands (five trading sessions in a row without error, with at least one sell or trim accepted along the way).
 
+## The Desk: meetings through the trading day (paper trading)
+
+```bash
+python -m pipeline.desk tick        # one round: the watch, then a meeting if one is due
+python -m pipeline.desk status      # today's meetings, the watch's last round, what is due now
+python -m pipeline.desk watch       # only the watch
+python -m pipeline.desk due         # print which meeting is due now, if any
+python -m pipeline.desk meet        # hold the meeting that is due
+```
+
+The desk is a second group beside the daily pipeline, with a paper account of its own (its records are kept under a model configuration whose name starts with `desk/`). The daily pipeline goes on exactly as it was: it is the baseline the desk is measured against. A test holds it to that, by a fingerprint of every prompt, event and signal table taken before the desk was added. Both use the same journal, and when the baseline has already collected a session's data the desk reads that same snapshot.
+
+A short job runs `tick` every few minutes. A round does two things.
+
+**The watch** is plain code and takes a few seconds: no model is called. On a trading day, from half an hour before the first check-in until the close, it fetches headlines for every name in the desk's book (holdings and orders waiting to fill) and the day's prices so far for the book, the S&P 500 and the VIX. Outside those hours it does nothing. What it fetches goes into the **ledger** (`data_store/ledger.sqlite3`), a file that is only ever added to: each story with the moment this system first had it, each price with the moment it was fetched, and a line for every fetch, the failed ones included. A fetch that failed is recorded as failed and nothing is put in its place. The prices come from the same source as the daily bars (Yahoo Finance, the day's bar while it is still forming) and may run behind the market.
+
+**A meeting**, when one is due:
+
+| Meeting | When (New York) | What it does |
+|---------|-----------------|--------------|
+| Check-in before the open (`premarket`) | `DESK_PREMARKET`, 08:30 | What has come in overnight. May take back a buy that is waiting to fill, or sell or trim a holding, at that day's open |
+| Check-ins during the session (`midday`, `afternoon`) | `DESK_MIDDAY` 12:00, `DESK_AFTERNOON` 15:00 | What has come in since the last meeting. Nothing is traded: what is decided is noted for the close meeting |
+| Close meeting (`close`) | From two hours after the close until the next open | The daily pipeline's seven stages, reading its headlines from the ledger and told what the day's check-ins found |
+
+A **check-in** forms no new view. The news desk (code) says what is new for each name in the book since the last meeting: headlines first seen since then, and where the name is trading against its usual daily range (ATR). Where there is something to ask about, the analyst says what it does to the view it already holds (`unchanged`, `strengthened`, `weakened` or `broken`), naming the headlines it relied on, and the portfolio manager says what to do. Code then decides: a check-in can only reduce risk, and only where the analyst's update says the view is weakened or broken. It never opens or adds to a position. A check-in with nothing new calls no model at all. Before the open, exits are sized, put through the risk gate (kill switch included) and placed to fill at that open, and a waiting buy can be taken back. During the session the desk's orders would fill at the next open anyway, so the decision is noted and the close meeting decides with the full day's data; the analyst and the manager are shown those notes there.
+
+**Every meeting has a cut-off**, and nothing the ledger first saw after it is shown to a model in that meeting. "First seen", not "published": a story is not known here before it has been fetched. The cut-off is recorded with the meeting, and each check-in records the headlines it showed, with the moment each was first seen.
+
+**When a meeting does not count.** No check-in is due while the last session has no close meeting to build on (a desk on its first day, or a close meeting that never got through): it is not tried at all. A check-in fails, and decides nothing, when the model is needed and not reachable, or when the cost limit is reached; it is tried once more at the next round and then left. It is marked `degraded` when a fetch it relied on had failed, a model call was lost, or the open passed before its orders could be placed (then nothing is placed). A close meeting that fails is tried again an hour later, five times at most.
+
+**Running it (macOS).** `scripts/desk_tick.sh` is one round. The watch needs no lock; a meeting is handed to `scripts/daily_run.sh`, so it takes the same lock as the daily pipeline, never runs a model beside it, and starts and stops Ollama the same way. The schedule is separate from the daily pipeline's:
+
+```bash
+scripts/schedule.sh install desk     # a round every 15 minutes (DESK_WATCH_MINUTES)
+scripts/schedule.sh status desk
+scripts/schedule.sh uninstall desk
+```
+
+While the watch is on, each round keeps the Mac from going to sleep on its own until the next one (`DESK_KEEP_AWAKE=0` turns that off). A closed lid still puts it to sleep, and launchd does not wake it: keep the Mac on with the lid open from before the open until after the close, or run the desk somewhere that stays on. The log is `data_store/logs/desk_<date>.log`.
+
+**What this stage does not do yet.** The desk's meetings are held by the same figures as the daily pipeline, plus the news desk. Forecasts, plans with triggers, and the analysts who look at people instead of prices are later stages of `docs/UPGRADE_PLAN.md` (section 11). The headlines are titles only, and filings are not fetched yet.
+
 ## Evaluation
 
 ```bash
@@ -395,22 +437,35 @@ A journal written before the evaluation existed opens as it is: the two tables t
 python -m dashboard                 # then open http://127.0.0.1:8765
 ```
 
-A web page over the journal and the last evaluation report. Its own labels are in Chinese.
+A web page over the journal, the data snapshots the runs recorded and the last evaluation report. Its own labels are in Chinese, and it has one look: a dark trading terminal.
 
-**It is read-only.** Every address it serves answers a read and refuses anything else, the journal is opened in SQLite's read-only mode, and the page has no control that places an order, moves a limit or starts a run. It never writes to the journal and does not create one that is missing. (SQLite may put its own empty `-wal` and `-shm` files beside a journal that is opened for reading.)
+**It is read-only.** Every address it serves answers a read and refuses anything else, the journal is opened in SQLite's read-only mode, and the page has no control that places an order, moves a limit or starts a run. It never writes to the journal and does not create one that is missing. The desk's ledger is read the same way, and only for the watch's last round; it is looked for beside the journal (`--ledger` names another), and one that is missing is not created. (SQLite may put its own empty `-wal` and `-shm` files beside a journal that is opened for reading.)
+
+**It opens on what the desk is at now.** With a desk running, the meeting room shows the meeting that is going, live, or the last one that was held, whether a check-in or a close meeting. Above the room a strip lists the day's meetings in the order they were held, each with its time and how it stands; choosing one opens it, and a button leads back to now. Under them is the watch's last round: when it was, what it fetched and could not fetch, the largest move of the day in the book, and the next meeting on the timetable. The strip is read again once a minute. A meeting's heading gives its cut-off. For a model configuration with no desk the strip shows the day's one meeting, its close run, and no watch line.
+
+**A check-in is shown like any meeting.** Its lines are laid on the same decision trail: the analyst's update where a view would be, the manager's decision where a proposal would be, and as the last step an order placed, a waiting buy taken back, or a decision noted for the close. The market screen shows the chart of the name being spoken of, from the data of the close meeting the check-in built on, with a line at the price the news desk reported for the day, from the line that reported it on.
 
 **Who can see it.** The page has no login. By default it listens on this computer only (`DASHBOARD_HOST`) and answers only a browser that addresses it as `127.0.0.1` or `localhost`, so a page on another web site cannot read the records through your browser by pointing its own name at your computer. Set `DASHBOARD_HOST` to one of the computer's own addresses and it also answers under that address; set it to `0.0.0.0` and it answers anyone who can reach the computer, under any name. Everyone who can open the page sees every record, so do not put it on a network you do not trust.
 
-**Only what was recorded is shown.** What a model said appears word for word, in the language it was written in. The page neither writes nor polishes a line, and puts recorded text on the page as text, never as markup. Fixed vocabulary (a side, a status, a stage) is named in Chinese; anything a model or a rule wrote in its own words is left as it is.
+**Only what was recorded is shown.** What a model said appears word for word, in the language it was written in. The page neither writes nor polishes a line, and puts recorded text on the page as text, never as markup. Fixed vocabulary (a side, a status, a stage) is named in Chinese; anything a model or a rule wrote in its own words is left as it is. The signs over the figures, the decision trail and its counts are read off the record's own fields (a direction, a verdict, a number of shares) or are counts of recorded lines; none of them is written by a model. They read the record the way the pipeline does: a ticker in the portfolio manager's list is trimmed and put in capitals, and only the first proposal for a ticker counts, with any later one noted as a repeat that does not.
+
+**Nothing ahead of the line being played.** While a session is played or a run is going, the signs and the trail show what the record holds up to that line. A ticker nobody has mentioned yet has no row, and a step that has not happened has no cell, label or tooltip. A ticker is said to have got no further only at the last line of a run that has finished, or when the final result is asked for.
+
+**Market data is the run's own snapshot.** Every price, bar, indicator and market series on the page is read from the data snapshot a run recorded, which is what its agents were shown: daily bars, not live quotes, and nothing is fetched from outside. The file is only read. While a run is still going, its snapshot is found through the session's data checkpoint, since the run writes down where it is only when it ends; a snapshot captured after that run began is not taken for its own, because another invocation may have saved its data over the checkpoint. A run that is no longer going and never wrote it down (it failed before it had data, or was killed) has no market data to show: the checkpoint belongs to the session, and by then it may hold the data of the run that replaced it. A stop or a limit is drawn on a ticker's chart when the line that set it has been reached. What the price did after a session comes from later sessions' snapshots and is joined on only once the record is over, marked as something nobody in that run could see; a later snapshot is used only when it has the same close for the session's day, so prices from before and after a split are never put on one chart. Direction is never told by colour alone: a rise or a fall carries an arrow, and a rising candle is hollow where a falling one is filled.
+
+**Movement changes nothing.** Words are revealed a few characters at a time but are the recorded words at every moment, and a figure that runs up always ends on its value. A reader whose system asks for reduced motion gets everything at once, without animation, and a tape that stands still.
 
 | Page | What it shows |
 |------|---------------|
-| 总览 | Equity beside the benchmark bought and held and the candidates in equal weight (both lines are read from the last evaluation report; the third reference, random picks, is a distribution and is on the evaluation page). Cash, the day's change, the fall from the high. The two circuit breakers, judged with the risk gate's own comparisons. The kill switch, put to the gate's own function: that is the switch as the dashboard sees it at that moment, which covers the switch file but not a `TRADING_HALT` set for the pipeline alone, so what the last finished run itself recorded about being halted is shown beside it. |
-| 会议室 | The main page. Fourteen figures stand in a circle: seven macro analysts, the ticker analyst, the bull and the bear facing each other, the judge, the portfolio manager, and the risk officer and the trader, who are rules and are marked as rules. They have positions, not names, and are drawn by code; none is modelled on a real person. The latest session is played in the order it was recorded: whoever speaks is lit, the one spoken to is marked, the words appear in the middle, and everything else recorded with that line is listed below. While a run is going, new lines appear by themselves. |
+| 总览 | Equity beside the benchmark bought and held and the candidates in equal weight (both lines are read from the last evaluation report; the third reference, random picks, is a distribution and is on the evaluation page). Cash, the day's change, the fall from the high. The decisions of the latest close meeting. The two circuit breakers, judged with the risk gate's own comparisons. The kill switch, put to the gate's own function: that is the switch as the dashboard sees it at that moment, which covers the switch file but not a `TRADING_HALT` set for the pipeline alone, so what the last finished run itself recorded about being halted is shown beside it. |
+| 会议室 | The main page. Fourteen figures stand round a table: seven macro analysts, the ticker analyst, the bull and the bear facing each other, the judge, the portfolio manager, and the risk officer and the trader, who are rules and are marked as rules. They have positions, not names, and are drawn by code; none is modelled on a real person. Each carries the mark of its field. The latest session is played in the order it was recorded: a light rests on whoever speaks, a stream runs along the table's edge to the one spoken to (or all the way round when it is everyone), the words appear on the line under the room, and a sign over each figure says what it has concluded so far. In the middle of the table stands the market screen, which follows the discussion: a ticker's daily candles, volume, recorded averages and usual daily swing (ATR) while that ticker is talked about, with the stops and limits the record puts on it; the tickers of the portfolio manager's list side by side; the recorded series of a macro analyst's field while that analyst speaks (the yield curve for the bond analyst, the sector funds for the equity analyst); otherwise the market as a whole. Beside the room, a panel shows whoever is speaking, or a figure that was picked: its field, what it has concluded so far in its recorded fields and its own words, the figures it cited with the pipeline's own check of each against the snapshot (which allows about two per cent; where the two numbers differ, both are shown), the recorded data of its field, and how often it has spoken by that line. The whole session's tally for a figure is shown only once the record is over. Under the room, the decision trail has one row per ticker and one cell per step it went through (view, debate, ruling, proposal, check, risk, order). A row appears when its ticker is first spoken of and a cell when its step has happened, with a count of how many tickers have got how far; a cell leads back to the line that was said, and a button shows the final result at once. Everything else recorded with the current line is listed below that. While a run is going, new lines appear by themselves. |
+| 决策 | How decisions changed from session to session: every ticker against every finished session, with the analyst's direction and confidence, whether it was held, what was proposed and what became of it, and a mark where the direction differs from the session before. It is read from each session's signal table, where an order is one that passed the risk gate (风控放行); fills are on the next page. Under it, the decision trail of whichever session is picked, read from the same run as that session's column; a cell of either leads to the replay of that run. |
 | 持仓和订单 | Positions with their stops, orders waiting to fill, fills, and the last finished session's candidates, views, proposals and risk decisions. |
 | 评估 | The last evaluation report as it was written: model configurations side by side, the scorecard, stated confidence against the hit rate, trades, where the account falls among random picks, model usage, and the lessons on record. The dashboard never runs the evaluation; `python -m evaluation` refreshes it. |
-| 回放 | Any past session, played back the same way: pick a day and the run that counts for it is shown. |
+| 回放 | Any past day, played back the same way: pick a day and its close meeting is shown (its last check-in while there is none yet); the day's other meetings are on the strip above the room. |
 | 运行状态 | Every run with its duration, model calls, cost, warnings and errors, and a link that replays that one run, a failed or replaced attempt included. |
+
+Along the top of every page runs a tape of the latest session's snapshot: each ticker with its close, its day's move, a small line of its recent closes and its usual daily swing, then the market series. On the meeting room and the replay it shows the prices of the run in the room instead, so an earlier session is never played under a later session's prices. It stops under the pointer, or with its button.
 
 When a session was run more than once, the run shown for it is the one still going, else the one whose signals stand, else the last attempt.
 
@@ -479,6 +534,16 @@ Set these in `.env` (see `.env.example`):
 | `EVALUATION_MAX_LESSONS` | `5` | Most lessons written by one evaluation run with `--lessons` |
 | `PIPELINE_USE_LESSONS` | `false` | Show lessons to the ticker analyst. Changes what the pipeline decides |
 | `PIPELINE_LESSONS_PER_TICKER` | `3` | Most lessons shown for one ticker |
+| `LEDGER_PATH` | `data_store/ledger.sqlite3` | The desk's ledger: headlines and prices with the moment each was first seen |
+| `DESK_PREMARKET` | `08:30` | The check-in before the open, New York time |
+| `DESK_MIDDAY` / `DESK_AFTERNOON` | `12:00` / `15:00` | The check-ins during the session. One timed at or after the day's close is skipped that day |
+| `DESK_WATCH_MINUTES` | `15` | How often the desk's job is scheduled (read by `scripts/schedule.sh install desk`) |
+| `DESK_KEEP_AWAKE` | `1` | Keep the Mac from sleeping on its own between rounds while the watch is on |
+| `DESK_CLOSE_DELAY_MINUTES` | `120` | How long after the close the close meeting is first tried |
+| `DESK_RETRY_MINUTES` / `DESK_CLOSE_TRIES` | `60` / `5` | How soon, and how often, a failed close meeting is tried again |
+| `DESK_CHECKIN_TRIES` | `2` | Tries at one check-in |
+| `DESK_HEADLINE_DAYS` / `DESK_HEADLINES_SHOWN` | `7` / `8` | How long a headline is shown, and how many per ticker fit in a prompt |
+| `DESK_MOVE_ATR` / `DESK_MOVE_PCT` | `1.0` / `3.0` | A move worth a look: this many usual daily ranges, or this many percent where the range is unknown |
 | `DASHBOARD_HOST` | `127.0.0.1` | Address the dashboard listens on. The default serves this computer only |
 | `DASHBOARD_PORT` | `8765` | Port the dashboard listens on |
 
@@ -499,7 +564,7 @@ financial-market-sim/
 ├── config.py              # Provider, model and feature configuration
 ├── orchestrator.py        # ReAct agentic orchestrator (structured action loop)
 ├── docs/UPGRADE_PLAN.md   # Plan for evolving this into a trading system
-├── scripts/               # daily_run.sh (one unattended run) and schedule.sh (launchd schedule, macOS)
+├── scripts/               # daily_run.sh (one unattended run), desk_tick.sh (one round of the desk), schedule.sh (launchd, macOS)
 ├── tests/                 # pytest suite (no real model needed)
 ├── main.py                # CLI entry point (Rich terminal UI, preferences)
 ├── app.py                 # Streamlit web UI
@@ -508,6 +573,8 @@ financial-market-sim/
 ├── .env.example           # Template for .env
 ├── pipeline/
 │   ├── daily.py           # The fixed daily pipeline (paper trading) and its command line
+│   ├── desk.py            # The desk: the watch, which meeting is due, the close meeting that reads the ledger
+│   ├── checkin.py         # A check-in: what is new, what it does to a standing view, what may be done about it
 │   ├── universe.py        # Ticker universe and the rule-based candidate screen
 │   ├── macro.py           # Combines the macro agents' assessments by rule
 │   ├── checks.py          # Rules between model output and what is kept
@@ -521,7 +588,7 @@ financial-market-sim/
 │   ├── paper.py           # Paper broker: matching against daily bars, splits, dividends, equity
 │   └── placement.py       # Three-step order placement that survives a crash
 ├── journal/
-│   └── store.py           # SQLite journal: runs, events, macro views, paper books, checkpoints, scores, lessons
+│   └── store.py           # SQLite journal: runs, events, macro views, paper books, checkpoints, scores, lessons, the desk's meetings
 ├── evaluation/
 │   ├── run.py             # The evaluation command: python -m evaluation
 │   ├── scoring.py         # Scores every view against later prices; the scorecard
@@ -536,9 +603,9 @@ financial-market-sim/
 │   ├── app.py             # Read-only web server: GET addresses, the live event stream, the page's files
 │   ├── reader.py          # Everything shown, read from the journal (opened read-only) and the last report
 │   ├── personas.py        # The fourteen figures: position, seat, model or rule
-│   └── static/            # The page: index.html, styles.css, js/ (meeting room, playback, charts, pages)
+│   └── static/            # The page: index.html, styles.css, js/ (meeting room, decision trail, playback, charts, pages)
 ├── agents/
-│   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager, reviewer
+│   ├── ticker/            # Ticker analyst, bull, bear, judge, portfolio manager, reviewer, and the two voices of a check-in
 │   ├── base.py            # BaseAgent: scenario analysis, deliberation, current-state assessment
 │   ├── central_bank.py    # Monetary policy specialist
 │   ├── fiscal_policy.py   # Government spending specialist
@@ -552,6 +619,7 @@ financial-market-sim/
 ├── data/
 │   ├── market_calendar.py # NYSE trading days, holidays, early closes
 │   ├── providers.py       # Yahoo Finance and FRED behind small interfaces
+│   ├── ledger.py          # The desk's ledger: what was seen and when it was first seen, fetches, the watch's rounds
 │   ├── indicators.py      # Moving averages, RSI, MACD, Bollinger, ATR
 │   ├── quality.py         # Checks that mark a ticker's data usable or not
 │   ├── snapshot.py        # Build, save and load snapshots; command line
@@ -579,7 +647,7 @@ RUN_LIVE=1 pytest -m live            # structured output against local Ollama
 RUN_LIVE_ANTHROPIC=1 pytest -m live  # the same against Claude (costs a fraction of a cent)
 ```
 
-The dashboard page's own logic (playing a meeting back, following a run that is still going, number formats, seats) has tests in `tests/js`. `pytest` runs them with `node` when it is installed and skips them when it is not; `node --test tests/js/*.test.mjs` runs them alone.
+The dashboard page's own logic (playing a meeting back, following a run that is still going, how each decision came about, what the decision trail shows at each line and which run the 决策 page reads, what the market screen and the tape show and when, each figure's panel, words kept as text and revealed unchanged, number formats, seats, a check-in read off its record, the strip of the day's meetings) has tests in `tests/js`. Their stand-in for a browser refuses a page that would write the word "null" where a missing piece should simply be left out. `pytest` runs them with `node` when it is installed and skips them when it is not; `node --test tests/js/*.test.mjs` runs them alone. Two more tests hold the page to the pipeline: one sets the trail the page works out from a run's events beside the grid read from that run's signal table, for runs the real pipeline made, and requires them to agree; the other requires the page to read a ticker out of a proposal exactly as the pipeline's `strip().upper()` does. The code that draws the page (figures, charts, layout, animation) is checked by eye only.
 
 ## License
 

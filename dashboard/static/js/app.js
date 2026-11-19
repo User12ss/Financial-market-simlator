@@ -3,11 +3,13 @@
 
 import { el, clear, getJSON, empty } from "./dom.js";
 import { hearEvent, hearRun, newLive, reconnected } from "./live.js";
-import { overviewPage, roomPage, bookPage, evaluationPage, replayPage, statusPage } from "./pages.js";
+import { overviewPage, roomPage, decisionsPage, bookPage, evaluationPage, replayPage, statusPage } from "./pages.js";
+import { tickerTape } from "./tape.js";
 
 const TABS = [
-  ["overview", "总览", overviewPage], ["room", "会议室", roomPage], ["book", "持仓和订单", bookPage],
-  ["evaluation", "评估", evaluationPage], ["replay", "回放", replayPage], ["status", "运行状态", statusPage],
+  ["overview", "总览", overviewPage], ["room", "会议室", roomPage], ["decisions", "决策", decisionsPage],
+  ["book", "持仓和订单", bookPage], ["evaluation", "评估", evaluationPage], ["replay", "回放", replayPage],
+  ["status", "运行状态", statusPage],
 ];
 const REFRESH_MS = 20000;
 const RETRY_MS = 5000;
@@ -17,8 +19,22 @@ const tabs = document.getElementById("tabs");
 const picker = document.getElementById("arm");
 const liveChip = el("a", { class: "chip", href: "#room", hidden: true });
 document.querySelector(".brand").append(liveChip);
+const tape = tickerTape();
+main.before(tape.node);
 
 const app = { roster: [], arm: null, page: null, source: null, connected: true, live: newLive() };
+
+/**
+ * The tape shows the latest session's recorded prices, unless the page on show has put its own run's prices on
+ * it (a room playing an earlier session must not have later prices running over it). When the latest cannot
+ * be read the tape keeps what it has.
+ */
+async function readTape() {
+  const arm = app.arm, page = app.page;
+  if (app.tapeTaken) return;
+  const answer = await getJSON("/api/market", { arm });
+  if (answer.ok && arm === app.arm && page === app.page && !app.tapeTaken) tape.load(answer.data);
+}
 
 function remembered() {
   try { return window.sessionStorage.getItem("arm"); } catch (error) { return null; }
@@ -28,10 +44,11 @@ function remember(arm) {
 }
 
 function route() {
-  const [name, day, run] = window.location.hash.replace(/^#/, "").split("/");
+  const [name, day, run, line] = window.location.hash.replace(/^#/, "").split("/");
   const found = TABS.find(([id]) => id === name) || TABS[0];
-  // After the page's name: a session date, then perhaps one run of that day. Anything else is ignored,
-  // and the page opens on the newest. The run's name is only ever sent to the server as a question.
+  // After the page's name: a session date, then perhaps one run of that day, then perhaps a line of it.
+  // Anything else is ignored, and the page opens on the newest. The run's name is only ever sent to the
+  // server as a question.
   const param = /^\d{4}-\d{2}-\d{2}$/.test(day || "") ? day : null;
   let which = null;
   try {
@@ -39,7 +56,7 @@ function route() {
   } catch (error) {
     which = null;
   }
-  return { id: found[0], build: found[2], param, run: which };
+  return { id: found[0], build: found[2], param, run: which, line: param && /^\d{1,5}$/.test(line || "") ? Number(line) : null };
 }
 
 function paintTabs(active) {
@@ -64,11 +81,19 @@ function paintLive() {
 }
 
 function render() {
-  const { id, build, param, run } = route();
+  const { id, build, param, run, line } = route();
   if (app.page && app.page.destroy) app.page.destroy();
   paintTabs(id);
-  app.page = build({ arm: app.arm, roster: app.roster, param, run, live: () => app.live });
+  app.tapeTaken = false;
+  app.page = build({
+    arm: app.arm, roster: app.roster, param, run, line, live: () => app.live,
+    tape: (market) => {                               // a page that shows one run puts that run's prices on the tape
+      app.tapeTaken = true;
+      tape.load(market);
+    },
+  });
   clear(main).append(app.page.node);
+  readTape();
 }
 
 function listen() {
@@ -83,6 +108,7 @@ function listen() {
     if (app.page && app.page.onStream) app.page.onStream(told);
     // A run starting or ending changes the numbers on the other pages too.
     if (changed && app.page && app.page.refresh) app.page.refresh();
+    if (changed) readTape();
   });
   app.source.addEventListener("event", (message) => {
     const told = JSON.parse(message.data);
@@ -130,7 +156,9 @@ picker.addEventListener("change", () => {
 });
 window.addEventListener("hashchange", () => { if (app.arm) render(); });
 window.setInterval(() => {
-  if (!document.hidden && app.page && app.page.refresh) app.page.refresh();
+  if (document.hidden) return;
+  if (app.page && app.page.refresh) app.page.refresh();
+  if (app.arm) readTape();
 }, REFRESH_MS);
 
 (async () => {

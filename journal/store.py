@@ -196,6 +196,30 @@ CREATE TABLE lessons (
     lesson_json  TEXT NOT NULL,
     PRIMARY KEY (arm, ticker, session_date)
 )""",
+    # The desk's meetings through the day. A check-in (before the open, or
+    # during the session) lives only here, with its events under its id in
+    # the events table. A close meeting is a run like any other and stays in
+    # the runs table; its row here adds the day and the cut-off.
+    "meetings": """
+CREATE TABLE meetings (
+    meeting_id    TEXT PRIMARY KEY,       -- for a close meeting, the id of its run
+    arm           TEXT NOT NULL,
+    day           TEXT NOT NULL,          -- the trading day the meeting belongs to
+    kind          TEXT NOT NULL,          -- premarket, midday, afternoon, close
+    session_date  TEXT NOT NULL,          -- the last completed session when it was held
+    as_of         TEXT,                   -- cut-off: nothing first seen after it was shown
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    status        TEXT NOT NULL,          -- running, ok, degraded, failed
+    error         TEXT,
+    pid           INTEGER,
+    llm_calls     INTEGER,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    model_seconds REAL,
+    cost_usd      REAL,
+    record_json   TEXT
+)""",
 }
 
 COMPLETED = ("ok", "degraded")
@@ -391,6 +415,68 @@ class Journal:
     def signal_table(self, run_id: str) -> SignalTable | None:
         row = self._db.execute("SELECT signals_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return SignalTable.model_validate_json(row["signals_json"]) if row and row["signals_json"] else None
+
+    # ── The desk's meetings ──────────────────────────────────────────────
+
+    def start_meeting(
+        self, meeting_id: str, arm: str, day: date, kind: str, session: date, as_of: datetime,
+        started_at: datetime, pid: int | None = None,
+    ) -> None:
+        with self.transaction():
+            self._db.execute(
+                "INSERT INTO meetings (meeting_id, arm, day, kind, session_date, as_of, started_at, status, pid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)",
+                (meeting_id, arm, day.isoformat(), kind, session.isoformat(), as_of.isoformat(),
+                 started_at.isoformat(), os.getpid() if pid is None else pid),
+            )
+
+    def finish_meeting(
+        self, meeting_id: str, status: str, finished_at: datetime, usage: UsageSummary,
+        record_json: str | None = None, error: str | None = None,
+    ) -> None:
+        with self.transaction():
+            self._db.execute(
+                "UPDATE meetings SET status = ?, finished_at = ?, error = ?, llm_calls = ?, input_tokens = ?, "
+                "output_tokens = ?, model_seconds = ?, cost_usd = ?, record_json = ? WHERE meeting_id = ?",
+                (status, finished_at.isoformat(), error, usage.calls, usage.input_tokens, usage.output_tokens,
+                 usage.model_seconds, usage.cost_usd, record_json, meeting_id),
+            )
+
+    def note_close_meeting(self, run_id: str, as_of: datetime) -> None:
+        """Enter a finished close run among the desk's meetings, with the cut-off it was held at."""
+        with self.transaction():
+            self._db.execute(
+                "INSERT OR REPLACE INTO meetings (meeting_id, arm, day, kind, session_date, as_of, started_at, "
+                "finished_at, status, error, pid, llm_calls, input_tokens, output_tokens, model_seconds, cost_usd) "
+                "SELECT run_id, arm, session_date, 'close', session_date, ?, started_at, finished_at, status, error, "
+                "pid, llm_calls, input_tokens, output_tokens, model_seconds, cost_usd FROM runs WHERE run_id = ?",
+                (as_of.isoformat(), run_id),
+            )
+
+    def meeting(self, meeting_id: str) -> sqlite3.Row | None:
+        return self._db.execute("SELECT * FROM meetings WHERE meeting_id = ?", (meeting_id,)).fetchone()
+
+    def meetings(self, arm: str, day: date | None = None) -> list[sqlite3.Row]:
+        """An arm's meetings, newest first. Rows carry every column of the meetings table."""
+        sql, params = "SELECT * FROM meetings WHERE arm = ?", [arm]
+        if day is not None:
+            sql, params = sql + " AND day = ?", params + [day.isoformat()]
+        return self._db.execute(sql + " ORDER BY started_at DESC, rowid DESC", tuple(params)).fetchall()
+
+    def completed_meeting(self, arm: str, day: date, kind: str) -> str | None:
+        """The id of a meeting of this kind that the arm already held on this day, if any."""
+        row = self._db.execute(
+            f"SELECT meeting_id FROM meetings WHERE arm = ? AND day = ? AND kind = ? "
+            f"AND status IN ({','.join('?' * len(COMPLETED))}) ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (arm, day.isoformat(), kind, *COMPLETED),
+        ).fetchone()
+        return row["meeting_id"] if row else None
+
+    def running_meetings(self, arm: str) -> list[sqlite3.Row]:
+        """The arm's meetings that started and never finished."""
+        return self._db.execute(
+            "SELECT * FROM meetings WHERE arm = ? AND status = 'running' ORDER BY started_at DESC, rowid DESC", (arm,)
+        ).fetchall()
 
     # ── Events ───────────────────────────────────────────────────────────
 

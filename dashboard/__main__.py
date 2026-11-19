@@ -23,9 +23,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=config.DASHBOARD_PORT, help="Port to listen on (DASHBOARD_PORT)")
     parser.add_argument("--journal", default=None, help="The journal to show (JOURNAL_PATH)")
     parser.add_argument("--evaluation-dir", default=None, help="Where evaluation reports are (EVALUATION_DIR)")
+    parser.add_argument("--ledger", default=None,
+                        help="The desk's ledger (LEDGER_PATH; beside the journal when --journal is given)")
     args = parser.parse_args(argv)
 
-    app = create_app(journal_path=args.journal, evaluation_dir=args.evaluation_dir, host=args.host)
+    app = create_app(journal_path=args.journal, evaluation_dir=args.evaluation_dir, host=args.host,
+                     ledger_path=args.ledger)
     print(f"Dashboard at http://{args.host}:{args.port}  (read-only; stop it with Ctrl-C)", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0

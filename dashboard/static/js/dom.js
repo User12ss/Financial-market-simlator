@@ -30,6 +30,9 @@ export function clear(node) {
   return node;
 }
 
+/** Replace what a node holds. Children that are null or false are left out, and text stays text, as in `el`. */
+export const fill = (node, ...children) => build(clear(node), {}, children);
+
 // ── Reading from the server ──────────────────────────────────────────────────
 
 export async function getJSON(path, params = {}) {
@@ -126,7 +129,10 @@ const WORDS = {
   side: { buy: "买入", sell: "卖出" },
   kind: { market: "市价", limit: "限价", stop: "止损" },
   direction: { bullish: "看多", neutral: "中性", bearish: "看空" },
-  action: { buy: "买入", sell: "卖出", trim: "减仓", hold: "持有" },
+  action: { buy: "买入", sell: "卖出", trim: "减仓", hold: "持有", keep: "保留", withdraw: "撤回买单" },
+  // The desk's meetings through the day, and what an analyst's update at a check-in does to a view that stands.
+  meeting: { premarket: "盘前会", midday: "午间碰头", afternoon: "尾盘碰头", close: "收盘会" },
+  effect: { unchanged: "不变", strengthened: "加强", weakened: "削弱", broken: "不成立" },
   verdict: { approved: "批准", reduced: "削减", rejected: "拒绝" },
   check: { accepted: "接受", rejected: "拒绝" },
   run: {
@@ -141,6 +147,14 @@ const WORDS = {
   debater: { bull: "多方", bear: "空方" },
   trade: { open: "持仓中", closed: "已平仓" },
   position: { candidate: "候选", held: "已持有" },
+  // The figures an analyst may cite, by the snapshot's own names for them.
+  metric: {
+    close: "收盘价", change_1d_pct: "1 日涨跌%", return_5d_pct: "5 日涨跌%", return_1mo_pct: "1 月涨跌%",
+    return_3mo_pct: "3 月涨跌%", return_1y_pct: "1 年涨跌%", high_52w: "52 周高点", low_52w: "52 周低点",
+    sma20: "20 日均线", sma50: "50 日均线", sma200: "200 日均线", rsi14: "RSI 14", macd: "MACD",
+    macd_signal: "MACD 信号线", atr14_pct: "ATR%", trailing_pe: "市盈率", forward_pe: "预期市盈率",
+    profit_margin_pct: "利润率%", beta: "Beta", market_cap_billion: "市值（十亿美元）",
+  },
 };
 
 export function word(group, value) {
@@ -205,7 +219,7 @@ export function table(columns, rows, none = "没有记录。") {
 
 const tip = () => document.getElementById("tooltip");
 
-/** rows: [{ color, value, name }]. The value leads; the name follows. */
+/** rows: [{ color, value, name, plain }]. The value leads; the name follows. A plain row is a sentence, not a figure. */
 export function showTip(x, y, head, rows) {
   const box = tip();
   clear(box);
@@ -213,7 +227,7 @@ export function showTip(x, y, head, rows) {
   for (const row of rows) {
     box.append(el("div", { class: "line" },
       row.color ? el("span", { class: "stroke", style: `background:${row.color}` }) : null,
-      el("span", { class: "v", text: row.value }),
+      el("span", { class: row.plain ? "v plain" : "v", text: row.value }),
       el("span", { class: "n", text: row.name })));
   }
   box.hidden = false;
