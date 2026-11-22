@@ -192,6 +192,36 @@ test("every way a ticker's day can end is told apart", () => {
   ]);
 });
 
+test("a holding the checks sold by their own default goes on to the risk gate and is said to be a default", () => {
+  // The manager's answer says nothing about TMO; the analyst is bearish and the judge ruled against owning it.
+  const day = [
+    /* 0 */ line("views", "ticker_analyst", "view", "TMO", { direction: "bearish", confidence: 0.85, held: true }),
+    /* 1 */ line("debate", "bear", "argument", "TMO", { round: 1 }),
+    /* 2 */ line("debate", "judge", "ruling", "TMO", { stance: "do_not_own", confidence: 0.85 }),
+    /* 3 */ proposed(["KO", "buy", 0.85]),
+    /* 4 */ checked("accepted", "KO", "buy"),
+    /* 5 */ checked("accepted", "TMO", "sell", "default"),
+    /* 6 */ line("risk", "risk_officer", "risk_approved", "TMO", sized("approved", "sell", 14, 14)),
+    /* 7 */ line("orders", "trader", "order_placed", "TMO", { side: "sell", shares: 14 }),
+  ];
+  const sold = buildTrail(day).find((item) => item.ticker === "TMO");
+  assert.equal(sold.proposal, null);
+  assert.deepEqual(sold.check, { index: 5, status: "accepted", action: "sell", source: "default", kept: null });
+  assert.deepEqual(outcome(sold, 5), { kind: "defaulted", action: "sell" });
+  assert.equal(outcomeText(outcome(sold, 5)), "没有提案，按规则默认卖出");
+  assert.equal(outcomeText(outcome(sold, 5), true), "没有提案，按规则默认卖出，之后没有进一步动作");
+  assert.deepEqual(outcome(sold, 6), { kind: "sized", verdict: "approved", side: "sell", shares: 14 });
+  assert.deepEqual(outcome(sold), { kind: "ordered", side: "sell", shares: 14 });
+  assert.equal(stepText("check", sold.check), "默认卖出");
+  // No proposal carries the arrow for it, so the check does; a holding kept by default has none.
+  assert.deepEqual([lean("check", sold.check), lean("check", row("ABBV").check)], ["down", "flat"]);
+  // It is a decision that went on to the risk gate, not a holding that was kept.
+  const counts = funnel(buildTrail(day));
+  assert.deepEqual([counts.proposed, counts.accepted, counts.kept, counts.sized, counts.ordered], [1, 2, 0, 1, 1]);
+  // A holding kept by default is still exactly what it was.
+  assert.deepEqual(outcome(row("ABBV")), { kind: "kept", source: "default" });
+});
+
 test("a ticker is only said to have got no further once the record is over", () => {
   // [where it stands, while the record is still being played, at the end of a finished record]
   const cases = [
@@ -334,6 +364,12 @@ test("one day of a ticker in the grid is put in fixed words and the table's own 
   assert.equal(fateText(cell({ action: "hold", source: "default", check: "accepted" })), "没有提案，默认持有");
   assert.equal(fateText(cell({ action: "hold", source: "portfolio_manager", check: "accepted" })), "持有");
   assert.equal(fateText(cell({ action: "trim", source: "portfolio_manager", check: "accepted" })), "减仓，没有下单");
+  // A sale the checks filled in themselves, where the manager said nothing, is said to be one.
+  const byDefault = { held: true, action: "sell", source: "default", check: "accepted" };
+  assert.equal(fateText(cell({ ...byDefault, verdict: "approved", approved_shares: 14, ordered: { side: "sell", shares: 14 } })),
+    "没有提案，默认卖出 14 股，风控放行");
+  assert.equal(fateText(cell({ ...byDefault, verdict: "rejected" })), "没有提案，默认卖出，风控拒绝");
+  assert.equal(fateText(cell({ ...byDefault })), "没有提案，默认卖出，没有下单");
 });
 
 test("the record is cut into stretches by stage, and a debate by ticker", () => {

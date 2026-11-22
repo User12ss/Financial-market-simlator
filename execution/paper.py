@@ -92,9 +92,23 @@ class _Bar:
     close: float
 
 
+# The data gives a fund no sector. A fund that holds one sector's stocks is counted under that
+# sector, in the words the data uses for the stocks themselves, so that the limit on a sector cannot
+# be passed by buying its fund on top of its stocks. A fund of the whole market (SPY, QQQ, IWM)
+# belongs to no sector and is left without one.
+SECTOR_FUNDS: dict[str, str] = {
+    "XLB": "Basic Materials", "XLC": "Communication Services", "XLE": "Energy", "XLF": "Financial Services",
+    "XLI": "Industrials", "XLK": "Technology", "XLP": "Consumer Defensive", "XLRE": "Real Estate",
+    "XLU": "Utilities", "XLV": "Healthcare", "XLY": "Consumer Cyclical",
+}
+
+
 def sector_of(item: TickerSnapshot | None) -> str:
-    """The sector a ticker is counted under. Empty when the data does not say."""
-    return item.fundamentals.sector if item and item.fundamentals else ""
+    """The sector a ticker is counted under. Empty when the data does not say and it is not a sector fund."""
+    if item is None:
+        return ""
+    stated = item.fundamentals.sector if item.fundamentals else ""
+    return stated or SECTOR_FUNDS.get(item.ticker, "")
 
 
 class PaperBroker:
@@ -151,7 +165,10 @@ class PaperBroker:
             price = lot.last_close if lot.last_close is not None else lot.anchor_close
             result[lot.ticker] = Position(
                 ticker=lot.ticker, shares=lot.shares, avg_cost=round(lot.avg_cost, 4), entry_date=lot.entry_date,
-                stop_price=stops.get(lot.ticker), sector=lot.sector, last_close=lot.last_close,
+                # A sector fund booked before funds were given a sector has none on record: it is read as its
+                # sector all the same, or it would stay outside that sector's limit for as long as it is held.
+                stop_price=stops.get(lot.ticker), sector=lot.sector or SECTOR_FUNDS.get(lot.ticker, ""),
+                last_close=lot.last_close,
                 value=round(lot.shares * price, 2),
                 unrealized_pct=(
                     round((lot.last_close / lot.avg_cost - 1) * 100, 2) if lot.last_close is not None else None

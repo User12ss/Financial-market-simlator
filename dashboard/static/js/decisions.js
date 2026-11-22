@@ -140,8 +140,15 @@ export function firstLine(row) {
   return lines.length ? Math.min(...lines) : null;
 }
 
+/**
+ * Whether a check is the checks' own sale of a holding: the manager's answer said nothing of it, the analyst was
+ * bearish and the judge had ruled against owning it (pipeline/checks.py). Every other default keeps the holding.
+ */
+const soldByDefault = (check) => check.source === "default" && MOVES.has(check.action);
+
 /** Whether the holding was kept by the checks' default by line `index`. */
-const keptBy = (check, index) => check.source === "default" || (check.kept !== null && check.kept <= index);
+const keptBy = (check, index) =>
+  (check.source === "default" && !soldByDefault(check)) || (check.kept !== null && check.kept <= index);
 
 /**
  * Where a ticker stands by line `index`: the furthest step it has reached and
@@ -161,6 +168,7 @@ export function outcome(row, index = Infinity) {
     return { kind: "sized", verdict: row.risk.verdict, side: row.risk.side, shares: row.risk.approved };
   }
   if (seen(row.check)) {
+    if (soldByDefault(row.check)) return { kind: "defaulted", action: row.check.action };
     if (row.check.source === "default") return { kind: "kept", source: "default", ...checkin };
     if (row.check.status === "rejected") {
       return { kind: "check_rejected", action: row.check.action, kept: keptBy(row.check, index), ...checkin };
@@ -198,6 +206,7 @@ export function outcomeText(result, ended = false) {
     case "kept":
       if (result.checkin) return result.source === "default" ? "没有决定，按规则保持原样" : "保持原样，不动";
       return result.source === "default" ? "没有提案，按规则继续持有" : "继续持有，不动";
+    case "defaulted": return `没有提案，按规则默认${word("action", result.action)}${more}`;
     case "accepted": return `${word("action", result.action)}的提案通过检查${more}`;
     case "proposed": return `组合经理提出${word("action", result.action)}${more}`;
     case "ruled": return `裁判裁定${word("ownership", result.stance)}${more}`;
@@ -278,7 +287,10 @@ export function lean(name, step) {
     const move = name === "order" ? step.side : step.action;
     return move === "buy" ? "up" : MOVES.has(move) ? "down" : "flat";
   }
-  if (name === "check") return step.status === "rejected" ? "stop" : "flat";
+  if (name === "check") {
+    if (step.status === "rejected") return "stop";
+    return soldByDefault(step) ? "down" : "flat";             // no proposal carries the arrow for a sale by default
+  }
   if (name === "risk") return step.verdict === "rejected" ? "stop" : "flat";
   return "flat";
 }
@@ -369,12 +381,15 @@ export function lastSaid(events, index, speaker) {
  * "风控放行" is an order that passed the risk gate, as the table lists it.
  */
 export function fateText(cell) {
-  if (cell.ordered) return `${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
+  // A sale the checks filled in themselves, where the manager's answer said nothing of the holding, is said to be
+  // one. (A holding they kept by default has no order and no verdict, and gets its own words further down.)
+  const own = cell.source === "default" ? "没有提案，默认" : "";
+  if (cell.ordered) return `${own}${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
   if (!cell.action) return "";
-  if (cell.verdict === "rejected") return `${word("action", cell.action)}，风控拒绝`;
+  if (cell.verdict === "rejected") return `${own}${word("action", cell.action)}，风控拒绝`;
   if (cell.check === "rejected") return `${word("action", cell.action)}被规则退回${cell.kept_by_default ? "，默认持有" : ""}`;
   if (cell.action === "hold") return cell.source === "default" ? "没有提案，默认持有" : "持有";
-  return `${word("action", cell.action)}，没有下单`;
+  return `${own}${word("action", cell.action)}，没有下单`;
 }
 
 /**

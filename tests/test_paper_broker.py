@@ -5,10 +5,12 @@ from datetime import date
 import pytest
 
 from data.models import Bars, CorporateAction, Fundamentals, Issue, PriceSummary, Snapshot, TickerSnapshot
-from execution.paper import PaperBroker
+from data.snapshot import MARKET_SERIES
+from execution.paper import SECTOR_FUNDS, PaperBroker, sector_of
 from execution.placement import place, reconcile
 from journal.store import Journal
 from models.trading import OrderRequest
+from pipeline.universe import DEFAULT_UNIVERSE
 
 # Sessions of the week of 16 November 2026, and the Friday before.
 FRI, MON, TUE, WED, THU = date(2026, 11, 13), date(2026, 11, 16), date(2026, 11, 17), date(2026, 11, 18), date(2026, 11, 19)
@@ -90,6 +92,63 @@ def test_market_buy_fills_at_the_next_open_and_cash_pays_for_it(broker):
     assert position.sector == "Technology"
     account = broker.account()
     assert account.cash == 10_000 - 1_020 and account.equity == pytest.approx(10_020)
+
+
+# ── The sector a ticker is counted under ─────────────────────────────────────
+
+def test_a_sector_fund_is_counted_under_the_sector_of_the_stocks_it_holds():
+    # The data gives a fund no sector. Left empty, it would sit outside the limit on its own sector.
+    bars = [(FRI, 100, 100, 100, 100)]
+    assert sector_of(ticker("XLP", bars, sector="")) == "Consumer Defensive"
+    assert sector_of(ticker("XLV", bars, sector="")) == "Healthcare"
+    # A sector the data does give is the one that counts, for a stock and for a fund alike.
+    assert sector_of(ticker("PG", bars, sector="Consumer Defensive")) == "Consumer Defensive"
+    assert sector_of(ticker("XLP", bars, sector="Something Else")) == "Something Else"
+    # A fund of the whole market belongs to no sector, and neither does a stock the data says nothing about.
+    assert sector_of(ticker("SPY", bars, sector="")) == ""
+    assert sector_of(ticker("AAA", bars, sector="")) == ""
+    assert sector_of(None) == ""
+
+
+# The market series name the sectors as index providers do. The data names a stock's sector in its own
+# words, read from the source on 2026-11-22 (one stock of each sector): these are the words a fund must be
+# counted under, or it would never meet the stocks of its own sector at the limit.
+THE_DATAS_WORD_FOR = {
+    "Technology": "Technology", "Healthcare": "Healthcare", "Financials": "Financial Services", "Energy": "Energy",
+    "Consumer Discretionary": "Consumer Cyclical", "Consumer Staples": "Consumer Defensive",
+    "Industrials": "Industrials", "Materials": "Basic Materials", "Utilities": "Utilities",
+    "Real Estate": "Real Estate", "Communication Services": "Communication Services",
+}
+
+
+def test_each_sector_fund_is_counted_under_the_sector_the_market_series_pair_it_with():
+    paired = {symbol: THE_DATAS_WORD_FOR[name] for group, name, symbol in MARKET_SERIES if group == "sectors"}
+    assert len(paired) == 11 and SECTOR_FUNDS == paired
+
+
+def test_every_sector_fund_in_the_built_in_universe_has_a_sector_and_the_broad_funds_have_none():
+    funds = [symbol for symbol in DEFAULT_UNIVERSE if symbol.startswith("XL")]
+    assert len(funds) == 11 and set(funds) == set(SECTOR_FUNDS)
+    assert not {"SPY", "QQQ", "IWM"} & set(SECTOR_FUNDS)
+
+
+def test_a_sector_fund_that_fills_is_booked_under_its_sector(broker):
+    broker.sync(snap(FRI, flat("XLP", FRI, sector="")))
+    broker.submit(buy("XLP"), FRI)
+    broker.sync(snap(MON, flat("XLP", MON, sector="")))
+    assert broker.positions()["XLP"].sector == "Consumer Defensive"
+
+
+def test_a_sector_fund_booked_before_funds_had_a_sector_is_read_as_its_sector(broker, journal):
+    broker.sync(snap(FRI, flat("XLP", FRI, sector=""), flat("AAA", FRI, sector="")))
+    broker.submit(buy("XLP"), FRI)
+    broker.submit(buy("AAA"), FRI)
+    broker.sync(snap(MON, flat("XLP", MON, sector=""), flat("AAA", MON, sector="")))
+    with journal.transaction():                         # the books as an earlier version left them
+        journal.write("UPDATE paper_positions SET sector = '' WHERE account = 'acct'")
+    positions = PaperBroker(journal, "acct", initial_cash=10_000, slippage_bps=0, stale_days=10).positions()
+    assert positions["XLP"].sector == "Consumer Defensive"
+    assert positions["AAA"].sector == "", "a stock the data says nothing about still has none"
     assert broker.orders() == [] and broker.orders(open_only=False)[0].status == "filled"
 
 

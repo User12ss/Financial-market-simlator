@@ -298,11 +298,11 @@ The stages run in an order fixed in code. Models work inside a stage and never c
 |---|---|---|
 | Data | code | Screen the universe on price, liquidity and trend. Take one snapshot of the candidates and of everything the account holds or has an order on. |
 | Settle | code | Bring the paper account up to the session: dividends, splits, stops, fills at the open, equity at the close. |
-| Macro | 7 models, then code | Each macro agent assesses the current state of its domain. Code combines the stances into the desk's macro view: the stance with the most confidence behind it, and sector tilts only where more than one agent's worth of confidence agrees. Reused for a week. |
+| Macro | 7 models, then code | Each macro agent assesses the current state of its domain. Code combines the stances into the desk's macro view: the stance with the most confidence behind it, and sector tilts only where more than one agent's worth of confidence agrees. Formed anew every session (`PIPELINE_MACRO_MAX_AGE_DAYS`); a second run of the same session reuses it. |
 | Views | 1 model | The ticker analyst writes one view per candidate and per holding: direction, confidence, horizon, invalidation, cited data and, for a candidate it is bullish on, the price it would put the stop at. |
 | Debate | 3 models | Bull, bear and judge argue the strongest new candidates and any holding whose view has turned. |
 | Proposals | 1 model | The portfolio manager proposes buy, sell, hold or trim. |
-| Checks | code | Each proposal is accepted or rejected by rule. Every holding gets a decision; a missing one is "hold". |
+| Checks | code | Each proposal is accepted or rejected by rule. Every holding gets a decision; a missing one is "hold", or "sell" where the analyst and the judge have both said exit (below). |
 | Risk | code | Each accepted proposal is sized, then the risk gate approves it, reduces it or rejects it, with the reason. |
 | Orders | code | What passed is placed with the paper broker, to fill at the next session's open. |
 
@@ -311,6 +311,7 @@ The stages run in an order fixed in code. Models work inside a stage and never c
 - The ticker must be one of today's candidates or holdings. Only the first proposal for a ticker counts.
 - A buy needs a checked analyst view of that ticker that is bullish, no ruling against it from the judge, a current macro view, and room in the book.
 - Sell, trim and hold apply only to positions the account holds, and a position with an exit already waiting gets no second order.
+- A holding the manager gives no accepted decision for is held. One exception: where the manager answered and its answer does not name the holding at all, the analyst's view of it is bearish and the judge ruled against owning it, the holding is sold, and the record says "sold by default". Two voices argued for the exit and nobody for keeping it. A manager that named the holding, even in a proposal that was turned back, has spoken, and one whose call failed has decided nothing: both leave it held. The analyst's view of a ticker can turn from one day to the next, so this rule sells more often than a manager would who had been asked again.
 
 These rules are also what limits the damage of a persuaded model. Headlines are outside text, and a model can be talked into things; code still only lets it buy a screened candidate that the analyst and the judge did not reject, with a stop inside a fixed range, the same money at risk wherever in that range the stop is, and limits it has no say in, or exit what the account already holds.
 
@@ -323,7 +324,7 @@ These rules are also what limits the damage of a persuaded model. Headlines are 
 - Long only. No position, no sell; a sell is cut to what is held.
 - Whitelist, minimum price, minimum dollar volume, usable data.
 - No buy without a protective stop below the price.
-- Largest loss per trade if the stop is hit, largest single position, largest sector, minimum cash, most positions, most new positions in a day, most turnover in a day.
+- Largest loss per trade if the stop is hit, largest single position, largest sector, minimum cash, most positions, most new positions in a day, most turnover in a day. A sector fund (XLK, XLP and the other nine) is counted under the sector of the stocks it holds, though the data gives a fund no sector: its sector's limit cannot be passed by buying the fund on top of the stocks. A fund of the whole market (SPY, QQQ, IWM) has no sector; tickers without one share one limit among them.
 - Circuit breakers: after a day's loss or a drawdown beyond the limit, no new buying. Exits still go through.
 - Kill switch: while the file `data_store/HALT` exists, or `TRADING_HALT=1` is set, no order of any kind is placed. The analysis still runs and is recorded.
 
@@ -374,7 +375,7 @@ python -m pipeline.desk due         # print which meeting is due now, if any
 python -m pipeline.desk meet        # hold the meeting that is due
 ```
 
-The desk is a second group beside the daily pipeline, with a paper account of its own (its records are kept under a model configuration whose name starts with `desk/`). The daily pipeline goes on exactly as it was: it is the baseline the desk is measured against. A test holds it to that, by a fingerprint of every prompt, event and signal table taken before the desk was added. Both use the same journal, and when the baseline has already collected a session's data the desk reads that same snapshot.
+The desk is a second group beside the daily pipeline, with a paper account of its own (its records are kept under a model configuration whose name starts with `desk/`). The daily pipeline is the baseline the desk is measured against, and adding the desk changed nothing in it: a test holds it to a fingerprint of every prompt, event and signal table taken before the desk was added. Rules changed since then were changed for both groups alike, so that the two stay comparable (on 2026-11-22: the macro view is formed every session, a holding the manager leaves out can be sold by default, and a sector fund counts towards its sector's limit). The fingerprint is taken with the macro view lasting a week, as it did then. Both use the same journal, and when the baseline has already collected a session's data the desk reads that same snapshot.
 
 A short job runs `tick` every few minutes. A round does two things.
 
@@ -502,7 +503,7 @@ Set these in `.env` (see `.env.example`):
 | `PIPELINE_MAX_CANDIDATES` | `10` | Candidates kept by the screen each day |
 | `PIPELINE_MIN_PRICE` | `5` | Screen: minimum share price |
 | `PIPELINE_MIN_DOLLAR_VOLUME` | `20000000` | Screen: minimum 20-day average dollar volume |
-| `PIPELINE_MACRO_MAX_AGE_DAYS` | `7` | The macro view is reused until it is this old |
+| `PIPELINE_MACRO_MAX_AGE_DAYS` | `1` | The macro view is reused until it is this many days old. `1`: formed anew every session (seven more model calls a day for each model configuration). It was `7` until 2026-11-22 |
 | `PIPELINE_DEBATE_TOP` | `3` | New candidates debated each day |
 | `PIPELINE_DEBATE_ROUNDS` | `1` | Rounds per debate |
 | `PIPELINE_MAX_COST_USD` | `2.0` | A run stops once its model calls have cost this much |

@@ -27,10 +27,12 @@ from evaluation.run import evaluate, save
 from execution.paper import PaperBroker
 from journal.store import Journal
 from models.evaluation import Evaluation
-from models.signals import Event, ProposalSetDraft, TickerViewDraft, UsageSummary
+from models.signals import DebateRulingDraft, Event, ProposalSetDraft, TickerViewDraft, UsageSummary
 from pipeline.daily import Arm
 from risk.gate import RiskLimits, halted
-from tests.pipeline_fakes import ScriptedLLM, SyntheticMarket, by_ticker, day, make_pipeline, proposals, session, view
+from tests.pipeline_fakes import (
+    ScriptedLLM, SyntheticMarket, by_ticker, day, make_pipeline, proposals, ruling, session, view,
+)
 from tests.test_evaluation import nov
 from tests.test_evaluation_run import a_lesson
 from tests.test_risk_gate import account as gate_account, buy, one
@@ -307,9 +309,11 @@ def test_each_figures_line_for_the_day_is_counted_from_the_record(client):
     assert first["portfolio_manager"] == "1 条提案：买入 1，卖出 0，减仓 0，持有 0"
     assert first["trader"] == "成交 0 笔，下单 1 张"
     assert set(first) == {persona.id for persona in personas.ROSTER}             # on the first day everyone has a line
-    # The next session reuses the macro view, so the analysts say nothing and the narrator says where it came from.
+    # The next session forms its own macro view, so the macro analysts speak again and nothing is carried over.
+    # (What the narrator says of a view that was reused is in the test below this one.)
     later = get(client, "/api/meeting", arm=ARM, session=session(16).isoformat())[1]["today"]
-    assert "central_bank" not in later and later["pipeline"] == f"沿用 {session(13).isoformat()} 的宏观结论"
+    assert later["central_bank"] == first["central_bank"] and later["sentiment"] == first["sentiment"]
+    assert "pipeline" not in later, "the narrator only speaks of a macro view that was carried over"
     assert later["trader"] == "成交 1 笔，下单 0 张"
 
 
@@ -1010,6 +1014,35 @@ def test_the_trail_and_the_grid_tell_the_same_story_of_the_same_run(tmp_path):
         {"kind": "kept", "source": "portfolio_manager"},
         {"kind": "check_rejected", "action": "buy", "kept": True},
     ]
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed, so the page's own logic cannot be run here")
+def test_a_holding_sold_by_the_checks_own_default_is_told_the_same_way_by_the_trail_and_the_grid(tmp_path):
+    """The manager's answer leaves a holding out, the analyst is bearish on it and the judge has ruled against
+    owning it: the checks sell it (pipeline/checks.py). Read from a run the real pipeline made."""
+    pipeline = a_week(tmp_path, days=(13,))                          # UPA is bought
+    llm = pipeline.arms[0].llm
+    llm.replies[TickerViewDraft] = by_ticker({"UPA": view(direction="bearish", confidence=0.7, horizon=3)}, view(horizon=3))
+    llm.replies[DebateRulingDraft] = lambda system, user: ruling("do_not_own" if "UPA [held]:" in user else "own")
+    one_more(pipeline, 16, ("UPB", "buy", 0.6))                      # and not a word about UPA
+    client = browser(tmp_path / "journal.sqlite3", tmp_path / "evaluation")
+    _, sold_on = get(client, "/api/history", arm=ARM)[1]["sessions"]
+    cell = sold_on["tickers"]["UPA"]
+    assert (cell["held"], cell["action"], cell["source"], cell["check"], cell["kept_by_default"]) == (
+        True, "sell", "default", "accepted", False)
+    assert cell["verdict"] == "approved" and cell["ordered"] == {"side": "sell", "shares": cell["approved_shares"]}
+
+    events = get(client, "/api/meeting", arm=ARM, run_id=sold_on["run_id"])[1]["events"]
+    result = subprocess.run([NODE, "tests/js/trail_of.mjs"], input=json.dumps(events), cwd=ROOT,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    [row] = [row for row in json.loads(result.stdout) if row["ticker"] == "UPA"]
+    assert row["proposal"] is None
+    assert (row["check"]["source"], row["check"]["action"], row["check"]["kept"]) == ("default", "sell", None)
+    assert (row["risk"]["verdict"], row["risk"]["approved"]) == (cell["verdict"], cell["approved_shares"])
+    assert row["ended"] == {"kind": "ordered", "side": "sell", "shares": cell["approved_shares"]}
+    said = next(event for event in events if event["ticker"] == "UPA" and event["stage"] == "checks")
+    assert said["remark"].startswith("UPA is sold by default: the portfolio manager gave no decision for it")
 
 
 # ── The market data a run worked from ────────────────────────────────────────

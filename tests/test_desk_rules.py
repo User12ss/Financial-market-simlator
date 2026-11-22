@@ -488,8 +488,11 @@ class Headlines:
         ][:limit]
 
 
-def baseline_fingerprint(tmp_path) -> str:
+def baseline_fingerprint(tmp_path, monkeypatch) -> str:
     """Two sessions of the daily pipeline: every prompt, every event and both signal tables, hashed."""
+    # The macro view was reused for a week when the fingerprint was taken. Since 2026-11-22 it is formed
+    # anew every session, by decision. With the window as it was then, everything else must still be as it was.
+    monkeypatch.setattr(desk_module.config, "PIPELINE_MACRO_MAX_AGE_DAYS", 7)
     digest = hashlib.sha256()
     clock, llm = Clock(day(13)), ScriptedLLM()
     journal = Journal(tmp_path / "journal.sqlite3")
@@ -514,9 +517,9 @@ def baseline_fingerprint(tmp_path) -> str:
     return digest.hexdigest()
 
 
-def test_the_daily_pipeline_says_and_does_exactly_what_it_did_before_the_desk_existed(tmp_path):
+def test_the_daily_pipeline_says_and_does_exactly_what_it_did_before_the_desk_existed(tmp_path, monkeypatch):
     # The fingerprint was taken from the code as it stood before the desk was added.
-    assert baseline_fingerprint(tmp_path) == BASELINE
+    assert baseline_fingerprint(tmp_path, monkeypatch) == BASELINE
 
 
 def test_the_daily_pipeline_is_the_same_with_a_desk_working_beside_it(tmp_path, monkeypatch):
@@ -524,7 +527,7 @@ def test_the_daily_pipeline_is_the_same_with_a_desk_working_beside_it(tmp_path, 
     assert hold(desk, ny(13, 18, 30)).status == "ok"
     round_at(desk, ny(16, 10, 0))
     monkeypatch.setattr(desk_module.config, "LEDGER_PATH", str(tmp_path / "desk" / "ledger.sqlite3"))
-    assert baseline_fingerprint(tmp_path / "baseline") == BASELINE
+    assert baseline_fingerprint(tmp_path / "baseline", monkeypatch) == BASELINE
 
 
 def test_the_desks_own_name_keeps_its_records_apart():

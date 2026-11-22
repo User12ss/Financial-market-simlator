@@ -197,8 +197,16 @@ def check_proposals(
 
     Accepted buys are then taken in order of confidence until the book is
     full. Positions being sold today still count as held, so the book can
-    never end up over its limit. A holding left without an accepted decision
-    is held.
+    never end up over its limit.
+
+    A holding left without an accepted decision is held, with one exception.
+    Where the manager answered and its answer says nothing of the holding at
+    all, the analyst's view of it is bearish and the judge ruled against
+    owning it, the holding is sold: two voices have argued for an exit and
+    nobody for keeping it, so keeping it would be the one outcome no one
+    argued for. A manager that named the holding, even in a proposal that
+    was turned back, has spoken, and one whose call failed has decided
+    nothing: in both cases it is held.
     """
     allowed = set(candidates) | set(holdings)
     results: list[TradeProposal] = []
@@ -260,7 +268,19 @@ def check_proposals(
             proposal.status = "rejected"
             proposal.note = f"The book is limited to {max_positions} positions."
 
+    def both_say_exit(ticker: str) -> bool:
+        view, ruling = views.get(ticker), rulings.get(ticker)
+        return (view is not None and view.direction == "bearish"
+                and ruling is not None and ruling.stance == "do_not_own")
+
     for ticker in sorted(set(holdings) - decided):
+        if draft is not None and ticker not in mentioned and ticker not in waiting and both_say_exit(ticker):
+            results.append(TradeProposal(
+                ticker=ticker, action="sell", confidence=0.0, source="default", status="accepted",
+                reason="No decision from the portfolio manager.",
+                note="Sold by default: the analyst's view is bearish and the judge ruled against owning it.",
+            ))
+            continue
         results.append(TradeProposal(
             ticker=ticker, action="hold", confidence=0.0, source="default", status="accepted",
             reason="No valid decision from the portfolio manager.",

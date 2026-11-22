@@ -93,8 +93,10 @@ PIPELINE_MAX_CANDIDATES: int = int(os.getenv("PIPELINE_MAX_CANDIDATES", "10"))
 PIPELINE_MIN_PRICE: float = float(os.getenv("PIPELINE_MIN_PRICE", "5"))
 PIPELINE_MIN_DOLLAR_VOLUME: float = float(os.getenv("PIPELINE_MIN_DOLLAR_VOLUME", "20000000"))
 
-# The macro team's view is reused until it is this many days old.
-PIPELINE_MACRO_MAX_AGE_DAYS: int = int(os.getenv("PIPELINE_MACRO_MAX_AGE_DAYS", "7"))
+# The macro team's view is reused until it is this many days old. 1: it is formed anew every
+# session, and only a second run of the same session reuses it. It was 7 until 2026-11-22: on
+# 20 November the view in use was three sessions old, "neutral", after the S&P 500 had fallen 5.9%.
+PIPELINE_MACRO_MAX_AGE_DAYS: int = int(os.getenv("PIPELINE_MACRO_MAX_AGE_DAYS", "1"))
 # How many of the strongest new candidates get a bull/bear debate, and how many rounds each.
 PIPELINE_DEBATE_TOP: int = int(os.getenv("PIPELINE_DEBATE_TOP", "3"))
 PIPELINE_DEBATE_ROUNDS: int = int(os.getenv("PIPELINE_DEBATE_ROUNDS", "1"))

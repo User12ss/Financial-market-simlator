@@ -722,7 +722,8 @@ def test_forcing_a_rerun_replaces_that_sessions_orders_and_fills_nothing_twice(t
 
 # ── The macro view over time ─────────────────────────────────────────────────
 
-def test_macro_view_is_reused_for_a_week_then_formed_again(tmp_path):
+def test_macro_view_is_reused_for_a_week_then_formed_again_when_it_is_set_to_last_a_week(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PIPELINE_MACRO_MAX_AGE_DAYS", 7)
     clock, llm = Clock(day(13)), ScriptedLLM()
     pipeline = make_pipeline(tmp_path, llm, clock=clock)
 
@@ -1186,7 +1187,77 @@ def test_every_utterance_is_recorded_in_order_with_speaker_and_listener(tmp_path
     opening = pipeline.journal.events(second.run_id)[:2]
     assert (opening[0].stage, opening[0].speaker, opening[0].kind, opening[0].ticker) == ("settle", "trader", "fill", "UPA")
     assert opening[0].remark.startswith("Buy ") and "UPA at the open on 2026-11-16" in opening[0].remark
-    assert (opening[1].speaker, opening[1].kind) == ("pipeline", "macro_view_reused")
+    assert (opening[1].stage, opening[1].kind) == ("macro", "assessment"), "the macro team is asked again each session"
+
+
+def test_the_macro_view_is_formed_anew_every_session_unless_it_is_told_to_last_longer(tmp_path, monkeypatch):
+    llm, clock = ScriptedLLM(), Clock(day(13))
+    pipeline = make_pipeline(tmp_path, llm, clock=clock)
+    run_once(pipeline)
+    asked = llm.count(DomainAssessmentDraft)
+
+    clock.now = day(16)
+    monday = run_once(pipeline)
+    kinds = [event.kind for event in pipeline.journal.events(monday.run_id)]
+    assert "macro_view" in kinds and "macro_view_reused" not in kinds
+    assert monday.table.regime_reused_from is None and monday.table.regime.session_date == session(16)
+    assert llm.count(DomainAssessmentDraft) == 2 * asked, "every macro analyst was asked again on Monday"
+
+    # The setting still does what it says: with a week, Monday's view is still the one in use on Tuesday.
+    monkeypatch.setattr(config, "PIPELINE_MACRO_MAX_AGE_DAYS", 7)
+    clock.now = day(17)
+    tuesday = run_once(pipeline)
+    kinds = [event.kind for event in pipeline.journal.events(tuesday.run_id)]
+    assert "macro_view_reused" in kinds and "macro_view" not in kinds
+    assert tuesday.table.regime_reused_from == session(16)
+    assert llm.count(DomainAssessmentDraft) == 2 * asked
+
+
+def test_the_setting_as_shipped_asks_for_a_new_macro_view_every_session():
+    # Read from the file, not from this process: a .env beside it may say otherwise for one machine.
+    source = open(config.__file__, encoding="utf-8").read()
+    assert 'os.getenv("PIPELINE_MACRO_MAX_AGE_DAYS", "1")' in source
+
+
+def left_out_holding(tmp_path, stance):
+    """Two sessions. UPA is bought, then the analyst turns bearish on it, the judge rules, and the manager's
+    answer on the second day says nothing about UPA at all."""
+    llm, clock = ScriptedLLM(), Clock(day(13))
+    pipeline = make_pipeline(tmp_path, llm, clock=clock)
+    llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7), ("UPB", "buy", 0.6))
+    run_once(pipeline)
+    clock.now = day(16)
+    llm.replies[TickerViewDraft] = by_ticker({"UPA": view(direction="bearish", confidence=0.7)}, view())
+    llm.replies[DebateRulingDraft] = lambda system, user: ruling(stance if "UPA [held]:" in user else "own")
+    llm.replies[ProposalSetDraft] = proposals(("UPB", "hold", 0.5))
+    return pipeline, run_once(pipeline)
+
+
+def test_a_holding_the_manager_leaves_out_is_sold_when_the_analyst_and_the_judge_both_say_exit(tmp_path):
+    pipeline, result = left_out_holding(tmp_path, "do_not_own")
+    held = result.table.holdings
+    shares = next(p.shares for p in held if p.ticker == "UPA")
+    about_upa = [e for e in pipeline.journal.events(result.run_id) if e.ticker == "UPA" and e.stage in ("checks", "risk", "orders")]
+    assert [(e.stage, e.kind) for e in about_upa] == [
+        ("checks", "accepted"), ("risk", "risk_approved"), ("orders", "order_placed")]
+    assert about_upa[0].remark == (
+        "UPA is sold by default: the portfolio manager gave no decision for it, the analyst's view is bearish and "
+        "the judge ruled against owning it."
+    )
+    assert (about_upa[0].payload["action"], about_upa[0].payload["source"]) == ("sell", "default")
+    assert about_upa[2].remark == f"Placed: sell {shares} UPA at the next open."
+    assert waiting_orders(pipeline) == {"UPA": "sell"}
+    [filled_in] = [p for p in result.table.proposals if p.ticker == "UPA"]
+    assert (filled_in.action, filled_in.source, filled_in.status) == ("sell", "default", "accepted")
+    # It is an exit, but nobody proposed it: the test of "an exit proposed" still waits for the manager's own.
+    assert progress(pipeline.journal, "fake/a")[:2] == (2, False)
+
+
+def test_a_holding_the_manager_leaves_out_is_kept_when_the_judge_sides_with_owning_it(tmp_path):
+    pipeline, result = left_out_holding(tmp_path, "own")
+    [check] = [e for e in pipeline.journal.events(result.run_id) if e.ticker == "UPA" and e.stage == "checks"]
+    assert check.remark == "UPA is held by default: the portfolio manager gave no valid decision for it."
+    assert waiting_orders(pipeline) == {}
 
 
 def test_events_are_passed_to_a_listener_as_they_happen(tmp_path):

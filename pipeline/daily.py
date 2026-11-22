@@ -665,7 +665,10 @@ class DailyPipeline:
         )
         for proposal in proposals:
             accepted = proposal.status == "accepted"
-            if proposal.source == "default":
+            if proposal.source == "default" and proposal.action == "sell":
+                remark = (f"{proposal.ticker} is sold by default: the portfolio manager gave no decision for it, "
+                          "the analyst's view is bearish and the judge ruled against owning it.")
+            elif proposal.source == "default":
                 remark = f"{proposal.ticker} is held by default: the portfolio manager gave no valid decision for it."
             elif accepted:
                 remark = f"{proposal.action.capitalize()} {proposal.ticker} is accepted."
@@ -787,8 +790,10 @@ def progress(journal: Journal, arm: str) -> tuple[int, bool, list[tuple[date, st
     """How an arm stands against "five sessions in a row without error, with an exit proposed".
 
     Returns the number of consecutive trading sessions, ending with the latest
-    one run, that finished with status ok; whether a sell or trim was accepted
-    during them; and the status of each session run, newest first.
+    one run, that finished with status ok; whether a sell or trim the portfolio
+    manager proposed was accepted during them (a sale the checks filled in by
+    default is an exit, but nobody proposed it); and the status of each
+    session run, newest first.
     """
     by_session: dict[date, list] = {}
     for row in journal.runs(arm):
@@ -807,7 +812,8 @@ def progress(journal: Journal, arm: str) -> tuple[int, bool, list[tuple[date, st
         expected = previous_trading_day(session)
         table = journal.signal_table(run_id)
         exits = exits or any(
-            p.status == "accepted" and p.action in ("sell", "trim") for p in (table.proposals if table else [])
+            p.status == "accepted" and p.action in ("sell", "trim") and p.source == "portfolio_manager"
+            for p in (table.proposals if table else [])
         )
     return streak, exits, [(session, status) for session, status, _ in history]
 

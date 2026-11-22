@@ -470,6 +470,67 @@ def test_no_answer_from_the_portfolio_manager_holds_everything():
     assert [(p.ticker, p.action, p.source) for p in results] == [("DOWN", "hold", "default")]
 
 
+# A holding the manager's answer leaves out is held, with one exception: the analyst is bearish on
+# it and the judge has ruled against owning it. Then two voices have said "exit" and nobody has
+# said "keep", and keeping it by default would be the one outcome no one argued for.
+
+SOLD_BY_DEFAULT = "Sold by default: the analyst's view is bearish and the judge ruled against owning it."
+
+
+def left_out(direction="bearish", stance="do_not_own", draft=proposals(("UPA", "buy", 0.6)), waiting=None,
+             view_of_it=True):
+    """What the checks fill in for DOWN, a holding, given the analyst's view of it and the judge's ruling."""
+    views = {"UPA": checked_view("UPA")}
+    if view_of_it:
+        views["DOWN"] = checked_view("DOWN", direction)
+    results = check_proposals(
+        draft, candidates=["UPA"], views=views,
+        rulings={"DOWN": judged("DOWN", stance)} if stance else {}, holdings={"DOWN": holding("DOWN")},
+        waiting=waiting or {}, regime_available=True, max_positions=10,
+    )
+    return [(p.action, p.source, p.status, p.note) for p in results if p.ticker == "DOWN"]
+
+
+def test_a_holding_the_manager_left_out_is_sold_when_the_analyst_and_the_judge_both_say_exit():
+    assert left_out() == [("sell", "default", "accepted", SOLD_BY_DEFAULT)]
+    [filled_in] = check_proposals(
+        proposals(), candidates=[], views={"DOWN": checked_view("DOWN", "bearish")},
+        rulings={"DOWN": judged("DOWN", "do_not_own")}, holdings={"DOWN": holding("DOWN")}, waiting={},
+        regime_available=True, max_positions=10,
+    )
+    assert filled_in.reason == "No decision from the portfolio manager." and filled_in.confidence == 0.0
+
+
+@pytest.mark.parametrize("direction, stance, view_of_it", [
+    ("bearish", "own", True),           # the judge sided with keeping it
+    ("bearish", None, True),            # no ruling: the debate did not finish
+    ("neutral", "do_not_own", True),    # the analyst took no side
+    ("bullish", "do_not_own", True),
+    ("bearish", "do_not_own", False),   # the analyst's view was refused by the checks: there is none
+])
+def test_one_voice_alone_does_not_sell_a_holding_the_manager_left_out(direction, stance, view_of_it):
+    assert left_out(direction, stance, view_of_it=view_of_it) == [("hold", "default", "accepted", "Held by default.")]
+
+
+def test_a_holding_the_manager_spoke_of_is_not_sold_over_its_head():
+    # It asked to buy more, which is turned back; but it did speak, and for owning it.
+    assert left_out(draft=proposals(("DOWN", "buy", 0.9))) == [
+        ("buy", "portfolio_manager", "rejected", "Already held. A position is sized once, when it is opened."),
+        ("hold", "default", "accepted", "Held by default."),
+    ]
+    assert left_out(draft=proposals(("DOWN", "hold", 0.5))) == [("hold", "portfolio_manager", "accepted", "")]
+
+
+def test_a_manager_that_gave_no_answer_at_all_sells_nothing():
+    # Its call failed. A meeting without its decision-maker changes nothing, whatever the others said.
+    assert left_out(draft=None) == [("hold", "default", "accepted", "Held by default.")]
+
+
+def test_a_holding_with_an_exit_already_waiting_is_not_sold_a_second_time_by_default():
+    assert left_out(waiting={"DOWN": "sell"}) == [
+        ("hold", "default", "accepted", "A sell from an earlier session is still waiting to fill.")]
+
+
 def test_buys_fill_the_book_in_order_of_confidence():
     results = decide(proposals(("UPA", "buy", 0.5), ("UPB", "buy", 0.9), ("UPC", "buy", 0.7)), held=["DOWN"], limit=3)
 
