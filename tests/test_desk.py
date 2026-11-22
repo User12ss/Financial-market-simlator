@@ -533,6 +533,198 @@ def test_a_checkin_during_the_session_notes_its_decision_and_trades_nothing(tmp_
     assert CheckinRecord.model_validate_json(row["record_json"]) == record
 
 
+def bought_this_morning(tmp_path, **kwargs):
+    """Monday, during the session: the buys of UPA and UPB placed after Friday's close filled at this open.
+
+    The account books them at Monday's close meeting, so the journal still has
+    both as waiting. News on UPA has come in and the watch has fetched it.
+    """
+    desk = make_desk(tmp_path, **kwargs)
+    assert hold(desk, ny(13, 18, 30)).status == "ok"
+    desk.news.add("UPA", "UPA loses its largest customer", ny(16, 11, 0))
+    round_at(desk, ny(16, 11, 30))
+    desk.llm.replies[ViewUpdateDraft] = update("broken", "The largest customer has gone.", cited=[1])
+    desk.llm.calls.clear()
+    return desk
+
+
+def test_a_buy_that_filled_at_this_mornings_open_can_be_cut_at_a_checkin_the_same_day(tmp_path):
+    desk = bought_this_morning(tmp_path)
+    broker = PaperBroker(desk.journal, ARM)
+    shares = {order.ticker: order.shares for order in broker.orders()}
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "sell"))
+    before = broker.orders()
+    result = hold(desk, ny(16, 12, 0))
+    record = result.record
+    assert (result.status, result.kind, record.can_act) == ("ok", "midday", False)
+    # The books are left as they were: nothing is booked, placed or taken back by a check-in during the session.
+    assert broker.positions() == {} and broker.orders() == before
+    assert [(b.ticker, b.held, b.waiting, b.at_open) for b in record.book] == [
+        ("UPA", False, None, "buy"), ("UPB", False, None, "buy")]
+    assert [(d.ticker, d.action, d.status, d.note) for d in record.decisions] == [("UPA", "sell", "accepted", "")]
+    assert [(d.ticker, d.action) for d in record.noted] == [("UPA", "sell")]
+    assert events(desk, result.meeting_id)[-2:] == [("checks", "accepted", "UPA"), ("orders", "noted", "UPA")]
+
+    # Neither model is told the buy is still waiting.
+    [asked] = desk.llm.messages(ViewUpdateDraft)
+    assert (f"THE DESK'S POSITION\nUPA: a buy of {shares['UPA']} shares was due to fill at today's open. The account "
+            "books a fill at the close meeting, so until then the desk takes it as held and the price paid is not "
+            "on record.\n") in asked
+    assert "waiting to fill" not in asked
+    [briefing] = desk.llm.messages(CheckinDraft)
+    assert "THE BOOK:\n- no positions\n\nDUE TO FILL AT TODAY'S OPEN (" in briefing
+    assert f"- UPA: buy {shares['UPA']} shares\n- UPB: buy {shares['UPB']} shares\n" in briefing
+    assert "ORDERS WAITING TO FILL" not in briefing
+    assert "  Allowed actions for UPA: keep, trim, sell." in briefing
+    [told] = [system for name, system, _ in desk.llm.calls if name == "CheckinDraft"]
+    assert ("Where the briefing lists a buy under DUE TO FILL AT TODAY'S OPEN, it is taken as held: it can be "
+            "trimmed or sold and can no longer be withdrawn.") in told
+    assert "Under each update are the actions allowed for that ticker. Choose one of them: any other is refused." in told
+
+    # The close meeting books the fills and is told what the check-in noted.
+    desk.llm.replies[ProposalSetDraft] = proposals(("UPA", "sell", 0.7), ("UPB", "hold", 0.6))
+    close = hold(desk, ny(16, 18, 30))
+    assert close.status == "ok"
+    assert sorted((fill.ticker, fill.side, fill.fill_date) for fill in close.table.fills) == [
+        ("UPA", "buy", MONDAY), ("UPB", "buy", MONDAY)]
+    assert "midday check-in: sell UPA. Rests on the update on UPA." in desk.llm.messages(ProposalSetDraft)[-1]
+    assert [(o.ticker, o.side) for o in broker.orders() if o.kind == "market"] == [("UPA", "sell")]
+
+
+def test_a_buy_the_broker_turned_down_at_the_open_is_found_out_at_the_close_meeting(tmp_path):
+    """A check-in can only say a buy was due at the open. Whether it filled is settled when the day is booked."""
+    # UPA splits on Monday, after the buy was sized: the broker cancels the buy instead of filling it.
+    desk = bought_this_morning(tmp_path, market=SyntheticMarket(splits={("UPA", MONDAY): 2.0}))
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "sell"))
+    midday = hold(desk, ny(16, 12, 0)).record
+    assert [(d.ticker, d.action) for d in midday.noted] == [("UPA", "sell")], "taken as held, as far as was known"
+
+    desk.llm.replies[ProposalSetDraft] = proposals(("UPA", "sell", 0.7), ("UPB", "hold", 0.6))
+    close = hold(desk, ny(16, 18, 30))
+    broker = PaperBroker(desk.journal, ARM)
+    assert sorted(broker.positions()) == ["UPB"], "the books show UPA was never bought"
+    assert "midday check-in: sell UPA." in desk.llm.messages(ProposalSetDraft)[-1]
+    [refused] = [p for p in close.table.proposals if p.ticker == "UPA"]
+    assert (refused.action, refused.status) == ("sell", "rejected")
+    assert [o.ticker for o in broker.orders() if o.kind == "market"] == [], "and nothing is sold on the note"
+
+
+def test_a_buy_that_has_had_its_open_is_not_taken_back_during_the_session(tmp_path):
+    desk = bought_this_morning(tmp_path)
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "withdraw"))
+    before = PaperBroker(desk.journal, ARM).orders()
+    record = hold(desk, ny(16, 12, 0)).record
+    assert [(d.ticker, d.action, d.status, d.note) for d in record.decisions] == [
+        ("UPA", "withdraw", "rejected", "The buy was due to fill at today's open and can no longer be taken back."),
+        ("UPA", "keep", "accepted", "Kept by default."),
+    ]
+    assert record.noted == [] and record.withdrawn == []
+    assert PaperBroker(desk.journal, ARM).orders() == before
+
+
+def test_before_the_open_the_same_buy_is_still_waiting_and_can_only_be_taken_back(tmp_path):
+    desk = make_desk(tmp_path)
+    assert hold(desk, ny(13, 18, 30)).status == "ok"
+    desk.news.add("UPA", "UPA is under investigation", ny(15, 12, 0))
+    round_at(desk, ny(16, 8, 15))
+    desk.llm.replies[ViewUpdateDraft] = update("weakened", "An investigation has been opened.", cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "trim"))
+    record = hold(desk, ny(16, 8, 30)).record
+    assert [(b.ticker, b.held, b.waiting, b.at_open) for b in record.book] == [
+        ("UPA", False, "buy", None), ("UPB", False, "buy", None)]
+    assert [(d.action, d.status, d.note) for d in record.decisions][0] == (
+        "trim", "rejected", "Cannot trim a ticker that is not held.")
+    # The manager was told which actions the ticker allowed, and what a buy that has not filled is.
+    briefing = desk.llm.messages(CheckinDraft)[-1]
+    assert "DUE TO FILL" not in briefing and "ORDERS WAITING TO FILL AT THE NEXT OPEN:\n- UPA: buy " in briefing
+    assert "  Allowed actions for UPA: keep, withdraw." in briefing
+    [told] = [system for name, system, _ in desk.llm.calls if name == "CheckinDraft"]
+    assert "A buy that has not filled is not a position: it cannot be trimmed or sold, only withdrawn." in told
+    assert "DUE TO FILL AT TODAY'S OPEN" not in told
+
+
+def test_a_position_sold_at_this_mornings_open_is_not_reviewed_later_that_day(tmp_path):
+    desk = held_book(tmp_path)
+    desk.news.add("UPA", "UPA loses its largest customer", ny(17, 7, 0))
+    round_at(desk, ny(17, 8, 15))
+    desk.llm.replies[ViewUpdateDraft] = update("broken", "The largest customer has gone.", cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "sell"))
+    [sale] = hold(desk, ny(17, 8, 30)).record.orders                # placed before the open, for Tuesday's open
+    desk.news.add("UPA", "UPA is sued by its lenders", ny(17, 11, 0))
+    desk.news.add("UPB", "UPB opens a new plant", ny(17, 11, 5))
+    round_at(desk, ny(17, 11, 30))
+    desk.llm.replies[ViewUpdateDraft] = update(cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPB", "keep"))
+    desk.llm.calls.clear()
+    result = hold(desk, ny(17, 12, 0))
+    assert result.status == "ok"
+    assert [b.ticker for b in result.record.book] == ["UPB"]
+    [asked] = desk.llm.messages(ViewUpdateDraft)
+    assert asked.endswith("Does anything here change the standing view of UPB?")
+    opening = desk.journal.events(result.meeting_id)[0]
+    assert opening.remark == (
+        "Since the last meeting (2026-11-17 08:30 New York time): 1 new headline on 1 of the 1 name in the book; "
+        "0 of the 1 with a price today trading beyond the usual daily range. "
+        "The watch last looked at 2026-11-17 11:30 New York time. "
+        "Not reviewed: UPA, due to be sold at today's open."
+    )
+    assert opening.payload["book"] == ["UPB"] and opening.payload["sold_at_open"] == ["UPA"]
+    [briefing] = desk.llm.messages(CheckinDraft)
+    assert f"- UPA: sell all {sale.shares} of its shares\n" in briefing
+    assert "Allowed actions for UPA" not in briefing
+
+
+def test_a_position_cut_at_this_mornings_open_is_reviewed_for_the_shares_that_are_left(tmp_path):
+    desk = held_book(tmp_path)
+    held = PaperBroker(desk.journal, ARM).positions()["UPA"].shares
+    desk.news.add("UPA", "UPA loses its largest customer", ny(17, 7, 0))
+    round_at(desk, ny(17, 8, 15))
+    desk.llm.replies[ViewUpdateDraft] = update("weakened", "The largest customer has gone.", cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "trim"))
+    [cut] = hold(desk, ny(17, 8, 30)).record.orders                 # half of it, for Tuesday's open
+    assert 0 < cut.shares < held
+    desk.news.add("UPA", "UPA is sued by its lenders", ny(17, 11, 0))
+    round_at(desk, ny(17, 11, 30))
+    desk.llm.replies[ViewUpdateDraft] = update("broken", "Its lenders have sued.", cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "sell"))
+    desk.llm.calls.clear()
+    record = hold(desk, ny(17, 12, 0)).record
+    assert [(b.ticker, b.held, b.waiting, b.at_open) for b in record.book] == [
+        ("UPA", True, None, "sell"), ("UPB", True, None, None)]
+    [asked] = desk.llm.messages(ViewUpdateDraft)
+    assert (f"UPA: a sell of {cut.shares} of these shares was due to fill at today's open. The account books a fill "
+            f"at the close meeting, so until then the desk takes {held - cut.shares} as held.\n") in asked
+    assert "waiting to fill" not in asked
+    [briefing] = desk.llm.messages(CheckinDraft)
+    assert f"- UPA: sell {cut.shares} of its {held} shares\n" in briefing
+    assert "  Allowed actions for UPA: keep, trim, sell." in briefing
+    # Before the fix this was turned back: "A sell is already waiting to fill."
+    assert [(d.ticker, d.action, d.status) for d in record.decisions] == [("UPA", "sell", "accepted")]
+    assert [(d.ticker, d.action) for d in record.noted] == [("UPA", "sell")]
+
+
+def test_when_the_only_name_was_sold_at_this_mornings_open_there_is_nothing_to_review(tmp_path):
+    desk = make_desk(tmp_path)
+    desk.llm.replies[ProposalSetDraft] = proposals(("UPA", "buy", 0.7))
+    assert hold(desk, ny(13, 18, 30)).status == "ok"
+    desk.llm.replies[ProposalSetDraft] = proposals(("UPA", "hold", 0.6))
+    assert hold(desk, ny(16, 18, 30)).status == "ok"
+    assert sorted(PaperBroker(desk.journal, ARM).positions()) == ["UPA"]
+    desk.news.add("UPA", "UPA loses its largest customer", ny(17, 7, 0))
+    round_at(desk, ny(17, 8, 15))
+    desk.llm.replies[ViewUpdateDraft] = update("broken", "The largest customer has gone.", cited=[1])
+    desk.llm.replies[CheckinDraft] = decisions(("UPA", "sell"))
+    assert len(hold(desk, ny(17, 8, 30)).record.orders) == 1
+    desk.news.add("UPA", "UPA is sued by its lenders", ny(17, 11, 0))
+    round_at(desk, ny(17, 11, 30))
+    desk.llm.calls.clear()
+    result = hold(desk, ny(17, 12, 0))
+    assert result.status == "ok" and result.record.book == [] and desk.llm.calls == []
+    [event] = desk.journal.events(result.meeting_id)
+    assert event.remark == "There is nothing to review. Not reviewed: UPA, due to be sold at today's open."
+    assert event.payload["sold_at_open"] == ["UPA"]
+
+
 def test_what_the_analyst_is_shown_at_a_checkin(tmp_path):
     desk = held_book(tmp_path)
     desk.news.add("UPA", "UPA earlier story", ny(16, 12, 0))

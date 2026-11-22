@@ -64,7 +64,9 @@ class CheckinManager:
             "The market has not opened yet. What you decide now is carried out at today's open."
             if self.can_act else
             "The market is open. The desk's orders fill at the next open, so nothing is traded now: what you decide "
-            "is noted, and the close meeting decides with the full day's data."
+            "is noted, and the close meeting decides with the full day's data. An order that was waiting for today's "
+            "open was due to fill there. Where the briefing lists a buy under DUE TO FILL AT TODAY'S OPEN, it is "
+            "taken as held: it can be trimmed or sold and can no longer be withdrawn."
         )
         return f"""You are the Portfolio Manager of a US equity swing-trading desk. The desk only buys shares (no shorting, no options) and holds them for days to weeks.
 
@@ -76,11 +78,12 @@ THE FOUR ACTIONS:
 - keep: leave the position, or the waiting order, as it is. This is the normal answer.
 - trim: cut a held position by half.
 - sell: close a held position.
-- withdraw: take back a buy order that is waiting to fill.
+- withdraw: take back a buy order that is waiting to fill. A buy that has not filled is not a position: it cannot be trimmed or sold, only withdrawn.
 
 WHAT TO RETURN:
 - One decision for each ticker under ANALYST UPDATES AT THIS MEETING. Say nothing about other tickers.
 - For each: the ticker exactly as shown, and a reason that names the analyst update it rests on.
+- Under each update are the actions allowed for that ticker. Choose one of them: any other is refused.
 
 RULES:
 - Trim, sell or withdraw only where the analyst's update says the view is weakened or broken. Anything else is refused.

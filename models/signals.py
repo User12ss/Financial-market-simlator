@@ -265,6 +265,11 @@ class TickerBriefing(BaseModel):
     ticker: str
     held: bool
     waiting: Literal["buy", "sell"] | None = Field(default=None, description="An order waiting to fill, if any")
+    at_open: Literal["buy", "sell"] | None = Field(
+        default=None,
+        description="An order that was due to fill at the open of the meeting's day, which had passed. The account "
+        "books it at the close meeting, so `held` does not count it yet",
+    )
     new_items: list[ShownItem] = Field(default_factory=list, description="First seen since the last meeting")
     not_shown: int = Field(default=0, description="New headlines beyond the number a prompt has room for")
     trading: PriceNow | None = Field(default=None, description="Where it is trading on the day of the meeting")

@@ -16,7 +16,10 @@ from models.signals import ProposalSetDraft, TickerBriefing, TickerViewDraft, Vi
 from models.trading import Order, Position
 from pipeline import checkin as checkin_module
 from pipeline import desk as desk_module
-from pipeline.checkin import brief, check_decisions, check_update, describe, price_now
+from pipeline.checkin import (
+    allowed_actions, brief, check_decisions, check_update, describe, due_at_open, left_at_open, manager_briefing,
+    price_now,
+)
 from pipeline.daily import Arm, DailyPipeline
 from pipeline.desk import headline_block
 from tests.desk_fakes import ARM, decisions, hold, make_desk, ny, round_at, update
@@ -260,14 +263,16 @@ def position(ticker) -> Position:
     return Position(ticker=ticker, shares=10, avg_cost=100.0, entry_date=date(2026, 11, 16), value=1000.0)
 
 
-def order(ticker, side) -> Order:
-    return Order(order_id=f"o|{ticker}|{side}", ticker=ticker, side=side, shares=10, status="open",
-                 created_session=date(2026, 11, 16))
+def order(ticker, side, shares=10, kind="market", created=date(2026, 11, 16)) -> Order:
+    return Order(order_id=f"o|{ticker}|{side}", ticker=ticker, side=side, kind=kind, shares=shares, status="open",
+                 created_session=created)
 
 
-def outcome(draft, updates, held=(), waiting=()) -> list[tuple[str, str, str, str]]:
+def outcome(draft, updates, held=(), waiting=(), at_open=()) -> list[tuple[str, str, str, str]]:
+    """`at_open` lists (ticker, side, shares) of orders that were due to fill at the open of the meeting's day."""
     results = check_decisions(
         draft, updates, {t: position(t) for t in held}, {t: order(t, side) for t, side in waiting},
+        {t: order(t, side, shares) for t, side, shares in at_open},
     )
     return [(d.ticker, d.action, d.status, d.note) for d in results]
 
@@ -318,6 +323,107 @@ def test_only_a_buy_that_is_waiting_can_be_taken_back():
         ("B", "keep", "accepted", "Kept by default."), ("C", "keep", "accepted", "Kept by default."),
         ("D", "keep", "accepted", "Kept by default."),
     ]
+
+
+# The account books a fill at the close meeting. Between the open and that meeting the journal still
+# lists an order placed for this open as waiting, though by the broker's own rule it has had its fill.
+
+def test_an_order_placed_for_this_open_has_had_its_fill_once_the_open_has_passed():
+    monday, tuesday = date(2026, 11, 16), date(2026, 11, 17)
+    orders = [
+        order("A", "buy", created=monday), order("B", "sell", created=monday),
+        order("C", "sell", kind="stop", created=monday),        # a stop waits for its price, not for the open
+        order("D", "buy", kind="limit", created=monday),        # and so does a limit
+        order("E", "buy", created=tuesday),                     # placed after this day's close: for the next open
+    ]
+    assert due_at_open(orders, tuesday, opened=False) == {}
+    due = due_at_open(orders, tuesday, opened=True)
+    assert sorted(due) == ["A", "B"] and due["A"].side == "buy" and due["B"].side == "sell"
+
+
+def test_a_buy_that_was_due_at_this_mornings_open_is_cut_like_any_position():
+    updates = updates_of(A="broken", B="weakened")
+    draft = decisions(("A", "sell"), ("B", "trim"))
+    assert outcome(draft, updates, at_open=[("A", "buy", 10), ("B", "buy", 10)]) == [
+        ("A", "sell", "accepted", ""), ("B", "trim", "accepted", "")]
+    # Before the open the same two buys are still waiting, and a buy that has not filled is not a position.
+    assert outcome(draft, updates, waiting=[("A", "buy"), ("B", "buy")])[:2] == [
+        ("A", "sell", "rejected", "Cannot sell a ticker that is not held."),
+        ("B", "trim", "rejected", "Cannot trim a ticker that is not held."),
+    ]
+
+
+def test_a_buy_that_has_had_its_open_can_no_longer_be_taken_back():
+    updates = updates_of(A="broken")
+    assert outcome(decisions(("A", "withdraw")), updates, at_open=[("A", "buy", 10)]) == [
+        ("A", "withdraw", "rejected", "The buy was due to fill at today's open and can no longer be taken back."),
+        ("A", "keep", "accepted", "Kept by default."),
+    ]
+
+
+def test_a_position_due_to_be_sold_at_this_mornings_open_is_held_only_for_what_is_left():
+    updates = updates_of(A="broken", B="broken", C="broken")
+    draft = decisions(("A", "sell"), ("B", "sell"), ("C", "trim"))
+    # A: all 10 of its shares were to be sold. B: 4 of its 10. C: more than it has, which sells what there is.
+    assert outcome(draft, updates, held="ABC", at_open=[("A", "sell", 10), ("B", "sell", 4), ("C", "sell", 25)]) == [
+        ("A", "sell", "rejected", "Cannot sell a ticker that was due to be sold at today's open."),
+        ("B", "sell", "accepted", ""),
+        ("C", "trim", "rejected", "Cannot trim a ticker that was due to be sold at today's open."),
+        ("A", "keep", "accepted", "Kept by default."), ("C", "keep", "accepted", "Kept by default."),
+    ]
+
+
+def test_a_record_written_before_orders_due_at_the_open_were_marked_still_reads():
+    # What a check-in recorded about a ticker on 20 November 2026, before the field existed.
+    old = {"ticker": "PG", "held": False, "waiting": "buy", "new_items": [], "not_shown": 0, "trading": None,
+           "affected": True}
+    read = TickerBriefing.model_validate(old)
+    assert (read.waiting, read.at_open) == ("buy", None), "an old record says nothing was due at the open"
+
+
+def test_a_name_sold_in_full_at_this_mornings_open_has_left_the_book():
+    positions = {t: position(t) for t in "ABC"}
+    at_open = {"A": order("A", "sell", 10), "B": order("B", "sell", 4), "C": order("C", "sell", 12),
+               "D": order("D", "buy")}
+    assert left_at_open(positions, {}, at_open) == ["A", "C"]          # B keeps 6 shares; D was bought
+    # One with an order still waiting stays in sight.
+    assert left_at_open(positions, {"C": order("C", "buy", kind="limit")}, at_open) == ["A"]
+    assert left_at_open(positions, {}, {}) == []
+
+
+def test_the_manager_is_told_what_has_filled_what_waits_and_which_actions_each_ticker_allows():
+    updates = updates_of(A="broken", C="weakened", D="weakened", E="unchanged")
+    briefings = [TickerBriefing(ticker=t, held=t in "CE", affected=t != "F") for t in "ACDEF"]
+    text = manager_briefing(
+        briefings, updates, {"C": position("C"), "E": position("E"), "F": position("F")},
+        {"D": order("D", "buy")}, {"A": order("A", "buy", 12), "C": order("C", "sell", 4)},
+    )
+    assert ("DUE TO FILL AT TODAY'S OPEN (the account books a fill at the close meeting; until then the desk "
+            "takes these as filled):\n- A: buy 12 shares\n- C: sell 4 of its 10 shares\n") in text
+    assert "ORDERS WAITING TO FILL AT THE NEXT OPEN:\n- D: buy 10 shares\n" in text
+    assert "- A: broken. r\n  Allowed actions for A: keep, trim, sell.\n" in text       # bought at the open: held
+    assert "- C: weakened. r\n  Allowed actions for C: keep, trim, sell.\n" in text     # 6 shares are left
+    assert "- D: weakened. r\n  Allowed actions for D: keep, withdraw.\n" in text       # not a position yet
+    assert "- E: unchanged. r\n  Allowed actions for E: keep.\n" in text                # nothing to act on
+    assert text.endswith("NOT REVIEWED (nothing new, or no standing view): F")
+    # Before the open nothing has filled, and the section is not there at all.
+    assert "DUE TO FILL" not in manager_briefing(briefings, updates, {"C": position("C")}, {"D": order("D", "buy")})
+    # A sell with no position behind it, which the broker will cancel, is not worded as a sale of "all 0 shares".
+    odd = manager_briefing([], {}, {}, {}, {"G": order("G", "sell", 5)})
+    assert "- G: sell 5 shares, of a position that is not on the books\n" in odd
+
+
+def test_the_allowed_actions_are_exactly_those_the_checks_accept():
+    updates = updates_of(A="broken", B="weakened", C="broken", D="unchanged", E="broken")
+    positions = {t: position(t) for t in "BCD"}
+    waiting, at_open = {"A": order("A", "buy"), "C": order("C", "sell")}, {"E": order("E", "buy")}
+    for ticker in updates:
+        allowed = allowed_actions(ticker, updates, positions, waiting, at_open)
+        for action in ("keep", "trim", "sell", "withdraw"):
+            [first, *_] = check_decisions(decisions((ticker, action)), updates, positions, waiting, at_open)
+            assert (first.status == "accepted") == (action in allowed), (ticker, action)
+    assert allowed_actions("A", updates, positions, waiting, at_open) == ["keep", "withdraw"]
+    assert allowed_actions("C", updates, positions, waiting, at_open) == ["keep"]       # a sell is already waiting
 
 
 def test_only_the_first_decision_for_a_ticker_counts_however_it_is_written():

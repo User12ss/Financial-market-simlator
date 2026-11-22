@@ -39,7 +39,8 @@ const FIELDS = {
   stop_reason: "止损理由",
   // What the desk's check-ins record.
   since: "上一场会议的截止时刻", as_of: "这一场的截止时刻", book: "账上的股票", affected: "有新情况",
-  waiting: "等待成交的订单", new_items: "新消息", not_shown: "没有列出的新消息条数", trading: "当天盘中报价",
+  waiting: "等待成交的订单", at_open: "今天开盘应已成交、尚未入账的订单", sold_at_open: "今天开盘应已卖出，不再复盘",
+  new_items: "新消息", not_shown: "没有列出的新消息条数", trading: "当天盘中报价",
   number: "编号", item_id: "台账里的编号", title: "标题", publisher: "来源", published_at: "来源标注的时间",
   first_seen: "本系统首次取得的时间", session: "交易日", seen_at: "取得的时间", last: "最新价",
   previous_close: "前一个收盘价", change_pct: "当日涨跌（%）", usual_range_pct: "日常波幅（%）",

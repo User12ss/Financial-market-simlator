@@ -21,6 +21,12 @@ A check-in can only reduce risk. It cuts or closes a position, or takes back
 a buy that has not filled, and only where the analyst's update says the view
 is weakened or broken. Opening and adding stay with the close meeting.
 
+The account books a fill at the close meeting, when the day's bar is
+complete. So between the open and that meeting the journal still lists an
+order placed for this open as waiting. A check-in held then does not take the
+journal's word for it: such an order was due to fill at the open, a buy is
+taken as held and a position sold there as gone (`due_at_open`).
+
 Everything shown to a model carries the moment this system first had it, and
 none of it is later than the meeting's cut-off.
 """
@@ -30,7 +36,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, get_args
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ValidationError
@@ -45,8 +51,8 @@ from execution.paper import PaperBroker, sector_of
 from execution.placement import place
 from journal.store import COMPLETED, Journal
 from models.signals import (
-    CheckinDecision, CheckinDraft, CheckinRecord, Event, PriceNow, ShownItem, TickerBriefing, TickerView,
-    TradeProposal, ViewUpdate, ViewUpdateDraft,
+    CheckinAction, CheckinDecision, CheckinDraft, CheckinRecord, Event, PriceNow, ShownItem, TickerBriefing,
+    TickerView, TradeProposal, ViewUpdate, ViewUpdateDraft,
 )
 from models.trading import Order, OrderRequest, Position, RiskDecision
 from pipeline.checks import figure_warning
@@ -62,6 +68,7 @@ NEWS_DESK = ("news_desk", "News Desk")
 NEW_YORK = ZoneInfo("America/New_York")
 # The effects of an update that allow a position to be cut or an order taken back.
 ACTIONABLE = ("weakened", "broken")
+ACTIONS: tuple[str, ...] = get_args(CheckinAction)
 EARLIER_SHOWN = 3
 
 
@@ -122,15 +129,56 @@ def price_now(quote: LiveQuote, item: TickerSnapshot | None) -> PriceNow:
     )
 
 
+def due_at_open(orders: list[Order], day: date, opened: bool) -> dict[str, Order]:
+    """The orders that were due to fill at the open of `day`, by ticker. None until that open has passed.
+
+    The journal lists them as waiting until the close meeting books them, but
+    by the broker's own rule a market order fills at the first open after the
+    session it was created in. A stop or a limit waits for its price, not for
+    the open, and is left out.
+
+    "Due" is as much as can be said before the day's bar is complete: the
+    broker cancels a buy whose open is at or below its stop, or that the cash
+    does not cover. That shows at the close meeting, which is also where
+    anything a check-in noted in the meantime is decided.
+    """
+    if not opened:
+        return {}
+    return {order.ticker: order for order in orders if order.kind == "market" and order.created_session < day}
+
+
+def shares_held(ticker: str, positions: dict[str, Position], at_open: dict[str, Order]) -> int:
+    """The shares the desk takes itself to hold: what is booked, and what was due at today's open."""
+    booked = positions[ticker].shares if ticker in positions else 0
+    order = at_open.get(ticker)
+    if order is None:
+        return booked
+    return booked + order.shares if order.side == "buy" else max(booked - order.shares, 0)
+
+
+def left_at_open(
+    positions: dict[str, Position], waiting: dict[str, Order], at_open: dict[str, Order],
+) -> list[str]:
+    """The tickers that left the book at today's open: the whole position was due to be sold there.
+
+    A check-in has nothing to review about them. One with an order still
+    waiting stays in the book, so that the order is not lost from sight.
+    """
+    return sorted(
+        ticker for ticker, order in at_open.items()
+        if order.side == "sell" and ticker not in waiting and shares_held(ticker, positions, at_open) <= 0
+    )
+
+
 def brief(
     ticker: str, held: bool, waiting: str | None, new: list[LedgerItem], quote: LiveQuote | None,
-    item: TickerSnapshot | None,
+    item: TickerSnapshot | None, at_open: str | None = None,
 ) -> TickerBriefing:
     """What the news desk has on one ticker. `new` is newest first; only the first few fit in a prompt."""
     shown = new[:config.DESK_HEADLINES_SHOWN]
     price = price_now(quote, item) if quote else None
     return TickerBriefing(
-        ticker=ticker, held=held, waiting=waiting,
+        ticker=ticker, held=held, waiting=waiting, at_open=at_open,
         new_items=[
             ShownItem(number=number, item_id=entry.item_id, title=entry.title, publisher=entry.publisher,
                       published_at=entry.published_at, first_seen=entry.first_seen)
@@ -162,15 +210,30 @@ def _headline(published: datetime | None, publisher: str, title: str) -> str:
 
 def render_checkin(
     briefing: TickerBriefing, view: TickerView, position: Position | None, order: Order | None,
-    earlier: list[LedgerItem], session: date,
+    earlier: list[LedgerItem], session: date, at_open: Order | None = None,
 ) -> str:
-    """Everything the analyst is shown about one ticker at a check-in."""
+    """Everything the analyst is shown about one ticker at a check-in.
+
+    `order` is still waiting to fill. `at_open` was due to fill at today's
+    open, which has passed, and is not booked yet.
+    """
     ticker = briefing.ticker
     lines = [f"STANDING VIEW (from the close meeting of {session})", render_view(view), "", "THE DESK'S POSITION"]
     if position is not None:
         lines.append(render_holding(position))
     if order is not None:
         lines.append(f"{ticker}: a {order.side} of {order.shares} shares is waiting to fill at the next open.")
+    if at_open is not None and at_open.side == "buy":
+        lines.append(
+            f"{ticker}: a buy of {at_open.shares} shares was due to fill at today's open. The account books a fill "
+            "at the close meeting, so until then the desk takes it as held and the price paid is not on record."
+        )
+    elif at_open is not None:
+        left = shares_held(ticker, {ticker: position} if position else {}, {ticker: at_open})
+        lines.append(
+            f"{ticker}: a sell of {at_open.shares} of these shares was due to fill at today's open. The account "
+            f"books a fill at the close meeting, so until then the desk takes {left} as held."
+        )
 
     lines.append("")
     price = briefing.trading
@@ -227,13 +290,78 @@ def check_update(briefing: TickerBriefing, draft: ViewUpdateDraft, shown: list[s
     )
 
 
+def refusal(
+    ticker: str, action: str, updates: dict[str, ViewUpdate], positions: dict[str, Position],
+    waiting: dict[str, Order], at_open: dict[str, Order],
+) -> str:
+    """Why this action cannot be carried out for this ticker at this check-in. Empty when it can.
+
+    - the analyst gave no update on the ticker at this meeting;
+    - it is a trim, sell or withdraw and the update is not "weakened" or
+      "broken": a check-in acts on what the analyst found, not on its own;
+    - it is a withdraw and no buy is waiting to fill: there never was one,
+      or it was due at today's open, which has passed;
+    - it is a trim or sell and no share is held, counting what was due to be
+      bought or sold at today's open, or a sell is already waiting.
+    """
+    if ticker not in updates:
+        return "The analyst gave no update on this ticker at this meeting."
+    if action == "keep":
+        return ""
+    effect = updates[ticker].effect
+    if effect not in ACTIONABLE:
+        return (f"The analyst's update is \"{effect}\". A check-in only cuts a position or takes back an order "
+                "where the update says the view is weakened or broken.")
+    order, filled = waiting.get(ticker), at_open.get(ticker)
+    if action == "withdraw":
+        if order is not None and order.side == "buy":
+            return ""
+        if filled is not None and filled.side == "buy":
+            return "The buy was due to fill at today's open and can no longer be taken back."
+        return "There is no buy waiting to fill."
+    if shares_held(ticker, positions, at_open) <= 0:
+        if filled is not None and filled.side == "sell":
+            return f"Cannot {action} a ticker that was due to be sold at today's open."
+        return f"Cannot {action} a ticker that is not held."
+    if order is not None and order.side == "sell":
+        return "A sell is already waiting to fill."
+    return ""
+
+
+def allowed_actions(
+    ticker: str, updates: dict[str, ViewUpdate], positions: dict[str, Position], waiting: dict[str, Order],
+    at_open: dict[str, Order] | None = None,
+) -> list[str]:
+    """The actions the checks accept for this ticker. The manager is told them before it decides."""
+    return [action for action in ACTIONS
+            if not refusal(ticker, action, updates, positions, waiting, at_open or {})]
+
+
+def _due_line(order: Order, position: Position | None) -> str:
+    """One order that was due at today's open, as the manager's list has it."""
+    if order.side == "buy":
+        return f"{order.ticker}: buy {order.shares} shares"
+    booked = position.shares if position else 0
+    if not booked:
+        # The broker cancels such a sell. It is listed as it stands, not as a sale of "all 0 shares".
+        return f"{order.ticker}: sell {order.shares} shares, of a position that is not on the books"
+    if order.shares >= booked:
+        return f"{order.ticker}: sell all {booked} of its shares"
+    return f"{order.ticker}: sell {order.shares} of its {booked} shares"
+
+
 def manager_briefing(
     briefings: list[TickerBriefing], updates: dict[str, ViewUpdate], positions: dict[str, Position],
-    waiting: dict[str, Order],
+    waiting: dict[str, Order], at_open: dict[str, Order] | None = None,
 ) -> str:
     """Everything the portfolio manager is shown at a check-in."""
+    at_open = at_open or {}
     lines = ["THE BOOK:"]
     lines += [f"- {render_holding(position)}" for position in positions.values()] or ["- no positions"]
+    if at_open:
+        lines += ["", "DUE TO FILL AT TODAY'S OPEN (the account books a fill at the close meeting; until then the "
+                      "desk takes these as filled):"]
+        lines += [f"- {_due_line(order, positions.get(ticker))}" for ticker, order in sorted(at_open.items())]
     if waiting:
         lines += ["", "ORDERS WAITING TO FILL AT THE NEXT OPEN:"]
         lines += [f"- {ticker}: {order.side} {order.shares} shares" for ticker, order in sorted(waiting.items())]
@@ -243,6 +371,9 @@ def manager_briefing(
         if update.data_warnings:
             text += f" (Automatic data check: {' '.join(update.data_warnings)})"
         lines.append(text)
+        # Said by the same rule that will check the decision, so the two cannot drift apart.
+        allowed = allowed_actions(ticker, updates, positions, waiting, at_open)
+        lines.append(f"  Allowed actions for {ticker}: {', '.join(allowed)}.")
     quiet = [b.ticker for b in briefings if b.ticker not in updates]
     if quiet:
         lines += ["", f"NOT REVIEWED (nothing new, or no standing view): {', '.join(quiet)}"]
@@ -251,43 +382,20 @@ def manager_briefing(
 
 def check_decisions(
     draft: CheckinDraft | None, updates: dict[str, ViewUpdate], positions: dict[str, Position],
-    waiting: dict[str, Order],
+    waiting: dict[str, Order], at_open: dict[str, Order] | None = None,
 ) -> list[CheckinDecision]:
     """Accept or reject each decision, and give every updated ticker one.
 
     Only the first decision for a ticker counts. It is rejected, with the
-    reason recorded, when:
-
-    - the analyst gave no update on that ticker at this meeting;
-    - it is a trim, sell or withdraw and the update is not "weakened" or
-      "broken": a check-in acts on what the analyst found, not on its own;
-    - it is a trim or sell of a ticker that is not held, or that already has
-      a sell waiting;
-    - it is a withdraw and no buy is waiting to fill.
+    reason recorded, when `refusal` has one. `waiting` holds the orders that
+    have not had their open yet; `at_open` those that were due at today's.
 
     An updated ticker left without an accepted decision is kept as it is.
     """
+    at_open = at_open or {}
     results: list[CheckinDecision] = []
     mentioned: set[str] = set()
     decided: set[str] = set()
-
-    def reason_to_reject(ticker: str, action: str) -> str:
-        if ticker not in updates:
-            return "The analyst gave no update on this ticker at this meeting."
-        if action == "keep":
-            return ""
-        effect = updates[ticker].effect
-        if effect not in ACTIONABLE:
-            return (f"The analyst's update is \"{effect}\". A check-in only cuts a position or takes back an order "
-                    "where the update says the view is weakened or broken.")
-        order = waiting.get(ticker)
-        if action == "withdraw":
-            return "" if order is not None and order.side == "buy" else "There is no buy waiting to fill."
-        if ticker not in positions:
-            return f"Cannot {action} a ticker that is not held."
-        if order is not None and order.side == "sell":
-            return "A sell is already waiting to fill."
-        return ""
 
     for item in (draft.decisions if draft else []):
         ticker = item.ticker.strip().upper()
@@ -295,7 +403,7 @@ def check_decisions(
             note = "A decision for this ticker was already given. Only the first counts."
         else:
             mentioned.add(ticker)
-            note = reason_to_reject(ticker, item.action)
+            note = refusal(ticker, item.action, updates, positions, waiting, at_open)
         results.append(CheckinDecision(
             ticker=ticker, action=item.action, reason=item.reason, status="rejected" if note else "accepted", note=note,
         ))
@@ -394,8 +502,14 @@ class Checkin:
         since = self._last_cutoff(meeting, base_started)
         broker = PaperBroker(self.journal, arm.name)
         positions, orders = broker.positions(), broker.orders()
-        waiting = {order.ticker: order for order in orders if order.kind != "stop"}
-        tickers = sorted(set(positions) | set(waiting))
+        # The books are those of the last close meeting. Once today's open has passed, an order placed
+        # for it is not waiting any more, whatever they say: see `due_at_open`.
+        at_open = due_at_open(orders, meeting.day, opened=not meeting.can_act)
+        had_their_open = {order.order_id for order in at_open.values()}
+        waiting = {order.ticker: order for order in orders
+                   if order.kind != "stop" and order.order_id not in had_their_open}
+        sold = left_at_open(positions, waiting, at_open)
+        tickers = sorted((set(positions) | set(waiting) | set(at_open)) - set(sold))
 
         # 1. briefing
         briefings = [
@@ -403,6 +517,7 @@ class Checkin:
                 ticker, ticker in positions, waiting[ticker].side if ticker in waiting else None,
                 self.ledger.items(ticker, as_of, config.DESK_HEADLINE_DAYS, since=since),
                 self.ledger.quote(ticker, as_of, meeting.day), snapshot.tickers.get(ticker),
+                at_open=at_open[ticker].side if ticker in at_open else None,
             )
             for ticker in tickers
         ]
@@ -412,9 +527,9 @@ class Checkin:
         rounds = self.ledger.watches(arm.name, limit=1, until=as_of)
         looked = datetime.fromisoformat(rounds[0]["at"]) if rounds else None
         self._say(meeting, "briefing", NEWS_DESK, "all", "briefing",
-                  remark=self._opening(meeting, since, briefings, looked),
+                  remark=self._opening(meeting, since, briefings, looked, sold),
                   payload={"since": since.isoformat(), "as_of": as_of.isoformat(), "book": tickers,
-                           "affected": [b.ticker for b in affected],
+                           "affected": [b.ticker for b in affected], "sold_at_open": sold,
                            "last_round": looked.isoformat() if looked else None})
         for failure in self.ledger.failures(as_of, tickers):
             what = (f"{failure.ticker}: headlines" if failure.what == "headlines" else "Today's prices")
@@ -444,7 +559,7 @@ class Checkin:
                 if entry.item_id not in shown_ids and entry.first_seen <= since
             ][:EARLIER_SHOWN]
             text = render_checkin(briefing, view, positions.get(ticker), waiting.get(ticker), earlier,
-                                  meeting.session)
+                                  meeting.session, at_open.get(ticker))
             try:
                 draft = self._cached(meeting, f"update:{ticker}", text, ViewUpdateDraft,
                                      lambda: analyst.update(ticker, text))
@@ -461,7 +576,7 @@ class Checkin:
         pm_summary = ""
         if updates:
             manager = CheckinManager(arm.llm, meeting.can_act)
-            text = manager_briefing(briefings, updates, positions, waiting)
+            text = manager_briefing(briefings, updates, positions, waiting, at_open)
             draft = None
             try:
                 draft = self._cached(meeting, "decisions", text, CheckinDraft, lambda: manager.decide(text))
@@ -471,7 +586,7 @@ class Checkin:
                 pm_summary = draft.summary
                 self._say(meeting, "proposals", (manager.id, manager.name), RISK_OFFICER[0], "checkin_decisions",
                           remark=draft.remark, payload=draft.model_dump(mode="json"), is_llm=True)
-            decisions = check_decisions(draft, updates, positions, waiting)
+            decisions = check_decisions(draft, updates, positions, waiting, at_open)
             for decision in decisions:
                 accepted = decision.status == "accepted"
                 if decision.source == "default":
@@ -509,9 +624,12 @@ class Checkin:
 
     def _opening(
         self, meeting: _Meeting, since: datetime, briefings: list[TickerBriefing], looked: datetime | None,
+        sold: list[str],
     ) -> str:
+        gone = f"Not reviewed: {', '.join(sold)}, due to be sold at today's open." if sold else ""
         if not briefings:
-            return "The book is empty: no positions and no orders waiting. There is nothing to review."
+            return (f"There is nothing to review. {gone}" if gone
+                    else "The book is empty: no positions and no orders waiting. There is nothing to review.")
         headlines = sum(len(b.new_items) + b.not_shown for b in briefings)
         with_news = sum(1 for b in briefings if b.new_items)
         text = (f"Since the last meeting ({clock(since)}): {headlines} new headline{'s' if headlines != 1 else ''} "
@@ -525,7 +643,7 @@ class Checkin:
                  else " The watch has not looked yet, so nothing new can be on record.")
         if not any(b.affected for b in briefings):
             text += " The standing views and orders are left as they are."
-        return text
+        return f"{text} {gone}".strip()
 
     def _act(
         self, meeting: _Meeting, record: CheckinRecord, wanted: list[CheckinDecision], broker: PaperBroker,
