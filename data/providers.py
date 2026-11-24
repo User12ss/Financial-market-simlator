@@ -161,6 +161,30 @@ class YFinanceProvider:
         ]
         return min(upcoming) if upcoming else None
 
+    def earnings_reports(self, symbol: str) -> list[datetime]:
+        """When the company reported its results, oldest first, as New York times.
+
+        The source lists the next report or two as well: dates after the
+        caller's own cut-off are the caller's to drop. A time of midnight
+        means the source gives the day and not the hour. This goes through
+        the source's earnings calendar page, which the client can only read
+        with the lxml package installed.
+        """
+        import yfinance as yf
+
+        try:
+            frame = yf.Ticker(symbol).get_earnings_dates(limit=100)
+        except ImportError as e:
+            raise DataError(f"Yahoo Finance earnings dates need a package that is not installed: {e}") from e
+        except Exception as e:
+            raise DataError(f"Yahoo Finance earnings dates failed for {symbol}: {e}") from e
+        if frame is None:
+            return []
+        stamps = pd.DatetimeIndex(frame.index)
+        if stamps.tz is None:
+            stamps = stamps.tz_localize("America/New_York")
+        return sorted(stamp.tz_convert("America/New_York").to_pydatetime() for stamp in stamps)
+
     def headlines(self, symbol: str, limit: int) -> list[NewsItem]:
         import yfinance as yf
 

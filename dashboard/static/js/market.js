@@ -61,17 +61,45 @@ export function lastBars(bars, count = BARS_ON_SCREEN) {
   }));
 }
 
+const BANDS = ["5", "25", "50", "75", "95"];
+
+/**
+ * The quant engineer's forecast for a ticker, once its line of the record has been reached: where the recorded
+ * percentiles of the simulated paths lie after each horizon. The last one said by line `upTo` is the one that stands.
+ */
+export function fanOf(ticker, events, upTo) {
+  for (let index = Math.min(upTo, events.length - 1); index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind !== "forecast" || event.ticker !== ticker) continue;
+    const said = event.payload || {};
+    const bands = (said.horizons || [])
+      .filter((item) => given(item.sessions) && item.quantiles && BANDS.every((band) => given(item.quantiles[band])))
+      .map((item) => ({ sessions: item.sessions, ...Object.fromEntries(BANDS.map((band) => [band, item.quantiles[band]])) }))
+      .sort((a, b) => a.sessions - b.sessions);
+    return bands.length ? { index, bands } : null;
+  }
+  return null;
+}
+
+/** One horizon of a forecast in words: where half the simulated paths end, and nine in ten. */
+export function fanText(band) {
+  return `${band.sessions} 个交易日后：一半的模拟路径落在 ${usd(band["25"])} 到 ${usd(band["75"])}，`
+    + `九成落在 ${usd(band["5"])} 到 ${usd(band["95"])}`;
+}
+
 /**
  * Where candles go on a plot. `before` are the bars up to the session,
  * `after` the ones recorded later (empty when they are not to be shown), and
  * `levels` are prices to mark (a stop, a limit). A level is kept on the price
  * scale only when it is near the candles: one far away would squash them, so
  * it is reported as lying off the plot, above or below.
- * Returns the candles with their places, the levels, and the scale used.
+ * `fan` is a recorded forecast (see fanOf): it is given room to the right of the session, one place for each
+ * session ahead, which are the same places the bars recorded afterwards go into.
+ * Returns the candles with their places, the levels, the fan and the scale used.
  */
-export function plot(before, after, levels, { width, height, volume = 0.16, gap = 0.28 }) {
+export function plot(before, after, levels, { width, height, volume = 0.16, gap = 0.28, fan = null }) {
   const all = [...before, ...after];
-  if (all.length === 0) return { candles: [], levels: [], low: null, high: null, cut: null, step: 0, bottom: 0 };
+  if (all.length === 0) return { candles: [], levels: [], low: null, high: null, cut: null, step: 0, bottom: 0, fan: null };
   let low = Math.min(...all.map((bar) => bar.low)), high = Math.max(...all.map((bar) => bar.high));
   const reach = (high - low || Math.abs(high) * 0.02 || 1) * 0.6;
   const placed = levels.map((level) => ({
@@ -83,12 +111,18 @@ export function plot(before, after, levels, { width, height, volume = 0.16, gap 
       high = Math.max(high, level.price);
     }
   }
+  const bands = fan && before.length ? fan.bands : [];
+  for (const band of bands) {
+    low = Math.min(low, band["5"]);
+    high = Math.max(high, band["95"]);
+  }
   const room = (high - low || Math.abs(high) * 0.02 || 1) * 0.06;         // a little air above and below
   low -= room;
   high += room;
   const top = 0, bottom = height * (1 - volume) - 4;
   const y = (price) => top + ((high - price) / (high - low)) * (bottom - top);
-  const step = width / all.length;
+  const ahead = bands.length ? bands[bands.length - 1].sessions : 0;
+  const step = width / (before.length + Math.max(after.length, ahead));
   const most = Math.max(...all.map((bar) => bar.volume || 0)) || 1;
   const candles = all.map((bar, at) => ({
     ...bar, after: at >= before.length, up: bar.close >= bar.open,
@@ -96,10 +130,19 @@ export function plot(before, after, levels, { width, height, volume = 0.16, gap 
     yHigh: y(bar.high), yLow: y(bar.low), yOpen: y(bar.open), yClose: y(bar.close),
     yVolume: height - ((bar.volume || 0) / most) * (height * volume),
   }));
+  const today = candles[before.length - 1];
   return {
     candles, low, high, step, y, bottom,
     levels: placed.map((level) => ({ ...level, y: level.off ? null : y(level.price) })),
     cut: after.length ? step * before.length : null,          // where the session ends and what came after begins
+    // The fan opens from the session's close: each horizon sits as many places to the right as it is sessions ahead.
+    fan: bands.length ? {
+      x: today.x, y: today.yClose,
+      points: bands.map((band) => ({
+        ...band, x: step * (before.length - 0.5 + band.sessions),
+        ...Object.fromEntries(BANDS.map((name) => [`y${name}`, y(band[name])])),
+      })),
+    } : null,
   };
 }
 

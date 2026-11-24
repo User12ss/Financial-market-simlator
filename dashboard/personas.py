@@ -19,7 +19,9 @@ from typing import Literal
 # Who speaks at each stage of the pipeline, for the page's legend.
 STAGES = [
     ("briefing", "情报"),       # only at the desk's check-ins: what has come in since the last meeting
-    ("settle", "结算"), ("macro", "宏观"), ("views", "观点"), ("debate", "辩论"),
+    ("settle", "结算"), ("macro", "宏观"), ("views", "观点"),
+    ("forecast", "预测"),       # only at the desk's close meeting: the forecast engine's distributions
+    ("debate", "辩论"),
     ("proposals", "提案"), ("checks", "检查"), ("risk", "风控"), ("orders", "下单"),
 ]
 
@@ -99,6 +101,8 @@ ROSTER: tuple[Persona, ...] = (
 NARRATOR = {"id": "pipeline", "title": "流程播报"}
 # The desk's news desk is code too, and has no seat yet: at a check-in it says what has come in.
 NEWS_DESK = {"id": "news_desk", "title": "情报员"}
+# So is the quant engineer, who reads out the forecast engine's distributions at the desk's close meeting.
+QUANT = {"id": "quant_engineer", "title": "量化工程师"}
 EVERYONE = {"id": "all", "title": "所有人"}
 
 _BY_ID = {persona.id: persona for persona in ROSTER}
@@ -108,7 +112,7 @@ def title_of(speaker: str) -> str:
     """The Chinese title for a speaker or listener id; the id itself when it is not one of ours."""
     if speaker in _BY_ID:
         return _BY_ID[speaker].title
-    for other in (NARRATOR, NEWS_DESK, EVERYONE):
+    for other in (NARRATOR, NEWS_DESK, QUANT, EVERYONE):
         if speaker == other["id"]:
             return other["title"]
     return speaker

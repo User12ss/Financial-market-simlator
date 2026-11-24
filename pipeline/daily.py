@@ -403,6 +403,7 @@ class DailyPipeline:
                 )
             with self.journal.transaction():
                 broker.mark_fills_reported(run.run_id)
+                self._finishing(run)
                 self.journal.finish_run(
                     run.run_id, table.status, self._now(), table.usage, table=table,
                     snapshot_path=str(data.snapshot_path),
@@ -440,6 +441,7 @@ class DailyPipeline:
 
         regime, reused_from = self._macro(run, refresh_macro)
         views = self._views(run, positions, regime)
+        self._after_views(run, account, positions, views)
         debates = self._debates(run, positions, views, regime)
         proposals, pm_summary = self._proposals(run, positions, waiting, views, debates, regime)
         decisions, halt = self._risk(run, account, positions, earlier, proposals, views)
@@ -479,6 +481,22 @@ class DailyPipeline:
         answer = call()
         self.journal.save_checkpoint(run.arm.name, session, key, answer.model_dump_json())
         return answer
+
+    def _after_views(self, run: _Run, account, positions: dict[str, Position], views: dict[str, TickerView]) -> None:
+        """A turn between the views and the debates. The daily pipeline has nothing to say here.
+
+        The desk's close meeting uses it for the forecast engine. Whatever is
+        said in it is recorded and goes no further: it returns nothing, and
+        the stages after it are given exactly what they would have been given.
+        """
+
+    def _finishing(self, run: _Run) -> None:
+        """Called as a run is recorded as finished, inside the same transaction. The daily pipeline keeps nothing more.
+
+        The desk's close meeting puts its forecast on record here: saved with
+        the meeting's ending or not at all, so that a meeting that failed
+        leaves no forecast behind.
+        """
 
     # ── Stage 2: macro ───────────────────────────────────────────────────
 

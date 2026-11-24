@@ -5,8 +5,8 @@ import { test } from "node:test";
 
 import { buildTrail } from "../../dashboard/static/js/decisions.js";
 import {
-  citationText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, rangePlace, readings, readouts, sectors,
-  sinceText, sinceThen, sparkOf, sparkPath, tape, yieldCurve,
+  citationText, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, rangePlace, readings,
+  readouts, sectors, sinceText, sinceThen, sparkOf, sparkPath, tape, yieldCurve,
 } from "../../dashboard/static/js/market.js";
 
 import { MARKET, PERSONAS } from "./market_fixture.mjs";
@@ -82,6 +82,67 @@ test("a recorded level near the candles is put on their scale, and one far away 
   assert.deepEqual(drawn.levels.slice(2).map((level) => level.y), [null, null]);
   assert.deepEqual(drawn.levels.map(levelText), [
     "分析师建议止损 $80.00", "限价 $115.00", "订单止损 $70.00（在图下方）", "限价 $130.00（在图上方）"]);
+});
+
+const bands = (sessions, q5, q25, q50, q75, q95) => ({ sessions, quantiles: { 5: q5, 25: q25, 50: q50, 75: q75, 95: q95 } });
+const FORECAST = { close: 100, horizons: [bands(5, 92, 97, 100, 103, 108), bands(1, 97, 99, 100, 101, 103), bands(10, 88, 95, 100, 105, 112)] };
+
+test("a forecast comes on to a chart only when the quant engineer's line has been reached, and the last one said stands", () => {
+  const events = [
+    said("ticker_analyst", "view", "TMO", {}),
+    said("quant_engineer", "market_state", null, {}),
+    said("quant_engineer", "forecast", "ABBV", { horizons: [bands(1, 290, 293, 294, 296, 299)] }),
+    said("quant_engineer", "forecast", "TMO", FORECAST),
+    said("judge", "ruling", "TMO", {}),
+    said("quant_engineer", "forecast", "TMO", { horizons: [bands(1, 96, 98, 100, 102, 104)] }),
+  ];
+  assert.equal(fanOf("TMO", events, 2), null);                   // not yet said, and ABBV's is not TMO's
+  const fan = fanOf("TMO", events, 4);
+  assert.equal(fan.index, 3);
+  // In order of how far ahead they look, each with the five recorded percentiles and nothing else.
+  assert.deepEqual(fan.bands, [
+    { sessions: 1, 5: 97, 25: 99, 50: 100, 75: 101, 95: 103 }, { sessions: 5, 5: 92, 25: 97, 50: 100, 75: 103, 95: 108 },
+    { sessions: 10, 5: 88, 25: 95, 50: 100, 75: 105, 95: 112 },
+  ]);
+  assert.equal(fanOf("TMO", events, 99).index, 5);               // said again later: that one stands from then on
+  assert.equal(fanOf("ABBV", events, 99).index, 2);
+  assert.equal(fanOf("ZZZ", events, 99), null);
+  assert.equal(fanOf("TMO", [], 3), null);
+  // A horizon without all five percentiles is left out; a forecast with none usable is no fan at all.
+  const partial = [said("quant_engineer", "forecast", "TMO", { horizons: [bands(1, 97, 99, 100, 101, 103), { sessions: 5, quantiles: { 5: 92, 50: 100 } }, { sessions: 10 }] })];
+  assert.deepEqual(fanOf("TMO", partial, 0).bands.map((band) => band.sessions), [1]);
+  assert.equal(fanOf("TMO", [said("quant_engineer", "forecast", "TMO", { horizons: [{ sessions: 5, quantiles: { 5: null } }] })], 0), null);
+  assert.equal(fanOf("TMO", [said("quant_engineer", "forecast", "TMO", {})], 0), null);
+  assert.equal(fanText(fan.bands[1]), "5 个交易日后：一半的模拟路径落在 $97.00 到 $103.00，九成落在 $92.00 到 $108.00");
+});
+
+test("the forecast is given the places to the right of the session, one for each session ahead", () => {
+  const before = lastBars(MARKET.tickers.TMO.bars), after = lastBars(MARKET.tickers.TMO.after, Infinity);
+  const fan = fanOf("TMO", [said("quant_engineer", "forecast", "TMO", FORECAST)], 0);
+  const drawn = plot(before, [], [], { width: 260, height: 100, fan });
+  // Three bars and ten sessions ahead share the width; nothing is marked as "afterwards".
+  assert.deepEqual([drawn.step, drawn.cut, drawn.candles.length], [20, null, 3]);
+  // The scale takes in the forecast's widest band: 88 to 112, where the candles alone span 90 to 110.
+  assert.deepEqual([drawn.low, drawn.high], [86.56, 113.44]);
+  const today = drawn.candles[2];
+  assert.deepEqual([drawn.fan.x, drawn.fan.y], [today.x, today.yClose]);
+  assert.deepEqual(drawn.fan.points.map((point) => [point.sessions, point.x]), [[1, 70], [5, 150], [10, 250]]);
+  const last = drawn.fan.points[2];
+  assert.deepEqual([last.y5, last.y25, last.y50, last.y75, last.y95], [88, 95, 100, 105, 112].map(drawn.y));
+  assert.ok(last.y95 < last.y75 && last.y75 < last.y50 && last.y50 < last.y25 && last.y25 < last.y5);
+  assert.deepEqual([last["5"], last["95"]], [88, 112]);            // the recorded figures travel with their places
+
+  // With what came after joined on, a horizon sits exactly where that session's bar is.
+  const joined = plot(before, after, [], { width: 260, height: 100, fan });
+  assert.deepEqual([joined.step, joined.cut], [20, 60]);
+  assert.equal(joined.fan.points[0].x, joined.candles[3].x);       // one session ahead: the first bar afterwards
+  // More bars afterwards than the forecast reaches: they set the width.
+  const long = Array.from({ length: 14 }, (_, at) => ({ date: `d${at}`, open: 100, high: 101, low: 99, close: 100, volume: 1 }));
+  assert.equal(plot(before, long, [], { width: 340, height: 100, fan }).step, 20);
+  // No forecast, no room kept for one, and no fan.
+  assert.equal(plot(before, [], [], { width: 300, height: 100 }).fan, null);
+  assert.equal(plot(before, [], [], { width: 300, height: 100, fan: null }).step, 100);
+  assert.equal(plot([], [], [], { width: 300, height: 100, fan }).fan, null);
 });
 
 test("stops and limits come on to a chart only when their line of the record has been reached", () => {

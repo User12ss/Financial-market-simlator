@@ -12,6 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from models.forecast import ForecastCard
 from models.signals import Direction, Draft, UsageSummary
 
 
@@ -242,6 +243,9 @@ class ArmEvaluation(BaseModel):
     scorecard: Scorecard
     trades: TradeSummary
     random: RandomBenchmark
+    forecasts: ForecastCard | None = Field(
+        default=None, description="How the forecast engine's distributions held up. None for an arm that makes none.",
+    )
     usage: UsageSummary = Field(default_factory=UsageSummary)
     lessons_written: int = 0
     lessons_total: int = 0

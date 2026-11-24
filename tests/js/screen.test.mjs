@@ -128,6 +128,50 @@ test("what the price did afterwards is joined on only once the record is over", 
   assert.doesNotMatch(words(screen.node), /之后/);
 });
 
+test("the quant engineer's forecast is drawn from its line on, under the candles, and not a line earlier", () => {
+  const band = (sessions, q5, q25, q50, q75, q95) => ({ sessions, quantiles: { 5: q5, 25: q25, 50: q50, 75: q75, 95: q95 } });
+  const events = [
+    /* 0 */ said("ticker_analyst", "view", "TMO", { direction: "bullish", confidence: 0.8, held: false }),
+    /* 1 */ said("quant_engineer", "market_state", null, {}),
+    /* 2 */ said("quant_engineer", "forecast", "TMO", { close: 100, horizons: [band(1, 97, 99, 100, 101, 103), band(5, 92, 97, 100, 103, 108)] }),
+    /* 3 */ said("judge", "ruling", "TMO", { stance: "own", confidence: 0.7 }),
+  ];
+  const rows = new Map(buildTrail(events).map((row) => [row.ticker, row]));
+  const line = (index, ended = false) => ({ event: events[index], rows, events, index, ended });
+  const screen = screenOn();
+  screen.show(line(0));
+  assert.deepEqual(wearing(screen.node, "fan"), []);
+  assert.deepEqual(wearing(screen.node, "fan-dot"), []);
+  assert.equal(wearing(screen.node, "swing").length, 1);             // the usual daily range, while there is no forecast
+  assert.doesNotMatch(words(screen.node), /量化工程师/);
+
+  screen.show(line(2));
+  assert.deepEqual(wearing(screen.node, "fan").map((path) => path.attributes.class), ["fan wide", "fan half"]);
+  assert.equal(wearing(screen.node, "fan-mid").length, 1);
+  assert.deepEqual(texts(screen.node, "fan-label"), ["九成的路径", "一半"]);
+  assert.equal(wearing(screen.node, "swing").length, 0);              // the forecast says more than the range did
+  assert.match(words(screen.node), /扇形是量化工程师（代码）记录的预测：一种分布，不是会走出来的路线。/);
+  // One mark per horizon to point at, which reads out the recorded percentiles.
+  const dots = wearing(screen.node, "fan-dot");
+  assert.equal(dots.length, 2);
+  assert.equal(dots[1].attributes["aria-label"], "预测，5 个交易日后：一半的模拟路径落在 $97.00 到 $103.00，九成落在 $92.00 到 $108.00");
+  dots[1].listeners.pointermove({ clientX: 10, clientY: 10 });
+  assert.match(words(tooltip), /TMO · 预测 · 5 个交易日后/);
+  assert.match(words(tooltip), /\$108\.00.*\$103\.00.*\$100\.00.*\$97\.00.*\$92\.00/);
+  dots[1].listeners.pointerleave();
+  // It is drawn before the candles, so they lie over it.
+  const order = wearing(screen.node, "candles")[0].children
+    .map((node) => String((node.attributes || {}).class || "").split(" ")[0]);
+  assert.ok(order.indexOf("fan") < order.indexOf("candle"));
+
+  // It stays for the lines that follow, and what happened afterwards is laid over it once the record is over.
+  screen.show(line(3));
+  assert.equal(wearing(screen.node, "fan").length, 2);
+  screen.show(line(3, true));
+  assert.equal(wearing(screen.node, "fan").length, 2);
+  assert.equal(candles(screen.node).filter((bar) => bar.attributes.class.includes("after")).length, 2);
+});
+
 test("a ticker the snapshot does not hold is said not to be there", () => {
   const screen = screenOn();
   screen.show(at(10));                                         // an old order of ZZZ filling

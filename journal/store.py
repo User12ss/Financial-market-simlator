@@ -21,6 +21,7 @@ from typing import Iterator
 
 import config
 from models.evaluation import Lesson, ViewScore
+from models.forecast import ForecastScore, ForecastSet
 from models.signals import Event, MacroRegime, SignalTable, UsageSummary
 
 # Bumped whenever an existing table changes. A journal written under another
@@ -219,6 +220,30 @@ CREATE TABLE meetings (
     model_seconds REAL,
     cost_usd      REAL,
     record_json   TEXT
+)""",
+    # What the forecast engine said at an arm's close meeting: one row per session, the whole
+    # set in one piece. A session forecast again (a close meeting held again) replaces its row.
+    "forecast_sets": """
+CREATE TABLE forecast_sets (
+    arm            TEXT NOT NULL,
+    session_date   TEXT NOT NULL,
+    run_id         TEXT NOT NULL,         -- the close meeting that made it
+    params_version INTEGER NOT NULL,
+    seed           INTEGER NOT NULL,
+    set_json       TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date)
+)""",
+    # What each forecast turned out to be worth: one row per name and horizon.
+    "forecast_scores": """
+CREATE TABLE forecast_scores (
+    arm          TEXT NOT NULL,
+    session_date TEXT NOT NULL,           -- the session the forecast was made after
+    ticker       TEXT NOT NULL,
+    sessions     INTEGER NOT NULL,        -- the horizon
+    matures_on   TEXT NOT NULL,
+    status       TEXT NOT NULL,           -- scored, pending, unpriced
+    score_json   TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date, ticker, sessions)
 )""",
 }
 
@@ -555,6 +580,47 @@ class Journal:
             sql += " AND clean = 1"
         rows = self._db.execute(sql + " ORDER BY known_on DESC, session_date DESC, ticker", tuple(params))
         return [Lesson.model_validate_json(row["lesson_json"]) for row in rows]
+
+    # ── Forecasts ────────────────────────────────────────────────────────
+
+    def save_forecast_set(self, forecasts: ForecastSet) -> None:
+        """Keep what the engine said for a session, in place of anything it said for that session before.
+
+        The scores of what it said before go with it: they measured other numbers.
+        """
+        key = (forecasts.arm, forecasts.session_date.isoformat())
+        with self.transaction():
+            self._db.execute("DELETE FROM forecast_scores WHERE arm = ? AND session_date = ?", key)
+            self._db.execute(
+                "INSERT OR REPLACE INTO forecast_sets VALUES (?, ?, ?, ?, ?, ?)",
+                (*key, forecasts.run_id, forecasts.params_version, forecasts.seed, forecasts.model_dump_json()),
+            )
+
+    def forecast_set(self, arm: str, session: date) -> ForecastSet | None:
+        row = self._db.execute(
+            "SELECT set_json FROM forecast_sets WHERE arm = ? AND session_date = ?", (arm, session.isoformat())
+        ).fetchone()
+        return ForecastSet.model_validate_json(row["set_json"]) if row else None
+
+    def forecast_sets(self, arm: str) -> list[ForecastSet]:
+        """Everything the engine said for an arm, the oldest session first."""
+        rows = self._db.execute("SELECT set_json FROM forecast_sets WHERE arm = ? ORDER BY session_date", (arm,))
+        return [ForecastSet.model_validate_json(row["set_json"]) for row in rows]
+
+    def save_forecast_scores(self, scores: list[ForecastScore]) -> None:
+        with self.transaction():
+            for score in scores:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO forecast_scores VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (score.arm, score.session_date.isoformat(), score.ticker, score.sessions,
+                     score.matures_on.isoformat(), score.status, score.model_dump_json()),
+                )
+
+    def forecast_scores(self, arm: str) -> list[ForecastScore]:
+        rows = self._db.execute(
+            "SELECT score_json FROM forecast_scores WHERE arm = ? ORDER BY session_date, ticker, sessions", (arm,)
+        )
+        return [ForecastScore.model_validate_json(row["score_json"]) for row in rows]
 
     # ── What the books hold ──────────────────────────────────────────────
 

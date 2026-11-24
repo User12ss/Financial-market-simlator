@@ -342,6 +342,84 @@ function paintRandom(node, report) {
     ], random.picks)));
 }
 
+// What the forecast engine has on record. It is code, read from the journal: the evaluation report is not needed for it.
+const STATE = { calm: "平稳", turbulent: "动荡", crisis: "危机", single: "只有一种状态" };
+const WHOSE = { position: "账上的止损", analyst: "分析师提的", rule: "仓位规则算的" };
+const ahead = (label) => label.replace(/^(\d+) sessions?$/, "$1 个交易日后");
+// A bar's label has little room: "5 日" here is five sessions ahead, as the line above the bars says.
+const brief = (label) => label.replace(/^(\d+) sessions?$/, "$1 日");
+const threeRates = (side) => ["50", "80", "95"].map((band) => rate(side.coverage[band])).join(" / ");
+const pair = (first, second, digits) => `${num(first, digits)} / ${num(second, digits)}`;
+
+function coverageRows(tallies, side) {
+  return tallies.flatMap((tally) => ["50", "80", "95"].map((band) => ({
+    label: `${brief(tally.label)} · 中间 ${band}%`, value: tally[side].coverage[band], marker: Number(band) / 100,
+    note: `${tally.scored} 条预测`,
+  })));
+}
+
+function paintForecasts(node, forecasts) {
+  if (!forecasts || !forecasts.sessions || !forecasts.card) return;
+  const record = forecasts.card, latest = forecasts.latest;
+  node.append(card("预测对账",
+    "量化工程师是代码，不是模型。它在收盘会上给出每只股票 1、5、10、20 个交易日后的价格分布，到期后和实际结果对账。"
+    + "“朴素预测”只用历史波动率，引擎要比它好才算有用。这些预测现在不影响任何订单。",
+    el("div", { class: "kpis" },
+      tile("留档的预测", num(record.total), `来自 ${num(forecasts.sessions)} 场收盘会`),
+      tile("已经对账", num(record.scored), `${num(record.pending)} 条还没到期，${num(record.unpriced)} 条缺价格`)),
+    record.scored === 0 ? empty("预测都还没到期。最短的期限是 1 个交易日，下一场收盘会就开始对账。") : el("div", {},
+      el("p", { class: "small muted", text:
+        "预测靠得住的话，实际结果落在“中间 50%”里的次数应当接近一半，落在“中间 95%”里的应当接近 95%。条是实际比例，竖线是应有的比例。"
+        + "“5 日 · 中间 80%”指 5 个交易日后的那份预测的中间 80%。"
+        + "同一天做出的预测一起涨跌，所以预测日的个数比预测的条数更能说明证据有多少。" }),
+      el("div", { class: "grid cols-2" },
+        el("div", {}, el("h3", { text: "引擎" }), rateBars({
+          rows: coverageRows(record.by_horizon, "engine"), barName: "实际落在区间内", markerName: "应有的比例",
+          label: "引擎的预测：各期限、各区间实际覆盖了多少结果",
+        })),
+        el("div", {}, el("h3", { text: "朴素预测" }), rateBars({
+          rows: coverageRows(record.by_horizon, "naive"), barName: "实际落在区间内", markerName: "应有的比例",
+          label: "朴素预测：各期限、各区间实际覆盖了多少结果",
+        }))),
+      el("details", {}, el("summary", { text: "查看数据表" }), table([
+        { title: "期限", cell: (row) => ahead(row.label) },
+        { title: "已对账", num: true, cell: (row) => num(row.scored) },
+        { title: "预测日", num: true, cell: (row) => num(row.sessions) },
+        { title: "引擎：落在中间 50 / 80 / 95%", num: true, cell: (row) => threeRates(row.engine) },
+        { title: "朴素：落在中间 50 / 80 / 95%", num: true, cell: (row) => threeRates(row.naive) },
+        { title: "分位损失，引擎 / 朴素（越低越好）", num: true, cell: (row) => pair(row.engine.loss, row.naive.loss, 5) },
+        { title: "止损被触及", num: true, cell: (row) => `${num(row.stops_touched)} / ${num(row.stops)}` },
+        { title: "止损概率的 Brier 分，引擎 / 朴素（越低越好）", num: true, cell: (row) => pair(row.engine.brier, row.naive.brier, 3) },
+      ], record.by_horizon)))));
+
+  if (!latest) return;
+  const ten = (item) => item.horizons.find((horizon) => horizon.sessions === 10) || item.horizons[item.horizons.length - 1];
+  const book = latest.book && latest.book.positions ? latest.book.horizons.find((horizon) => horizon.sessions === 10) : null;
+  node.append(card("最近一次预测",
+    `${latest.session_date} 的收盘会 · 参数第 ${latest.params_version} 版（数据截到 ${latest.params_cutoff}）· `
+    + `${num(latest.paths)} 条模拟路径 · 随机种子 ${latest.seed}。凭这几样可以把这次预测一位不差地重算出来。`,
+    el("div", { class: "kpis" }, latest.states.map((name, at) => tile(
+      `市场状态：${STATE[name] || name}`, rate(latest.state_now[at]),
+      latest.state_ahead["10"] ? `10 个交易日后 ${rate(latest.state_ahead["10"][at])}` : null))),
+    table([
+      { title: "标的", cell: (row) => el("strong", { text: row.ticker }) },
+      { title: "收盘", num: true, cell: (row) => usd(row.close) },
+      { title: "10 个交易日后，一半的路径", num: true, cell: (row) => `${usd(ten(row).quantiles["25"])} – ${usd(ten(row).quantiles["75"])}` },
+      { title: "九成的路径", num: true, cell: (row) => `${usd(ten(row).quantiles["5"])} – ${usd(ten(row).quantiles["95"])}` },
+      { title: "止损", num: true, cell: (row) => (row.stop === null ? null : `${usd(row.stop)}（${WHOSE[row.stop_from] || row.stop_from}）`) },
+      { title: "途中触及止损", num: true, cell: (row) => rate(ten(row).stop_touch) },
+      { title: "先到名义目标", num: true, cell: (row) => rate(ten(row).target_first) },
+      { title: "观点给的倾斜和依据（原文）", said: true, cell: (row) => row.lean_basis || null },
+    ], latest.tickers, "这一场没有能预测的股票。"),
+    book ? el("p", { class: "small", text:
+      `组合照现在的 ${num(latest.book.positions)} 只持仓、之后不再交易来算：10 个交易日后净值九成落在 ${usd(book.equity["5"], 0)} 到 `
+      + `${usd(book.equity["95"], 0)}。同一天有两只以上触及止损的可能 ${rate(book.stops_together)}，触及回撤熔断 `
+      + `${rate(book.drawdown_breaker, 1)}，触及单日亏损熔断 ${rate(book.daily_loss_breaker, 1)}。` }) : null,
+    latest.problems.length ? el("div", {},
+      el("h3", { text: "没能预测的（原文）" }),
+      el("ul", { class: "plain said" }, latest.problems.map((problem) => el("li", { text: problem })))) : null));
+}
+
 function paintEvaluation(node, data, ctx) {
   node.append(el("h1", { text: "评估" }));
   if (!data.as_of) {
@@ -391,6 +469,8 @@ function paintEvaluation(node, data, ctx) {
   } else if (data.as_of) {
     node.append(empty("这份报告里没有这套模型配置。"));
   }
+
+  paintForecasts(node, data.forecasts);
 
   node.append(card("复盘写下的教训",
     data.lessons_shown ? "现在的设置：分析师写观点时会看到这些教训。" : "现在的设置：这些教训只是存着，没有给分析师看。",

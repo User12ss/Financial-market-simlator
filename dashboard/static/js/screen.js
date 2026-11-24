@@ -11,8 +11,8 @@ import { el, svg, clear, showTip, hideTip, usd, num } from "./dom.js";
 import { ticks } from "./charts.js";
 import { STEPS, lean, reached, stepText } from "./decisions.js";
 import {
-  BARS_ON_SCREEN, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, readings, readouts, sectors,
-  sinceText, sinceThen, sparkOf, sparkPath, yieldCurve,
+  BARS_ON_SCREEN, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, readings, readouts,
+  sectors, sinceText, sinceThen, sparkOf, sparkPath, yieldCurve,
 } from "./market.js";
 import { replay } from "./motion.js";
 
@@ -78,16 +78,20 @@ export function marketScreen({ personas }) {
   const foot = el("div", { class: "holo-foot" });
   const node = el("section", { class: "holo", "aria-label": "行情屏" }, head, body, foot);
 
-  /** A ticker's bars as candles. `levels` are the prices the record has put on it so far; `after` joins on what came later. */
-  function candleChart(ticker, before, later, levels, marks, { width, height }) {
+  /**
+   * A ticker's bars as candles. `levels` are the prices the record has put on it so far; `after` joins on what
+   * came later; `fan` is the quant engineer's forecast, once its line has been reached.
+   */
+  function candleChart(ticker, before, later, levels, marks, { width, height }, fan = null) {
     const inner = Math.max(120, width - GUTTER);
-    const drawn = plot(before, later, levels, { width: inner, height });
+    const drawn = plot(before, later, levels, { width: inner, height, fan });
     const inside = (price) => price <= drawn.high && price >= drawn.low;
     const today = drawn.candles[before.length - 1];
     const frame = svg("svg", {
       class: "candles", viewBox: `0 0 ${width} ${height}`, role: "img",
       "aria-label": `${ticker} 最近 ${before.length} 个交易日的日 K 线，这一场的收盘价 ${usd(today.close)}`
-        + (later.length ? `，后面接着之后 ${later.length} 个交易日` : ""),
+        + (later.length ? `，后面接着之后 ${later.length} 个交易日` : "")
+        + (drawn.fan ? `。右侧是预测的分布：${fanText(drawn.fan.points[drawn.fan.points.length - 1])}` : ""),
     });
     for (const price of ticks(drawn.low, drawn.high, 4).filter(inside)) {
       frame.append(svg("line", { class: "grid-line", x1: 0, x2: inner, y1: drawn.y(price), y2: drawn.y(price) }),
@@ -98,8 +102,26 @@ export function marketScreen({ personas }) {
         svg("line", { class: "cut", x1: drawn.cut, x2: drawn.cut, y1: 0, y2: height }),
         svg("text", { class: "cut-label", x: drawn.cut + 4, y: 10, text: "之后的实际走势（当时看不到）" }));
     }
+    // The forecast, under the candles: what was recorded afterwards is drawn over it, so the two can be compared.
+    if (drawn.fan) {
+      const { x, y, points } = drawn.fan;
+      const edge = (name) => points.map((point) => `L${point.x.toFixed(1)},${point[name].toFixed(1)}`).join(" ");
+      const back = (name) => [...points].reverse().map((point) => `L${point.x.toFixed(1)},${point[name].toFixed(1)}`).join(" ");
+      const far = points[points.length - 1];
+      frame.append(
+        svg("path", { class: "fan wide", d: `M${x.toFixed(1)},${y.toFixed(1)} ${edge("y95")} ${back("y5")} Z` }),
+        svg("path", { class: "fan half", d: `M${x.toFixed(1)},${y.toFixed(1)} ${edge("y75")} ${back("y25")} Z` }),
+        svg("path", { class: "fan-mid", d: `M${x.toFixed(1)},${y.toFixed(1)} ${edge("y50")}` }));
+      // Named on the chart while there is room: once the bars recorded afterwards are joined on, their own
+      // heading stands there, and the line under the chart says what the fan is.
+      if (drawn.cut === null) {
+        frame.append(
+          svg("text", { class: "fan-label", x: far.x, y: Math.max(9, far.y95 - 3), "text-anchor": "end", text: "九成的路径" }),
+          svg("text", { class: "fan-label", x: far.x, y: Math.max(9, far.y75 - 3), "text-anchor": "end", text: "一半" }));
+      }
+    }
     // How far the price usually moves in a day (the recorded ATR), as a band round the session's close.
-    if (marks.swing) {
+    if (marks.swing && !drawn.fan) {
       const top = Math.max(0, drawn.y(Math.min(drawn.high, marks.swing.high)));
       const base = Math.min(drawn.bottom, drawn.y(Math.max(drawn.low, marks.swing.low)));
       frame.append(svg("rect", {
@@ -137,6 +159,23 @@ export function marketScreen({ personas }) {
       strip.addEventListener("pointerleave", hideTip);
       frame.append(strip);
     });
+    // And one mark per horizon of the forecast, to point at for its recorded percentiles.
+    for (const point of drawn.fan ? drawn.fan.points : []) {
+      const mark = svg("circle", { class: "fan-dot", cx: point.x, cy: point.y50, r: 3.2, tabindex: 0, "aria-label": `预测，${fanText(point)}` });
+      const tip = (px, py) => showTip(px, py, `${ticker} · 预测 · ${point.sessions} 个交易日后`, [
+        { value: usd(point["95"]), name: "95% 的路径低于" }, { value: usd(point["75"]), name: "75%" },
+        { value: usd(point["50"]), name: "中位数" }, { value: usd(point["25"]), name: "25%" },
+        { value: usd(point["5"]), name: "5% 的路径低于" },
+      ]);
+      mark.addEventListener("pointermove", (pointer) => tip(pointer.clientX, pointer.clientY));
+      mark.addEventListener("pointerleave", hideTip);
+      mark.addEventListener("focus", () => {
+        const box = mark.getBoundingClientRect();
+        tip(box.left + box.width / 2, box.top);
+      });
+      mark.addEventListener("blur", hideTip);
+      frame.append(mark);
+    }
     return frame;
   }
 
@@ -166,7 +205,9 @@ export function marketScreen({ personas }) {
       })));
     }
     const later = since && item.after ? lastBars(item.after, Infinity).slice(0, AFTER_ON_SCREEN) : [];
-    const before = lastBars(item.bars, BARS_ON_SCREEN - later.length);
+    const fan = fanOf(ticker, context.events, context.index);
+    const ahead = fan ? fan.bands[fan.bands.length - 1].sessions : 0;
+    const before = lastBars(item.bars, BARS_ON_SCREEN - Math.max(later.length, ahead));
     // A level too far from the candles to be drawn among them is named under the chart instead.
     const far = plot(before, later, levels, SIZE).levels.filter((level) => level.off);
     const plotBox = el("div", { class: "holo-plot" });
@@ -176,11 +217,12 @@ export function marketScreen({ personas }) {
         el("span", { class: "read" }, el("small", { text: part.label }), el("b", { class: part.lean === "flat" ? null : part.lean, text: part.text })))),
       el("div", { class: "holo-notes" },
         far.map((level) => el("span", { class: `note-level ${level.kind}`, text: levelText(level) })),
+        fan ? el("span", { class: "note-fan", text: "扇形是量化工程师（代码）记录的预测：一种分布，不是会走出来的路线。" }) : null,
         since ? el("span", { class: `note-since ${since.lean}`, text: sinceText(since) }) : null,
         context.ended && !since ? el("span", { class: "muted", text: "这一场之后还没有新的交易日记录。" }) : null));
     // Drawn last, at the size the screen leaves for it once everything round it is in place.
     const wide = plotBox.clientWidth, tall = plotBox.clientHeight;
-    plotBox.append(candleChart(ticker, before, later, levels, gauges(item), wide > 40 && tall > 40 ? { width: wide, height: tall } : SIZE));
+    plotBox.append(candleChart(ticker, before, later, levels, gauges(item), wide > 40 && tall > 40 ? { width: wide, height: tall } : SIZE, fan));
   }
 
   /** The tickers on the portfolio manager's list, side by side, each with what was proposed for it. */
@@ -252,7 +294,10 @@ export function marketScreen({ personas }) {
     const about = focus.kind === "ticker" ? [focus.ticker] : focus.kind === "list" ? focus.tickers : [];
     const progress = about.map((ticker) => {
       const row = context.rows.get(ticker);
-      return row ? STEPS.map((name) => (reached(row[name], context.index) ? stepText(name, row[name], { upTo: context.index }) : "")).join("|") : "";
+      const steps = row ? STEPS.map((name) => (reached(row[name], context.index) ? stepText(name, row[name], { upTo: context.index }) : "")).join("|") : "";
+      // A forecast said for a ticker changes its chart too: the line it was said at is part of what is shown.
+      const fan = focus.kind === "ticker" ? fanOf(ticker, context.events || [], context.index) : null;
+      return `${steps}#${fan ? fan.index : ""}`;
     });
     return { about: JSON.stringify([state.market.run_id, focus]), all: JSON.stringify([state.market.run_id, focus, progress, context.ended]) };
   }

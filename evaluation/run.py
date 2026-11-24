@@ -28,6 +28,8 @@ from evaluation.prices import Prices
 from evaluation.report import to_markdown
 from evaluation.scoring import score_views, scorecard, standing_runs
 from evaluation.trades import summarize, trades_of
+from forecast.scoring import card as forecast_card
+from forecast.scoring import reconcile
 from journal.store import Journal, JournalError
 from models.evaluation import ArmEvaluation, Evaluation, RandomBenchmark, Scorecard, TradeSummary
 from models.signals import SignalTable, UsageSummary
@@ -97,6 +99,7 @@ def evaluate(
             symbols.update(table.candidates)
         symbols.update(row["ticker"] for row in journal.rows(
             "SELECT DISTINCT ticker FROM paper_fills WHERE account = ?", (arm,)))
+        symbols.update(forecast.ticker for forecasts in journal.forecast_sets(arm) for forecast in forecasts.tickers)
         if tables and (first is None or tables[0].session_date < first):
             first = tables[0].session_date
     prices = Prices.fetch(provider, symbols, first - timedelta(days=PRICE_LEAD_DAYS), as_of) if first else Prices({})
@@ -128,6 +131,17 @@ def evaluate(
                                   simulations=simulations, seed=seed)
 
         notes = caveats(card, summary, random)
+        # Forecasts are reconciled at each close meeting from that day's snapshot, which holds only the
+        # names under discussion that day. Here every name's prices are at hand, so none stays unpriced.
+        forecasts = None
+        if journal.forecast_sets(arm):
+            forecasts = forecast_card(arm, reconcile(journal, arm, prices.frame, as_of)[0])
+            if 0 < forecasts.scored < 400:
+                days = max(item.sessions for item in forecasts.by_horizon)
+                notes.append(
+                    f"{forecasts.scored} forecast(s) reconciled, made on {days} day(s). Forecasts made on the same "
+                    "day rise and fall together, so they say less than their number suggests."
+                )
         written = []
         if arm in reviewers:
             written, problems = write_lessons(
@@ -141,6 +155,7 @@ def evaluate(
             first_session=tables[0].session_date if tables else None,
             last_session=tables[-1].session_date if tables else None,
             sessions_run=len(tables), curves=curves, scorecard=card, trades=summary, random=random,
+            forecasts=forecasts,
             usage=usage_of(journal, arm), lessons_written=len(written), lessons_total=len(journal.lessons(arm)),
             notes=notes,
         ))
@@ -234,6 +249,9 @@ def main(argv: list[str] | None = None) -> int:
         if arm.random.percentile is not None:
             print(f"  its picks against random picks from the same candidates: better than "
                   f"{arm.random.percentile:.0f}% of {arm.random.simulations} outcomes, over {arm.random.entries} buy(s)")
+        if arm.forecasts is not None:
+            print(f"  forecasts: {arm.forecasts.scored} reconciled, {arm.forecasts.pending} not yet due, "
+                  f"{arm.forecasts.unpriced} without a price")
         if arm.lessons_written:
             print(f"  {arm.lessons_written} lesson(s) written")
     print(f"\n  {markdown}\n  {data}")

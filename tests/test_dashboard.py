@@ -222,7 +222,8 @@ def test_the_pages_own_logic_passes_its_tests():
     the strip of the day's meetings: tests/js, run by node."""
     files = sorted(path.name for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     assert files == ["checkin.test.mjs", "day.test.mjs", "decisions.test.mjs", "decisions_page.test.mjs",
-                     "dom.test.mjs", "format.test.mjs", "live.test.mjs", "market.test.mjs", "motion.test.mjs",
+                     "dom.test.mjs", "forecasts_page.test.mjs", "format.test.mjs", "live.test.mjs", "market.test.mjs",
+                     "motion.test.mjs",
                      "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "trail.test.mjs"]
     result = subprocess.run([NODE, "--test", *(f"tests/js/{name}" for name in files)],
                             cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -242,7 +243,7 @@ def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear
     assert (seat["bear"] - seat["bull"]) % 14 == 7
     assert (seat["portfolio_manager"], seat["judge"]) == (0, 7)
     assert [stage["id"] for stage in body["stages"]] == [
-        "briefing", "settle", "macro", "views", "debate", "proposals", "checks", "risk", "orders"]
+        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "orders"]
     assert all(figure["title"] and figure["does"] for figure in roster)
     # Each has the mark of its field and what it is a specialist in, and no two share a mark.
     assert all(figure["emblem"] and len(figure["craft"]) >= 3 for figure in roster)

@@ -58,6 +58,11 @@ MARKET_SERIES: list[tuple[str, str, str]] = [
     ("sectors", "Communication Services", "XLC"),
 ]
 
+# Market series whose daily bars are kept in the snapshot, not only their latest figures: the
+# index and the sector funds. The forecast engine works out each name's own move against them,
+# and a forecast can only be worked out again later if they were kept.
+KEPT_BARS: list[str] = ["^GSPC"] + [symbol for group, _, symbol in MARKET_SERIES if group == "sectors"]
+
 # FRED series: (id, name, unit, frequency, show year-over-year change).
 MACRO_SERIES: list[tuple[str, str, str, str, bool]] = [
     ("FEDFUNDS", "Effective federal funds rate", "%", "monthly", False),
@@ -143,6 +148,10 @@ class SnapshotBuilder:
             )
         if include_market:
             snapshot.market = self._market(bars, session, snapshot.issues)
+            snapshot.market_bars = {
+                symbol: _stored_bars(bars[symbol]) for symbol in KEPT_BARS
+                if symbol in bars and not bars[symbol].empty
+            }
         if include_macro:
             snapshot.macro = self._macro(session, snapshot.issues)
         return snapshot

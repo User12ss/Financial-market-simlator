@@ -265,6 +265,45 @@ def test_next_earnings_is_the_first_date_after_the_session(monkeypatch):
     assert YFinanceProvider().next_earnings("AAPL", date(2027, 6, 1)) is None
 
 
+def test_report_times_come_back_oldest_first_in_new_york_time_and_a_failure_is_a_data_error(monkeypatch):
+    """Past earnings reports, for the forecast engine: it needs the hour as well as the day."""
+    import yfinance
+
+    def source(answer):
+        class Ticker:
+            def __init__(self, symbol):
+                assert symbol == "COST"
+
+            def get_earnings_dates(self, limit):
+                assert limit == 100                      # as far back as the source goes
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        return Ticker
+
+    def times(index):
+        monkeypatch.setattr(yfinance, "Ticker", source(pd.DataFrame({"EPS Estimate": 1.0}, index=index)))
+        return [stamp.isoformat() for stamp in YFinanceProvider().earnings_reports("COST")]
+
+    # As the source gives them: the coming report first, in New York time.
+    given = pd.DatetimeIndex(["2026-12-10 16:00", "2026-09-24 16:00", "2026-03-05 06:30"], tz="America/New_York")
+    assert times(given) == ["2026-03-05T06:30:00-05:00", "2026-09-24T16:00:00-04:00", "2026-12-10T16:00:00-05:00"]
+    # A time in another zone is turned into New York's, and one that names no zone is taken to be New York's.
+    assert times(pd.DatetimeIndex(["2026-03-05 21:00"], tz="UTC")) == ["2026-03-05T16:00:00-05:00"]
+    assert times(pd.DatetimeIndex(["2026-03-05 16:00"])) == ["2026-03-05T16:00:00-05:00"]
+
+    for nothing in (None, pd.DataFrame()):
+        monkeypatch.setattr(yfinance, "Ticker", source(nothing))
+        assert YFinanceProvider().earnings_reports("COST") == []
+    # The source's calendar page can only be read with lxml installed: said as such, not as a crash.
+    monkeypatch.setattr(yfinance, "Ticker", source(ImportError("Missing optional dependency 'lxml'.")))
+    with pytest.raises(DataError, match="earnings dates need a package that is not installed: Missing optional dependency 'lxml'"):
+        YFinanceProvider().earnings_reports("COST")
+    monkeypatch.setattr(yfinance, "Ticker", source(RuntimeError("Too Many Requests")))
+    with pytest.raises(DataError, match="earnings dates failed for COST: Too Many Requests"):
+        YFinanceProvider().earnings_reports("COST")
+
+
 # ── Quality checks ───────────────────────────────────────────────────────────
 
 def codes(issues, severity=None):

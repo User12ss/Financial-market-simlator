@@ -26,7 +26,9 @@ from dashboard.personas import STAGES, title_of
 from data.ledger import Ledger
 from data.models import Bars, Snapshot
 from journal.store import COMPLETED
+from forecast.scoring import card as forecast_card
 from models.evaluation import Evaluation
+from models.forecast import ForecastScore, ForecastSet
 from models.signals import SignalTable
 from risk.gate import halted
 
@@ -557,13 +559,14 @@ class Reader:
                         "outcome": lesson["outcome"], "assessment": lesson["assessment"], "lesson": lesson["lesson"],
                         "clean": bool(row["clean"]), "warnings": lesson.get("data_warnings", []),
                     })
+        forecasts = self.forecasts(arm)
         if evaluation is None:
             return {"arm": arm, "report": None, "arms": [], "lessons": lessons,
-                    "lessons_shown": config.PIPELINE_USE_LESSONS}
+                    "lessons_shown": config.PIPELINE_USE_LESSONS, "forecasts": forecasts}
         mine = next((item for item in evaluation.arms if item.arm == arm), None)
         return {
             "arm": arm, "as_of": evaluation.as_of.isoformat(), "created_at": evaluation.created_at.isoformat(),
-            "benchmark": evaluation.benchmark, "file": str(path),
+            "benchmark": evaluation.benchmark, "file": str(path), "forecasts": forecasts,
             "report": None if mine is None else mine.model_dump(mode="json"),
             # One line per model configuration, to set them side by side.
             "arms": [
@@ -578,6 +581,38 @@ class Reader:
                 for item in evaluation.arms
             ],
             "lessons": lessons, "lessons_shown": config.PIPELINE_USE_LESSONS,
+        }
+
+    def forecasts(self, arm: str) -> dict:
+        """What the forecast engine has on record for an arm: how its distributions held up, and what it last said.
+
+        Read from the journal, where each close meeting of the desk keeps its
+        forecasts and reconciles the ones that came due. Nothing is worked
+        out here beyond counting the scores on record.
+        """
+        nothing = {"arm": arm, "sessions": 0, "card": None, "latest": None}
+        with self._db() as db:
+            tables = {row["name"] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('forecast_sets', 'forecast_scores')")}
+            if "forecast_sets" not in tables:
+                return nothing
+            sessions = db.execute("SELECT COUNT(*) FROM forecast_sets WHERE arm = ?", (arm,)).fetchone()[0]
+            last = db.execute(
+                "SELECT set_json FROM forecast_sets WHERE arm = ? ORDER BY session_date DESC LIMIT 1", (arm,)).fetchone()
+            rows = db.execute("SELECT score_json FROM forecast_scores WHERE arm = ?", (arm,)).fetchall() \
+                if "forecast_scores" in tables else []
+        if not sessions:
+            return nothing
+        try:
+            scores = [ForecastScore.model_validate_json(row["score_json"]) for row in rows]
+            latest = ForecastSet.model_validate_json(last["set_json"])
+        except ValueError:
+            return nothing                          # written by another version of the program
+        return {
+            "arm": arm, "sessions": sessions, "card": forecast_card(arm, scores).model_dump(mode="json"),
+            # The percentiles kept for scoring are of no use to a page.
+            "latest": latest.model_dump(
+                mode="json", exclude={"tickers": {"__all__": {"horizons": {"__all__": {"grid", "naive_grid"}}}}}),
         }
 
     # ── How decisions changed from session to session ────────────────────

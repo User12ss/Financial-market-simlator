@@ -152,6 +152,11 @@ class Snapshot(BaseModel):
     session_date: date = Field(description="Last completed trading session at capture time")
     tickers: dict[str, TickerSnapshot] = Field(default_factory=dict)
     market: list[MarketPoint] = Field(default_factory=list)
+    market_bars: dict[str, Bars] = Field(
+        default_factory=dict,
+        description="Daily bars of the index and the sector funds, by symbol: what the forecast engine reads the "
+                    "market's and the sectors' moves from. Empty in snapshots taken before it existed.",
+    )
     macro: list[MacroPoint] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list, description="Problems not tied to one ticker")
 

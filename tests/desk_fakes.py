@@ -85,6 +85,7 @@ def make_desk(tmp_path, llm=None, market=None, news=None, clock=None, arm=ARM) -
         Arm(arm, llm or desk_llm()), journal=Journal(tmp_path / "journal.sqlite3"),
         ledger=Ledger(tmp_path / "ledger.sqlite3"), builder=builder, universe=UNIVERSE,
         runs_dir=tmp_path / "runs", snapshot_dir=tmp_path / "snapshots", now=clock,
+        forecast_dir=tmp_path / "forecast",
     )
     desk.clock, desk.news, desk.llm = clock, news, desk.arm.llm
     return desk

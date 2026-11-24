@@ -23,6 +23,11 @@ A short job runs `tick` every few minutes. Each round does two things:
             close it is the close meeting: the daily pipeline's seven stages,
             with the headlines taken from the ledger and what the day's
             check-ins noted put in front of the analyst and the manager.
+            After the analyst's views the quant engineer's seat (plain code,
+            pipeline.quant) gives the forecast engine's distribution for
+            each name and for the book, and reconciles the forecasts that
+            came due. That is recorded and goes no further: no model is
+            shown it and no order depends on it.
 
 Every meeting has a cut-off. Nothing the ledger first saw after it is shown
 to a model in that meeting.
@@ -47,6 +52,8 @@ from data.render import render_ticker
 from data.snapshot import HEADLINES_PER_TICKER, SnapshotBuilder
 from journal.store import COMPLETED, Journal
 from models.signals import CheckinRecord, Event, UsageSummary
+from forecast.params import ParamStore
+from pipeline import quant
 from pipeline import universe as universe_rules
 from pipeline.checkin import NEW_YORK, Checkin, CheckinResult, clock
 from pipeline.daily import Arm, DailyPipeline, RunResult, _alive_elsewhere, _print_event
@@ -134,9 +141,11 @@ class _DeskClose(DailyPipeline):
     found is put in front of the analyst and the portfolio manager.
     """
 
-    def __init__(self, *args, ledger: Ledger, **kwargs) -> None:
+    def __init__(self, *args, ledger: Ledger, forecast_dir: str | Path | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.ledger = ledger
+        self.params = ParamStore(forecast_dir)
+        self._forecasts: dict[str, tuple] = {}       # by run: the forecast and its waiting rows, kept when the run finishes
         self.as_of: datetime | None = None
         self._since: datetime | None = None
         self._checkins: list[CheckinRecord] = []
@@ -175,6 +184,31 @@ class _DeskClose(DailyPipeline):
             lines += ["- Earlier today at the desk (your own updates at the day's check-ins):"] + notes
         return "\n".join(lines)
 
+    def _after_views(self, run, account, positions, views) -> None:
+        """The quant engineer's turn. What it says is recorded, and nothing after it is given any of it."""
+        if not config.FORECAST_ENABLED:
+            return
+        try:
+            turn = quant.speak(
+                self.journal, run.arm.name, run.run_id, run.data.snapshot, account, positions, views,
+                provider=self.builder.market, universe=self.universe, now=self._now(), store=self.params,
+            )
+            # Made ready here, inside the same guard: whatever could fail in writing it down fails now.
+            held = quant.ready(turn.forecasts) if turn.forecasts is not None else None
+        except Exception as e:  # a forecast that fails must not cost the meeting its decisions
+            turn, held = quant.Turn([quant.problem_line(f"No forecast at this meeting: {type(e).__name__}: {e}")]), None
+        for line in turn.lines:
+            self._say(run, quant.STAGE, quant.QUANT, "all", line.kind, ticker=line.ticker, remark=line.remark,
+                      payload=line.payload)
+        # Said now, kept later: the forecast goes on record when the meeting is recorded as finished.
+        if held is not None:
+            self._forecasts[run.run_id] = held
+
+    def _finishing(self, run) -> None:
+        held = self._forecasts.pop(run.run_id, None)
+        if held is not None:
+            quant.keep(self.journal, *held)
+
     def manager_briefing(self, candidates, holdings, waiting, views, debates, regime) -> str:
         text = DailyPipeline.manager_briefing(candidates, holdings, waiting, views, debates, regime)
         noted = [
@@ -199,13 +233,14 @@ class Desk:
         snapshot_dir: str | Path | None = None,
         now: Callable[[], datetime] | None = None,
         on_event: Callable[[Event], None] | None = None,
+        forecast_dir: str | Path | None = None,
     ) -> None:
         self.arm = arm
         self.journal = journal or Journal()
         self.ledger = ledger or Ledger()
         self.builder = builder or SnapshotBuilder()
         self.universe = universe if universe is not None else universe_rules.load_universe()
-        self.runs_dir, self.snapshot_dir = runs_dir, snapshot_dir
+        self.runs_dir, self.snapshot_dir, self.forecast_dir = runs_dir, snapshot_dir, forecast_dir
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._on_event = on_event
 
@@ -378,7 +413,7 @@ class Desk:
         pipeline = _DeskClose(
             [self.arm], builder=self.builder, journal=self.journal, universe=self.universe,
             runs_dir=self.runs_dir, snapshot_dir=self.snapshot_dir, now=self._now, on_event=self._on_event,
-            ledger=self.ledger,
+            ledger=self.ledger, forecast_dir=self.forecast_dir,
         )
         result = pipeline.run()[0]
         if result.run_id and result.status != "skipped" and pipeline.as_of is not None:

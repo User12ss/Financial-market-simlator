@@ -196,6 +196,41 @@ DESK_HEADLINES_SHOWN: int = int(os.getenv("DESK_HEADLINES_SHOWN", "8"))
 DESK_MOVE_ATR: float = float(os.getenv("DESK_MOVE_ATR", "1.0"))
 DESK_MOVE_PCT: float = float(os.getenv("DESK_MOVE_PCT", "3.0"))
 
+# --- The forecast engine (plain code, no model is called; it places and changes no order) ---
+# At the desk's close meeting the quant engineer's seat says what the price of each name under
+# discussion may do over the next 1, 5, 10 and 20 sessions, as a distribution: a Markov chain for
+# the market's state, and for each name a diffusion with jumps around it. Every forecast is kept
+# and set against what happened once its horizon has ended.
+FORECAST_ENABLED: bool = os.getenv("FORECAST_ENABLED", "true").strip().lower() == "true"
+# Where each week's parameters are kept, one file per version.
+FORECAST_DIR: str = os.getenv("FORECAST_DIR", "").strip() or str(PROJECT_ROOT / "data_store" / "forecast")
+# Paths simulated for every name at every meeting.
+FORECAST_PATHS: int = int(os.getenv("FORECAST_PATHS", "10000"))
+# States of the market (2: calm and turbulent; 3 adds crisis).
+FORECAST_STATES: int = int(os.getenv("FORECAST_STATES", "2"))
+# Years of daily bars the estimate reads: the index for the states, each name for everything else.
+FORECAST_MARKET_YEARS: int = int(os.getenv("FORECAST_MARKET_YEARS", "20"))
+FORECAST_HISTORY_YEARS: int = int(os.getenv("FORECAST_HISTORY_YEARS", "5"))
+# Volatility is an exponentially weighted average of squared daily moves; this is the weight on yesterday's.
+FORECAST_EWMA_LAMBDA: float = float(os.getenv("FORECAST_EWMA_LAMBDA", "0.94"))
+# A day's own move beyond this many of its expected standard deviations counts as a jump, not as ordinary noise.
+FORECAST_JUMP_SIGMAS: float = float(os.getenv("FORECAST_JUMP_SIGMAS", "4.0"))
+# With fewer past report days than this, a name's earnings moves are drawn from its whole sector's.
+FORECAST_MIN_EARNINGS: int = int(os.getenv("FORECAST_MIN_EARNINGS", "8"))
+# A name's own average daily return counts for days / (days + this) of itself: with five years
+# of bars, a fifth. An average from a few hundred days is mostly noise.
+FORECAST_DRIFT_SHRINK_DAYS: int = int(os.getenv("FORECAST_DRIFT_SHRINK_DAYS", "5040"))
+# No seat names a price target yet. Until one does, "target before stop" is asked of a notional
+# target this many times as far above the close as the stop is below it.
+FORECAST_TARGET_R: float = float(os.getenv("FORECAST_TARGET_R", "2.0"))
+# How a record earns a say (the only way a model's words become a number in the simulation):
+# nothing below this many scored cases; a hit rate has to clear a coin toss by this many
+# standard errors; and an analyst's lean may shift a name's drift by at most this share of
+# its volatility over the view's horizon.
+FORECAST_TRACK_MIN: int = int(os.getenv("FORECAST_TRACK_MIN", "200"))
+FORECAST_TRACK_Z: float = float(os.getenv("FORECAST_TRACK_Z", "1.64"))
+FORECAST_TILT_CAP: float = float(os.getenv("FORECAST_TILT_CAP", "0.25"))
+
 # --- Dashboard ---
 # A read-only web page over the journal: python -m dashboard. By default it
 # listens on this machine only. It has no login, so do not point it at a

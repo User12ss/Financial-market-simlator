@@ -5,6 +5,7 @@ from __future__ import annotations
 import config
 from evaluation.trades import how_it_ended
 from models.evaluation import ArmEvaluation, Curve, Evaluation, Slice, Tally, Trade
+from models.forecast import COVERAGES, ForecastCard, Reliability
 
 
 def _pct(value: float | None, signed: bool = True) -> str:
@@ -63,6 +64,43 @@ def _slices(title: str, slices: list[Slice]) -> list[str]:
         return []
     parts = ", ".join(f"{item.label} {_usd(item.pnl_usd)} ({item.trades})" for item in slices)
     return [f"- {title}: {parts}"]
+
+
+def _coverage(side: Reliability) -> str:
+    return " / ".join(_rate(side.coverage.get(name)) for name in COVERAGES)
+
+
+def _forecasts(card: ForecastCard) -> list[str]:
+    out = [
+        "### Forecasts", "",
+        f"{card.scored} of {card.total} forecast(s) reconciled; {card.pending} not yet due, {card.unpriced} without a "
+        "price. A forecast is a distribution of where the price will be, so it is measured by where the outcome fell "
+        "in it: an honest one has the outcome inside its middle 50% about half the time, inside its middle 80% four "
+        "times in five, inside its middle 95% nineteen times in twenty. The plain forecast uses historical volatility "
+        "and nothing else; the engine has to do better than it to be worth having.", "",
+    ]
+    if not card.by_horizon:
+        return out + ["No forecast has reached the end of its horizon yet.", ""]
+    out += [
+        "| Ahead | Reconciled | Made on | Engine: inside 50 / 80 / 95% | Plain: inside 50 / 80 / 95% | "
+        "Pinball loss, engine / plain | Stops touched | Brier of the stop chance, engine / plain |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for item in card.by_horizon:
+        def pair(first: float | None, second: float | None, digits: int) -> str:
+            return " / ".join("n/a" if value is None else format(value, f".{digits}f") for value in (first, second))
+
+        out.append(
+            f"| {item.label} | {item.scored} | {item.sessions} day(s) | {_coverage(item.engine)} | "
+            f"{_coverage(item.naive)} | {pair(item.engine.loss, item.naive.loss, 5)} | "
+            f"{item.stops_touched} of {item.stops} | {pair(item.engine.brier, item.naive.brier, 3)} |"
+        )
+    return out + [
+        "",
+        "Pinball loss and the Brier score are both better when lower. Forecasts made on the same day share that "
+        "day's market, so the count of days says more about how much evidence this is than the count of forecasts.",
+        "",
+    ]
 
 
 def _arm(arm: ArmEvaluation, benchmark: str) -> list[str]:
@@ -177,6 +215,9 @@ def _arm(arm: ArmEvaluation, benchmark: str) -> list[str]:
             "after that day's close. The other orders the account placed that day are not counted, and the limits "
             "are today's settings, not necessarily those of the day.", "",
         ]
+
+    if arm.forecasts is not None:
+        out += _forecasts(arm.forecasts)
 
     usage = arm.usage
     cost = "no per-token cost (local model)" if usage.cost_usd is None else f"about ${usage.cost_usd:,.2f}"
