@@ -103,6 +103,57 @@ def _forecasts(card: ForecastCard) -> list[str]:
     ]
 
 
+def _worked_back(record: dict) -> list[str]:
+    counts, events = record["endings"], record["events"]
+    out = [
+        "### Trades worked back", "",
+        f"{counts['scored']} ending(s) reconciled; {counts['pending']} not yet due, {counts['unpriced']} without a "
+        "price. For every holding and every name the analyst would own, the simulation says how often the trade ends "
+        "at its target, at its stop, or at neither within its horizon. Once the horizon has ended the daily bars say "
+        "which it was, and the three chances are scored against it: a Brier score, 0 for a certain and correct call, "
+        "2 for a certain and wrong one. \"With the proposed events\" is the same simulation with the scenario "
+        "analyst's events put in, for the names that had any: if its score is not the better one, those events made "
+        "the chances worse. The plain forecast uses historical volatility and nothing else.", "",
+    ]
+    rows = [(name, record["outcomes"].get(key)) for key, name in
+            (("measured", "The simulation alone"), ("rehearsed", "With the proposed events"))]
+    if not any(row for _, row in rows):
+        out += ["No trade worked back has reached the end of its horizon yet.", ""]
+    else:
+        out += [
+            "| Reading | Reconciled | Made on | Ended at target / stop / neither | Chance given, on average | "
+            "Brier score | Plain forecast's |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for name, row in rows:
+            if not row:
+                continue
+            ended, given = row["ended"], row["mean_chance"]
+            plain = "n/a" if row["plain_brier"] is None else f"{row['plain_brier']:.3f}"
+            out.append(
+                f"| {name} | {row['scored']} | {row['sessions']} day(s) | {ended['good']} / {ended['bad']} / "
+                f"{ended['middle']} | {given['good'] * 100:.0f}% / {given['bad'] * 100:.0f}% / "
+                f"{given['middle'] * 100:.0f}% | {row['brier']:.3f} | {plain} |"
+            )
+        out.append("")
+    if events["proposed"]:
+        text = (f"The scenario analyst proposed {events['proposed']} event(s): {events['scored']} judged, "
+                f"{events['pending']} waiting, {events['cannot_be_judged']} that code cannot judge and that are "
+                "never scored.")
+        if events.get("unread"):
+            text += (f" {events['unread']} more wait for a reading of the name's headlines that covers their days "
+                     "without a gap: without one, nothing says whether they happened.")
+        if events["scored"]:
+            text += (f" Of those judged, {events['happened']} happened; they were given "
+                     f"{events['mean_probability'] * 100:.0f}% on average. Brier score {events['brier']:.3f}, where "
+                     "always saying 50% scores 0.250.")
+        out += [text, ""]
+    return out + [
+        "Trades worked back on the same day share that day's market, so the count of days says more about how much "
+        "evidence this is than the count of trades.", "",
+    ]
+
+
 def _arm(arm: ArmEvaluation, benchmark: str) -> list[str]:
     out = [f"## {arm.arm}", ""]
     if not arm.sessions_run:
@@ -218,6 +269,8 @@ def _arm(arm: ArmEvaluation, benchmark: str) -> list[str]:
 
     if arm.forecasts is not None:
         out += _forecasts(arm.forecasts)
+    if arm.worked_back is not None:
+        out += _worked_back(arm.worked_back)
 
     usage = arm.usage
     cost = "no per-token cost (local model)" if usage.cost_usd is None else f"about ${usage.cost_usd:,.2f}"

@@ -44,7 +44,23 @@ _NORMAL = NormalDist()
 DAYS = max(HORIZONS)
 # A name needs this many daily returns in the snapshot for its volatility today to mean anything.
 MIN_BARS = BURN_IN + 40
-_NEVER = DAYS + 1
+NEVER = DAYS + 1
+_NEVER = NEVER
+# A proposed event is sized by the name's own past jumps when it has this many, else by its sector's too.
+MIN_EVENT_POOL = 10
+
+
+@dataclass
+class Proposed:
+    """An event a seat proposed for one name. A judgement, not a measurement: it is simulated only when asked for."""
+
+    key: str
+    first: int              # the first simulated day it may fall on: 0 is the next session
+    last: int               # the last
+    probability: float
+    direction: int          # +1 up, -1 down
+    low: float              # the smallest move it would make, as a log return above zero
+    high: float             # the largest
 
 
 @dataclass
@@ -63,6 +79,27 @@ class Subject:
     lean: float = 0.0                       # see forecast.weights.lean; signed by the direction here
     lean_basis: str = ""
     shares: int = 0
+    target: float | None = None             # a target someone named: without one, a notional one stands in
+    events: list[Proposed] = field(default_factory=list)
+
+
+@dataclass
+class Trace:
+    """One name's simulated paths, kept so they can be read backwards from how they end (forecast.backward)."""
+
+    ticker: str
+    path: np.ndarray                # log price at each day's close, from the meeting's close
+    lowest: np.ndarray              # the lowest point reached by each day's close
+    stopped: np.ndarray             # the first day the stop was touched, or NEVER
+    reached: np.ndarray             # the first day the target was reached, or NEVER
+    sold: np.ndarray | None         # where a touched stop sold: the stop, or the open that passed it
+    jumps: np.ndarray               # its own unannounced jump on each day, 0 where there was none
+    report_index: int | None        # the simulated day that reacts to its earnings report, when modelled
+    report_move: np.ndarray | None  # that day's move at the open, in units of the volatility expected for it
+    fund_jumps: np.ndarray | None   # its sector fund's own jump on each day
+    events: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)   # by key: the day it fell on or NEVER, its size
+    left_out: dict[str, str] = field(default_factory=dict)     # proposed events that could not be simulated, and why
+    capped: dict[str, float] = field(default_factory=dict)     # those whose range was cut to the largest past jump: that jump
 
 
 @dataclass
@@ -70,6 +107,9 @@ class Book:
     cash: float
     equity: float
     high_water: float
+    # Names held that the snapshot has no usable price for, and the value the account carries each at. They
+    # cannot be subjects, and still count in the book.
+    unpriced: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -100,6 +140,10 @@ class Result:
     tickers: list[TickerForecast] = field(default_factory=list)
     book: BookForecast | None = None
     problems: list[str] = field(default_factory=list)
+    # Kept only when asked for (`trace`): the paths behind the forecasts.
+    traces: dict[str, Trace] = field(default_factory=dict)
+    states: np.ndarray | None = None        # the market's state on each simulated day
+    market: np.ndarray | None = None        # the market's log level at each day's close, from the meeting's close
 
 
 def stream(seed: int, label: str) -> np.random.Generator:
@@ -230,12 +274,14 @@ def naive_stop_touch(vol: float, sessions: int, level: float) -> float:
 def run(
     params: Params, session: date, market: pd.Series, funds: dict[str, pd.Series], subjects: list[Subject], *,
     seed: int, paths: int | None = None, book: Book | None = None, target_r: float | None = None,
+    trace: bool = False,
 ) -> Result:
     """Forecast every subject, and the book when one is given.
 
     `market` and `funds` are daily log returns by session from the meeting's
     snapshot. A subject that cannot be forecast is named in the result's
-    problems with the reason, and nothing stands in for it.
+    problems with the reason, and nothing stands in for it. With `trace` the
+    simulated paths are kept on the result, for reading them backwards.
     """
     paths = config.FORECAST_PATHS if paths is None else paths
     target_r = config.FORECAST_TARGET_R if target_r is None else target_r
@@ -288,7 +334,7 @@ def run(
     unsimulated: list[Subject] = []
     for subject in sorted(subjects, key=lambda s: s.ticker):
         try:
-            forecast, path, opened, stopped = _one(
+            forecast, path, opened, stopped, kept = _one(
                 params, session, subject, market, fund_path, shared, seed=seed, paths=paths, target_r=target_r,
             )
         except ForecastError as e:
@@ -297,12 +343,32 @@ def run(
                 unsimulated.append(subject)
             continue
         result.tickers.append(forecast)
+        if trace:
+            result.traces[subject.ticker] = kept
         if subject.shares > 0:
             held.append((subject, path, opened, stopped))
 
     if book is not None:
         result.book = _book(book, held, unsimulated, paths)
+    if trace:
+        result.states, result.market = states, np.cumsum(market_path, axis=1)
     return result
+
+
+def _event_pool(params: Params, series: SeriesParams) -> np.ndarray:
+    """The sizes a proposed event is drawn from: the name's own past jumps, with its sector's when it has few.
+
+    A name and a sector that never jumped in the sample are sized by every
+    name's jumps in the estimate: a quiet past is no reason to think the
+    name cannot jump, and nothing else says how far.
+    """
+    pool = [abs(move) for move in series.jumps]
+    if len(pool) < MIN_EVENT_POOL and series.sector:
+        pool += [abs(move) for other in params.series.values()
+                 if other.sector == series.sector and other.ticker != series.ticker for move in other.jumps]
+    if not pool:
+        pool = [abs(move) for other in params.series.values() for move in other.jumps]
+    return np.array(sorted(pool))
 
 
 def _one(
@@ -339,11 +405,23 @@ def _one(
         gap = np.where(gapped, np.array(series.jumps)[rng.integers(0, len(series.jumps), (paths, DAYS))], 0.0)
     report_on, report_index = _report_day(series, subject, session)
     modelled = report_index is not None and bool(series.earnings)
+    report_move = None
     if modelled:
-        gap[:, report_index] = vol * np.array(series.earnings)[rng.integers(0, len(series.earnings), paths)]
+        report_move = np.array(series.earnings)[rng.integers(0, len(series.earnings), paths)]
+        gap[:, report_index] = vol * report_move
         gapped[:, report_index] = True
     elif report_index is not None:
         notes.append(f"An earnings report moves the session of {report_on}, inside the horizon, and is not modelled.")
+    jumps = gap.copy()
+    if modelled:
+        jumps[:, report_index] = 0.0
+    events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    left_out: dict[str, str] = {}
+    capped: dict[str, float] = {}
+    if subject.events:
+        gap, gapped, jumps, events, left_out, capped = _proposed(
+            params, series, subject, gap, gapped, jumps, report_index if modelled else None, seed, paths,
+        )
     own = np.where(gapped, 0.0, own)
 
     fund_vol = fund.vol if fund else 0.0
@@ -375,16 +453,22 @@ def _one(
     stop = subject.stop if subject.stop and 0 < subject.stop < subject.close else None
     if subject.stop and stop is None:
         notes.append(f"The stop {subject.stop:,.2f} is not below the close {subject.close:,.2f}: nothing is said about it.")
-    target = break_even = None
+    target = break_even = named = sold = None
     stopped = np.full(paths, _NEVER)
     reached = np.full(paths, _NEVER)
     if stop is not None:
         stop_level = math.log(stop / subject.close)
         stopped = _first(low <= stop_level)
-        target = round(subject.close + target_r * (subject.close - stop), 2)
+        named = subject.target if subject.target and subject.target > subject.close else None
+        if subject.target and named is None:
+            notes.append(f"The target {subject.target:,.2f} is not above the close {subject.close:,.2f}: "
+                         "a notional one stands in.")
+        target = round(named if named else subject.close + target_r * (subject.close - stop), 2)
         target_level = math.log(target / subject.close)
         reached = _first(high >= target_level)
         break_even = (subject.close - stop) / (target - stop)
+        # A touched stop sells at the stop, or at the open when the price opened through it.
+        sold = np.minimum(stop_level, opened[np.arange(paths), np.minimum(stopped, DAYS - 1)])
 
     history = subject.returns.to_numpy()
     naive_vol = float(np.std(history))
@@ -408,21 +492,78 @@ def _one(
     forecast = TickerForecast(
         ticker=subject.ticker, close=subject.close, beta=round(series.beta, 4), sector=series.sector,
         own_vol=vol, daily_vol=daily_vol, naive_vol=naive_vol, stop=stop, stop_from=subject.stop_from if stop else "",
-        target=target, break_even=break_even, direction=subject.direction, confidence=subject.confidence,
-        view_horizon=subject.view_horizon, lean=lean, lean_basis=subject.lean_basis, report_on=report_on,
-        report_modelled=modelled, notes=notes, horizons=horizons,
+        target=target, target_from="named" if named else "", break_even=break_even, direction=subject.direction,
+        confidence=subject.confidence, view_horizon=subject.view_horizon, lean=lean, lean_basis=subject.lean_basis,
+        report_on=report_on, report_modelled=modelled, notes=notes, horizons=horizons,
     )
-    return forecast, path, opened, stopped
+    kept = Trace(
+        ticker=subject.ticker, path=path, lowest=lowest, stopped=stopped, reached=reached, sold=sold, jumps=jumps,
+        report_index=report_index if modelled else None, report_move=report_move,
+        fund_jumps=fund.gap if fund is not None else None, events=events, left_out=left_out, capped=capped,
+    )
+    return forecast, path, opened, stopped, kept
+
+
+def _proposed(
+    params: Params, series: SeriesParams, subject: Subject, gap: np.ndarray, gapped: np.ndarray, jumps: np.ndarray,
+    report_index: int | None, seed: int, paths: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict, dict, dict]:
+    """Put the events a seat proposed for a name on its paths.
+
+    Each happens or not on each path by its own stated probability, on a day
+    drawn evenly from its dates. Its size is drawn from past jumps, in the
+    direction stated, and held inside the stated range; a range that reaches
+    beyond the largest past jump is cut to it, and that is noted. On a day
+    such an event falls, no unannounced jump is drawn as well, so one day
+    does not carry two; an earnings report on that day still counts.
+
+    The events are taken to be independent of one another and of everything
+    else. Each draws from a stream named after it, so a name's other draws
+    are what they are without it.
+    """
+    pool = _event_pool(params, series)
+    events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    left_out: dict[str, str] = {}
+    capped: dict[str, float] = {}
+    seat = np.zeros((paths, DAYS))
+    hit = np.zeros((paths, DAYS), dtype=bool)
+    rows = np.arange(paths)
+    for event in subject.events:
+        first, last = max(event.first, 0), min(event.last, DAYS - 1)
+        if first > last:
+            left_out[event.key] = "its dates lie outside the simulated days."
+            continue
+        if not len(pool):
+            left_out[event.key] = "no name in the estimate has a past jump to size it by."
+            continue
+        rng = stream(seed, f"event {subject.ticker} {event.key}")
+        happens = rng.random(paths) < event.probability
+        day = rng.integers(first, last + 1, paths)
+        largest = float(pool[-1])
+        if event.high > largest:
+            capped[event.key] = largest
+        ceiling = min(event.high, largest)
+        size = event.direction * np.clip(pool[rng.integers(0, len(pool), paths)], min(event.low, ceiling), ceiling)
+        seat[rows[happens], day[happens]] += size[happens]
+        hit[rows[happens], day[happens]] = True
+        events[event.key] = (np.where(happens, day, NEVER), np.where(happens, size, 0.0))
+    report = np.zeros((1, DAYS), dtype=bool)
+    if report_index is not None:
+        report[0, report_index] = True
+    gap = np.where(hit, np.where(report, gap, 0.0) + seat, gap)
+    return gap, gapped | hit, np.where(hit, 0.0, jumps), events, left_out, capped
 
 
 def _book(book: Book, held: list, unsimulated: list[Subject], paths: int) -> BookForecast:
     """What the book as it stands may be worth, taking each stop as it is touched and trading nothing else.
 
     A holding that could not be simulated is counted at its last close
-    throughout, and named: leaving it out would understate the book.
+    throughout, and named: leaving it out would understate the book. So is
+    one the snapshot has no usable price for, at the value the account
+    carries it at.
     """
     limits_drawdown = book.high_water * (1 - config.RISK_MAX_DRAWDOWN_PCT / 100)
-    frozen = sum(subject.shares * subject.close for subject in unsimulated)
+    frozen = sum(subject.shares * subject.close for subject in unsimulated) + sum(book.unpriced.values())
     values = np.full((paths, DAYS), book.cash + frozen)
     stops_on = np.zeros((paths, DAYS), dtype=np.int64)
     for subject, path, opened, stopped in held:
@@ -451,8 +592,10 @@ def _book(book: Book, held: list, unsimulated: list[Subject], paths: int) -> Boo
             daily_loss_breaker=float(lost[:, :sessions].any(axis=1).mean()),
         ))
     return BookForecast(
-        equity=book.equity, cash=book.cash, high_water=book.high_water, positions=len(held) + len(unsimulated),
-        horizons=horizons,
+        equity=book.equity, cash=book.cash, high_water=book.high_water,
+        positions=len(held) + len(unsimulated) + len(book.unpriced), horizons=horizons,
         notes=[f"{subject.ticker} is held but could not be simulated: its value is taken as fixed at its last close."
-               for subject in unsimulated],
+               for subject in unsimulated]
+        + [f"{ticker} is held but the snapshot has no usable price for it: its value is taken as fixed at the "
+           f"{value:,.2f} the account carries it at." for ticker, value in sorted(book.unpriced.items())],
     )

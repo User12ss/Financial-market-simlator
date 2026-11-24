@@ -445,6 +445,7 @@ class DailyPipeline:
         debates = self._debates(run, positions, views, regime)
         proposals, pm_summary = self._proposals(run, positions, waiting, views, debates, regime)
         decisions, halt = self._risk(run, account, positions, earlier, proposals, views)
+        self._after_risk(run, account, positions, views)
 
         return SignalTable(
             run_id=run.run_id, arm=run.arm.name, session_date=session, created_at=self._now(),
@@ -488,6 +489,16 @@ class DailyPipeline:
         The desk's close meeting uses it for the forecast engine. Whatever is
         said in it is recorded and goes no further: it returns nothing, and
         the stages after it are given exactly what they would have been given.
+        """
+
+    def _after_risk(self, run: _Run, account, positions: dict[str, Position], views: dict[str, TickerView]) -> None:
+        """A turn after the risk gate has spoken and before the orders are placed. The daily pipeline has nothing to say here.
+
+        The desk's close meeting gives it to the seats whose words decide
+        nothing: by now every decision of the meeting has been made, so a
+        model call here cannot use up what a deciding seat needed. Like the
+        turn after the views it returns nothing, and the orders placed after
+        it are exactly those the risk gate approved.
         """
 
     def _finishing(self, run: _Run) -> None:

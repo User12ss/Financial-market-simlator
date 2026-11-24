@@ -441,10 +441,39 @@ At the desk's close meeting, after the analyst's views, a seat that is code and 
 **Limits to know.**
 
 - Past earnings dates come from the price source's earnings calendar page, which the client reads with the `lxml` package (in `requirements.txt`). Where a name's dates cannot be fetched (the package is missing, or the source refuses), its parameters say that its report days are not known: they are then not told apart from other days (the large ones count as jumps), and a report inside a forecast's horizon is said to be there and not modelled.
-- The forecast is made at the close meeting only, not at check-ins. The book's forecast assumes no trading after today and is not reconciled; only the names' forecasts are.
+- The forecast is made at the close meeting only, not at check-ins. The book's forecast assumes no trading after today and is not reconciled; only the names' forecasts are. A holding the evening's snapshot has no usable price for stays in the book at the value the account carries it at, and the forecast's notes name it. (The first version left such a holding out, which put the book below its drawdown breaker before a day had passed. A forecast recorded by that version on an evening with such a holding does not work out again to the same book figures.)
 - Names move together only through the market and their sector. A theme shared by a few names is not modelled, so several falling at once is somewhat underestimated. Volatility over the horizon changes only with the market's state.
 - Forecasts made on the same day share that day's market: they are worth fewer than their count, and the report says how many days they come from.
 - When a session is run again on purpose and that run fails, the forecast of the session's earlier, finished meeting stays on record and goes on being reconciled: it is what that meeting said.
+
+## Working a Trade Back from Its Endings (it places and changes no order)
+
+At the same meeting, right after its forecasts, the quant engineer reads the simulated paths a second time, backwards. A trade (a holding, or a name the analyst would own) has three endings within its horizon: **the target is reached first, the stop is touched first, or neither** by the time the horizon runs out. Every simulated path ends exactly one way. For each ending the seat says what the paths that end that way went through (`forecast/backward.py`):
+
+- how often each ending comes, and how often the stop sells and the price still stands above today's close when the horizon ends ("right about the direction, shaken out on the way");
+- the day that settled it, the deepest dip before it was settled, where a touched stop actually sold (below the stop where the price opened through it), and how much of the whole movement came on its single largest day;
+- for each kind of event the simulation contains, **its chance given each ending**: of the paths that end at the stop, on what share did it happen first? The events are the name's own sharp moves, its sector's, an earnings report taken well or badly, the market spending a day in its other state, and the index moving `BACKWARD_MARKET_MOVE_PCT` percent from today's close. An event counts only when it happens on or before the day that settles the path: a jump after the stop has sold is no part of the trade.
+
+The chance of an event given an ending is counted on the paths, and a test holds it to what Bayes' rule makes of the chance of the ending given the event. **The ratio** of an event's chance given the stop to its chance given the target says how much the event tells about where the trade is heading; the events are ranked by the log of that ratio with half a path added to each count, so that an event seen on a handful of paths does not outrank one seen on thousands. An ending on fewer than `BACKWARD_MIN_PATHS` paths is too rare to read, and that is said. All of it is true inside the simulation and no further: an event the simulation does not contain cannot appear.
+
+**The scenario analyst** (a model's seat, `agents/ticker/scenario.py`) is there for what the simulation lacks. Once every decision of the meeting has been made, it is shown each name's facts and a numbered list of its headlines, and asked whether any headline points to something particular that has not happened yet and would move the price sharply on the day it does. What it proposes is judgement: a probability nobody measured, a window of days, a direction and a range of sizes. Code checks every event and repairs none (`pipeline/scenario.py`): it must cite a headline it was shown, lie within the trade's horizon, have a probability strictly between 0 and 1 and a move of at least `SCENARIO_MIN_MOVE_PCT` percent, and say how anyone could tell afterwards that it happened. A name the ledger holds no headline about is not asked about. The seat speaks after the risk gate for one reason: its model calls count against the run's spending limit like any other, and a seat that decides nothing must not be able to use up what a deciding seat needed.
+
+**The rehearsal.** The same paths are then drawn again with the proposed events on them (each happens or not by its stated probability, on a day drawn evenly from its window, at a size drawn from the name's own past jumps, its sector's when it has few, and held inside the stated range; a range beyond the largest past jump is cut to it, and the meeting hears that), and read backwards again. **Two readings are kept apart**: the measured one, which rests on the simulation alone, and the rehearsed one, marked wherever it is shown as resting on judgement. The forecast on record is the measured one and does not move for anything the seat says: each event draws from a random stream of its own, and a test compares three days of meetings with the seat on and off, down to every other prompt, event, order and kept number.
+
+**Scored when the days have passed** (`forecast/outcomes.py`). Once a trade's horizon has ended, the daily bars say which ending happened: the first day whose low reaches the stop or whose high reaches the target settles it, the stop first on a day that does both, as in the simulation, and the meeting's own day never counts. The three chances are scored against it (a Brier score: 0 for a certain and correct call, 2 for a certain and wrong one), for the measured reading, for the rehearsed one, and for **the plain forecast**, the textbook chances of a driftless walk between two barriers at the name's historical volatility. If the rehearsed reading does not score better than the measured one, the seat's events made the chances worse. Each proposed event is scored too, where code can tell whether it happened: a close beyond a level, a one-day move, or a whole word in a headline. A headline counts only if the ledger first saw it **after** the cut-off of the meeting that proposed the event: the headline an event was proposed from cannot be the proof that it happened. What decides that is the ledger's clock and not the source's date: a story dated an hour before the meeting that the ledger only came to see the next day was not known at the meeting. A headline belongs to the event's days by its source's date, from the close before the first day to the close of the last; one without a date belongs to them if the ledger first saw it by the first reading after that close (a name that is not held is read once an evening, by the close meeting). An event checked in words only is never scored.
+
+**A headline check gets a verdict only from a reading without a gap** (`Ledger.read_between`). Saying that something did not appear takes a reading at or after the close of the event's last day, and none before it that may have missed something: a reading asks for the latest five headlines, and one that brings back a full page the ledger had seen none of may have let older ones go by. Without such a reading the event is scored neither way and waits, even when a matching headline was seen (what was seen is recorded beside it): scoring only the events seen to happen would tilt the record towards them. The same holds when the reading that closes the days comes more than eight hours after the last close (the wire was down that evening, or no meeting was held) and is the first to see a headline without a date: nobody can say which day that headline is from.
+
+**Limits to know.**
+
+- With the local 7B model the seat's events are mostly refused. Its first run on live data returned five events for one company, none of them from anything in the data; requiring a cited headline is what came of that. Whether the seat adds anything is for the scores to say.
+- A proposed event is one day's move, independent of everything else. Bad news comes in clusters, and chains of events are for a later stage.
+- A headline check is only as good as the ledger's reading: the watch's rounds for names in the book, and each close meeting's latest five for the names it discussed. For a name in the news every day, an evening's five are often all new, which is a gap: most headline checks on such names will wait and never be scored. The report says how many wait. "No gap" itself rests on the source handing out its latest headlines first.
+- A headline without a date that the ledger first sees on the evening of an event's last day is counted as those days' news, though it may be a few hours younger.
+- The words of a headline check are screened for the company's name, the ticker, words the headlines shown already have and a short list of common words, no further. A word as broad as a publisher's name is still taken, and makes its event easier to score as having happened.
+- An event on a name that drops out of the meeting's candidates and is not held gets no further reading, and waits for good. Reading the names that have an event open is a job for the watch, and is not built.
+- The trades are worked back at the close meeting only, and nothing here is shown on the dashboard beyond the lines as they were said.
+- Plans, the conditions they watch and what code does when one holds (the second half of this stage) are not built.
 
 ## Evaluation
 
@@ -599,6 +628,12 @@ Set these in `.env` (see `.env.example`):
 | `FORECAST_DRIFT_SHRINK_DAYS` | `5040` | A name's own average return counts for days / (days + this) of itself |
 | `FORECAST_TARGET_R` | `2.0` | The notional target: this many times as far above the close as the stop is below |
 | `FORECAST_TRACK_MIN` / `FORECAST_TRACK_Z` / `FORECAST_TILT_CAP` | `200` / `1.64` / `0.25` | How a record earns a say: the fewest scored cases, how far above a coin toss the hit rate must be, and the most an analyst's view may tilt the drift (as a share of the horizon's volatility) |
+| `BACKWARD_MIN_PATHS` | `100` | An ending on fewer simulated paths than this is too rare to say what led to it |
+| `BACKWARD_MARKET_MOVE_PCT` | `5.0` | "The index falls (or rises) this many percent from today's close" is one of the events looked for |
+| `BACKWARD_REPORT_MOVES` | `1.0` | An earnings report "taken badly" or "well": the name opens at least this many of that day's expected moves away |
+| `SCENARIO_ENABLED` | `true` | The scenario analyst's seat at the desk's close meeting. Off, there is no rehearsal; the trades are still worked back |
+| `SCENARIO_MAX_EVENTS` / `SCENARIO_MAX_NAMES` | `5` / `8` | Events kept for one name, and names the seat is asked about at one meeting (one model call each) |
+| `SCENARIO_MIN_MOVE_PCT` | `1.0` | The smallest one-day move that counts as an event |
 | `DASHBOARD_HOST` | `127.0.0.1` | Address the dashboard listens on. The default serves this computer only |
 | `DASHBOARD_PORT` | `8765` | Port the dashboard listens on |
 
@@ -632,11 +667,14 @@ financial-market-sim/
 │   ├── engine.py          # The simulation: market, sectors and names together, and what is read off the paths
 │   ├── weights.py         # How a record earns a say in the simulation: exactly zero until it has one
 │   ├── scoring.py         # Reconciling forecasts with what happened, beside the plain forecast
+│   ├── backward.py        # A trade's paths read backwards from its three endings: what each went through, and what tells them apart
+│   ├── outcomes.py        # Which ending happened, and whether a proposed event did: the chances scored
 │   └── __main__.py        # python -m forecast: estimate, status, verify
 ├── pipeline/
 │   ├── daily.py           # The fixed daily pipeline (paper trading) and its command line
 │   ├── desk.py            # The desk: the watch, which meeting is due, the close meeting that reads the ledger
 │   ├── quant.py           # The quant engineer's seat at the close meeting: code that reads out the forecast and reconciles
+│   ├── scenario.py        # What code keeps of the scenario analyst's events, and what it refuses
 │   ├── checkin.py         # A check-in: what is new, what it does to a standing view, what may be done about it
 │   ├── universe.py        # Ticker universe and the rule-based candidate screen
 │   ├── macro.py           # Combines the macro agents' assessments by rule

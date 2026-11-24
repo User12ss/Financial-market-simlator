@@ -505,6 +505,37 @@ def test_a_holding_that_could_not_be_simulated_is_counted_at_its_close_and_named
     assert result.book.horizons[1].equity["50"] == pytest.approx(100 + 10 * priced.quantiles["50"], abs=0.01)
 
 
+def test_a_holding_the_snapshot_has_no_price_for_is_counted_at_what_the_account_carries_it_at():
+    """Found in the first run on live data: two holdings had no usable price that evening, were left out of the
+    book, and the forecast said the drawdown breaker was certain to trip."""
+    params, market, subject = lone(shares=10)
+    # The account: 200 in cash, 10 X at 100, and a holding the books carry at 500 that has no price tonight.
+    book = Book(cash=200.0, equity=1700.0, high_water=1700.0, unpriced={"GONE": 500.0})
+    result = run(params, MONDAY, market, {}, [subject], seed=1, paths=PATHS, book=book)
+    assert result.book.positions == 2
+    assert result.book.notes == ["GONE is held but the snapshot has no usable price for it: its value is taken as "
+                                 "fixed at the 500.00 the account carries it at."]
+    priced = horizon(forecast_of(result), 5)
+    assert result.book.horizons[1].equity["50"] == pytest.approx(200 + 500 + 10 * priced.quantiles["50"], abs=0.01)
+    assert result.book.horizons[0].drawdown_breaker < 0.01
+    # Left out, as it was: the book starts 500 short, below the level of the breaker before a day has passed.
+    short = run(params, MONDAY, market, {}, [subject], seed=1, paths=PATHS,
+                book=Book(cash=200.0, equity=1700.0, high_water=1700.0))
+    assert short.book.horizons[0].drawdown_breaker == 1.0 and short.book.positions == 1
+    # Beside a holding that could not be simulated, which is taken at its last close, and a second one without a price.
+    ghost = Subject("GHOST", 20.0, subject.returns, shares=5)
+    both = run(params, MONDAY, market, {}, [subject, ghost], seed=1, paths=PATHS,
+               book=Book(cash=200.0, equity=1830.0, high_water=1830.0, unpriced={"GONE": 500.0, "AWAY": 30.0}))
+    assert both.book.positions == 4 and len(both.book.notes) == 3
+    assert both.book.notes[1].startswith("AWAY is held") and "at the 30.00 the account" in both.book.notes[1]
+    assert both.book.horizons[1].equity["50"] == pytest.approx(200 + 100 + 530 + 10 * priced.quantiles["50"], abs=0.01)
+    # What is carried is what the account says of that holding. Its total is not asked: one that does not add up
+    # (a price that moved between the account's reading and the snapshot's) moves nothing.
+    odd = run(params, MONDAY, market, {}, [subject], seed=1, paths=PATHS,
+              book=Book(cash=200.0, equity=900.0, high_water=900.0, unpriced={"GONE": 500.0}))
+    assert odd.book.horizons[1].equity["50"] == pytest.approx(200 + 500 + 10 * priced.quantiles["50"], abs=0.01)
+
+
 def test_the_number_of_paths_and_the_target_come_from_the_configuration(monkeypatch):
     params, market, subject = lone(stop=96.0)
     monkeypatch.setattr(engine.config, "FORECAST_PATHS", 300)

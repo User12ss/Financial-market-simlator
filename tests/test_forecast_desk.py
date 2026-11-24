@@ -11,6 +11,7 @@ from data.providers import DataError
 from data.snapshot import KEPT_BARS, load_snapshot
 from forecast.params import ForecastError, ParamStore
 from models.forecast import ForecastSet
+from models.planning import ScenarioDraft
 from models.signals import ProposalSetDraft, TickerViewDraft
 from pipeline import desk as desk_module
 from pipeline import quant
@@ -49,8 +50,9 @@ def test_the_seat_speaks_after_the_views_and_before_the_debates(week):
     lines = said(desk, monday.run_id)
     assert {(event.speaker, event.speaker_name, event.is_llm, event.addressed_to) for event in lines} \
         == {(QUANT[0], QUANT[1], False, "all")}
-    assert [event.kind for event in lines] == ["forecast_parameters", "market_state", "forecast", "forecast"]
-    assert [event.ticker for event in lines] == [None, None, "CLMB", "RISE"]
+    assert [event.kind for event in lines] == [
+        "forecast_parameters", "market_state", "forecast", "forecast", "backward", "backward"]
+    assert [event.ticker for event in lines] == [None, None, "CLMB", "RISE", "CLMB", "RISE"]
 
 
 def test_what_it_says_about_the_market_and_each_name(week):
@@ -123,7 +125,35 @@ def test_with_a_position_the_book_is_forecast_too(week):
     assert line.remark.startswith("The book as it stands, 1 position(s) and no trading after today, 10 sessions on: ")
     assert line.payload["positions"] == 1 and line.payload["equity"] == tuesday.table.account.equity
     assert [item["sessions"] for item in line.payload["horizons"]] == [1, 5, 10, 20]
-    assert said(desk, tuesday.run_id)[-2].kind == "book_forecast"          # after the names, before the scores
+    # After the names; then the trades worked back, and the scores last.
+    assert [event.kind for event in said(desk, tuesday.run_id)] == [
+        "market_state", "forecast", "forecast", "book_forecast", "backward", "backward", "forecast_scores"]
+
+
+def test_a_holding_with_no_usable_price_that_evening_still_counts_in_the_book(tmp_path):
+    desk = forecast_desk(tmp_path, ny(23, 18, 30))
+    hold(desk, ny(23, 18, 30))
+    tuesday = hold(desk, ny(24, 18, 30))                       # RISE was bought at Tuesday's open
+    assert [holding.ticker for holding in tuesday.table.holdings] == ["RISE"]
+    desk.market.missing.add("RISE")                            # on Wednesday evening the source has nothing for it
+    wednesday = hold(desk, ny(25, 18, 30))
+    assert wednesday.status in ("ok", "degraded")
+    line = said(desk, wednesday.run_id, "book_forecast")[0]
+    assert line.payload["positions"] == 1
+    carried = wednesday.table.holdings[0].value                # what the account says the holding is worth
+    assert carried > 0 and line.payload["notes"] == [
+        "RISE is held but the snapshot has no usable price for it: its value is taken as fixed at the "
+        f"{carried:,.2f} the account carries it at."]
+    assert line.remark.endswith(line.payload["notes"][0])
+    # Nothing in the book moves, so every path leaves it where the account has it, and no breaker is near.
+    equity = wednesday.table.account.equity
+    one = line.payload["horizons"][0]
+    assert one["equity"]["5"] == one["equity"]["95"] == pytest.approx(equity, abs=0.01)
+    assert one["drawdown_breaker"] == 0.0
+    # Worked out again from the record, the same.
+    store = desk_module.ParamStore(desk.forecast_dir)
+    recorded = desk.journal.forecast_set(ARM, WEDNESDAY)
+    assert recompute(desk.journal, wednesday.run_id, store).model_dump_json() == recorded.model_dump_json()
 
 
 # ── On record, and reconciled ────────────────────────────────────────────────
@@ -228,18 +258,19 @@ def test_the_snapshot_keeps_the_bars_the_forecast_was_made_from(week):
 # ── It changes nothing else ──────────────────────────────────────────────────
 
 def record_of(desk, results) -> dict:
-    """Everything the meetings said, asked and did, the quant engineer's own turn left out."""
+    """Everything the meetings said, asked and did, the quant engineer's and the scenario analyst's turns left out."""
     events = [
         [(e.stage, e.speaker, e.addressed_to, e.kind, e.ticker, e.remark, json.dumps(e.payload, sort_keys=True))
-         for e in desk.journal.events(result.run_id) if e.stage != "forecast"]
+         for e in desk.journal.events(result.run_id) if e.stage not in ("forecast", "scenario")]
         for result in results
     ]
     orders = [tuple(row) for row in desk.journal.rows(
         "SELECT order_id, ticker, side, kind, shares, stop_price, protective_stop, status, created_session, "
         "filled_price, note FROM paper_orders ORDER BY order_id")]
     return {
-        "prompts": list(desk.llm.calls), "events": events, "orders": orders,
-        "tables": [result.table.model_dump_json() for result in results],
+        "prompts": [call for call in desk.llm.calls if call[0] != "ScenarioDraft"], "events": events, "orders": orders,
+        # The count of model calls is the one thing in a table that the scenario analyst's turn adds to.
+        "tables": [result.table.model_dump_json(exclude={"usage"}) for result in results],
         "equity": [tuple(row) for row in desk.journal.rows("SELECT * FROM paper_equity ORDER BY session_date")],
     }
 
@@ -268,6 +299,12 @@ def test_with_the_forecast_on_or_off_every_prompt_decision_and_order_is_the_same
     assert len(on.journal.forecast_sets(ARM)) == 3
     assert record_of(on, with_forecast) == record_of(off, without)
     assert len(record_of(on, with_forecast)["orders"]) >= 1               # and there were orders to compare
+    # The scenario analyst was asked with the forecast on, and those calls are all the tables differ by.
+    # It is asked about a name only when the ledger holds a headline about it: here, RISE on Wednesday.
+    asked = on.llm.count(ScenarioDraft)
+    assert asked == 1 and off.llm.count(ScenarioDraft) == 0
+    assert sum(result.table.usage.calls for result in with_forecast) - asked \
+        == sum(result.table.usage.calls for result in without)
 
 
 def test_a_forecast_that_breaks_costs_the_meeting_nothing(tmp_path, monkeypatch):
@@ -285,8 +322,12 @@ def test_a_forecast_that_breaks_costs_the_meeting_nothing(tmp_path, monkeypatch)
         ("forecast_problem", "No forecast at this meeting: RuntimeError: a bug in the engine"),
     ]
     assert result.status == "ok" and result.table.warnings == []
-    assert result.table.model_dump_json() == expected.table.model_dump_json()
-    assert desk.journal.forecast_sets(ARM) == []
+    assert result.table.model_dump_json(exclude={"usage"}) == expected.table.model_dump_json(exclude={"usage"})
+    # With no forecast there is nothing to rehearse, and nothing is said of the scenario analyst at all.
+    assert desk.llm.count(ScenarioDraft) == 0
+    assert [event for event in desk.journal.events(result.run_id) if event.stage == "scenario"] == []
+    assert [event.kind for event in plain.journal.events(expected.run_id) if event.stage == "scenario"] == ["scenario_note"]
+    assert desk.journal.forecast_sets(ARM) == [] and desk.journal.backward_sets(ARM) == []
 
 
 class NoHistory:
@@ -492,7 +533,8 @@ def test_when_reconciling_fails_todays_forecast_is_still_said_and_kept(tmp_path,
     monkeypatch.setattr(quant, "reconcile", broken)
     tuesday = hold(desk, ny(24, 18, 30))
     lines = said(desk, tuesday.run_id)
-    assert [line.kind for line in lines] == ["market_state", "forecast", "forecast", "book_forecast", "forecast_problem"]
+    assert [line.kind for line in lines] == [
+        "market_state", "forecast", "forecast", "book_forecast", "backward", "backward", "forecast_problem"]
     assert lines[-1].remark == ("The forecasts that came due could not be reconciled at this meeting: "
                                 "ValueError: the scores could not be read")
     assert tuesday.status == "ok" and desk.journal.forecast_set(ARM, TUESDAY).run_id == tuesday.run_id
@@ -531,5 +573,7 @@ def test_a_forecast_that_cannot_be_made_ready_to_keep_is_dropped_at_the_seats_tu
         ("forecast_problem", "No forecast at this meeting: RuntimeError: the rows could not be made"),
     ]
     # The meeting itself finished, with the orders it would have placed anyway, and nothing half-kept.
-    assert result.status == "ok" and result.table.model_dump_json() == expected.table.model_dump_json()
+    assert result.status == "ok"
+    assert result.table.model_dump_json(exclude={"usage"}) == expected.table.model_dump_json(exclude={"usage"})
     assert len(result.table.orders) == 1 and desk.journal.forecast_sets(ARM) == []
+    assert desk.journal.backward_sets(ARM) == [] and desk.llm.count(ScenarioDraft) == 0

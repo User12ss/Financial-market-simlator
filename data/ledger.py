@@ -23,6 +23,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 import config
+from data.market_calendar import previous_trading_day, session_close
 from data.models import NewsItem
 
 _SCHEMA = """
@@ -86,6 +87,14 @@ def item_id(source: str, headline: NewsItem) -> str:
     title = " ".join(headline.title.split())
     key = headline.link.strip() or f"{headline.publisher.strip()}|{title}"
     return hashlib.sha256(f"{source}|{key}".encode()).hexdigest()[:16]
+
+
+# How many headlines one reading asks the source for (data.snapshot.HEADLINES_PER_TICKER; a test holds the two
+# together). A reading that fills the page with headlines the ledger had never seen may have missed older ones.
+PAGE = 5
+# A reading this long after a session's close is still that evening's: time enough for the close meeting, which is
+# held from two hours after the close, and not enough to reach the next morning.
+EVENING_HOURS = 8
 
 
 class LedgerItem(BaseModel):
@@ -213,6 +222,63 @@ class Ledger:
             last=row["last"], previous_close=row["previous_close"],
         )
 
+    def read_between(
+        self, ticker: str, first: date, last: date, after: datetime | None = None,
+    ) -> tuple[list[str], bool]:
+        """The headlines about a ticker that belong to the sessions from `first` to `last`, and whether the
+        ledger's readings covered those days without a gap.
+
+        A headline its source dates belongs to those days when the date lies from the close before `first` to
+        the close of `last`. One its source does not date belongs to them when the ledger first saw it in that
+        stretch, or at the first reading after it: a name the watch does not read is read by each evening's
+        close meeting, after the close. With `after` (the cut-off of the meeting that asks) only what the ledger
+        first saw later counts: what that meeting could have been shown is not news to it. The source's date
+        is not held against the cut-off. A story dated an hour before the meeting that the ledger only came to
+        see the next day was not known at the meeting.
+
+        "Covered" is what allows saying that something did NOT appear. It takes a reading at or after the
+        close of `last`, and no gap before it. A reading asks for the latest few headlines (`PAGE`). If it
+        brings back a full page and the ledger had seen none of them, older ones may have gone by unseen: a
+        gap. If it brings back fewer, or one the ledger already held, nothing between that one and now was
+        missed, as long as the source hands out the latest first. A reading that brought nothing back, or
+        that failed, is no reading.
+
+        One more thing undoes it. The reading that closes the days is meant to be that evening's. When it comes
+        more than `EVENING_HOURS` after the last close (the wire was down that evening, or no meeting was held),
+        a headline without a date that it is the first to see may be of a later day, and nobody can say. It is
+        still returned, and the days are not covered.
+        """
+        start, end = session_close(previous_trading_day(first)), session_close(last)
+        if after is not None and after >= end:
+            return [], False                              # asked once the days were over: nothing in them is news
+        low, later = (after, ">") if after is not None and after >= start else (start, ">=")
+        readings = self._db.execute(
+            "SELECT at, found, added FROM fetches WHERE what IN ('headlines', 'headlines_snapshot') AND ticker = ? "
+            f"AND ok = 1 AND found > 0 AND at {later} ? ORDER BY at, id", (ticker, stamp(low)),
+        ).fetchall()
+        closing = next((row for row in readings if _moment(row["at"]) >= end), None)
+        covered = closing is not None and all(
+            row["found"] < PAGE or row["added"] < row["found"] for row in readings if row["at"] <= closing["at"]
+        )
+        upto = _moment(closing["at"]) if closing is not None else end
+        late = upto > end + timedelta(hours=EVENING_HOURS)
+        rows = self._db.execute(
+            f"SELECT title, published_at, first_seen FROM items WHERE ticker = ? AND first_seen {later} ? "
+            "ORDER BY first_seen, item_id", (ticker, stamp(low)),
+        ).fetchall()
+        titles = []
+        for row in rows:
+            published, first_seen = _moment(row["published_at"]), _moment(row["first_seen"])
+            if published is not None:
+                belongs = start <= published <= end
+            else:
+                belongs = first_seen <= upto
+                if belongs and late and first_seen > end:
+                    covered = False                       # of those days or of a later one: there is no telling
+            if belongs:
+                titles.append(row["title"])
+        return titles, covered
+
     # ── Fetches ──────────────────────────────────────────────────────────
 
     def log_fetch(
@@ -224,6 +290,25 @@ class Ledger:
                 "INSERT INTO fetches (at, what, ticker, ok, found, added, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (stamp(at), what, ticker, int(ok), found, added, error),
             )
+
+    def note_read(self, ticker: str, at: datetime, found: int, added: int) -> None:
+        """Record that a ticker's headlines were read at `at` by a close meeting's snapshot. Once: the same
+        reading noted again (a meeting held twice on one snapshot) adds nothing.
+
+        It is logged under a name of its own, so that what the watch's own
+        fetches did (`failures`) reads exactly as it did before there was
+        such a note.
+        """
+        with self._db:
+            seen = self._db.execute(
+                "SELECT 1 FROM fetches WHERE what = 'headlines_snapshot' AND ticker = ? AND at = ? LIMIT 1",
+                (ticker, stamp(at)),
+            ).fetchone()
+            if seen is None:
+                self._db.execute(
+                    "INSERT INTO fetches (at, what, ticker, ok, found, added, error) "
+                    "VALUES (?, 'headlines_snapshot', ?, 1, ?, ?, '')", (stamp(at), ticker, found, added),
+                )
 
     def failures(self, as_of: datetime, tickers: list[str]) -> list[FetchFailure]:
         """Fetches whose latest try by `as_of` failed, for these tickers and for the fetches that cover several.

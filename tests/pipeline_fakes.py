@@ -12,6 +12,7 @@ from data.models import Fundamentals
 from data.providers import BAR_COLUMNS, DataError
 from data.snapshot import SnapshotBuilder
 from journal.store import Journal
+from models.planning import ProposedEventDraft, ScenarioDraft
 from models.signals import (
     Citation, DebateArgumentDraft, DebateRulingDraft, DomainAssessmentDraft, ProposalDraft, ProposalSetDraft,
     SectorCall, TickerViewDraft,
@@ -169,6 +170,21 @@ def proposals(*items: tuple[str, str, float]):
     )
 
 
+def proposed_event(label="The recall widens", first=1, last=5, probability=0.2, direction="down", low=4.0, high=8.0,
+                   check="headline", keywords=("widens",), level=None, check_text="A headline says the recall has widened.",
+                   basis="The recall named in the headlines.", cited=(1,)):
+    return ProposedEventDraft(
+        label=label, first_session=first, last_session=last, probability=probability, direction=direction,
+        low_pct=low, high_pct=high, check_kind=check, check_keywords=list(keywords), check_level=level,
+        check_text=check_text, basis=basis, cited=list(cited),
+    )
+
+
+def scenario(*events: ProposedEventDraft, remark="Nothing particular to add."):
+    """The scenario analyst's answer for one name. With no events it is the usual one: nothing to add."""
+    return ScenarioDraft(events=list(events), remark=remark)
+
+
 class ScriptedLLM:
     """Stands in for LLMClient. `replies` maps a schema to an object, an exception, or a
     function of (system prompt, user message) that returns either."""
@@ -180,6 +196,7 @@ class ScriptedLLM:
             DebateArgumentDraft: argument(),
             DebateRulingDraft: ruling(),
             ProposalSetDraft: proposals(),
+            ScenarioDraft: scenario(),
         }
         self.calls: list[tuple[str, str, str]] = []     # schema name, system prompt, user message
         self.usage = UsageLog()

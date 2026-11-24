@@ -50,7 +50,10 @@ class TickerForecast(BaseModel):
     stop_from: Literal["position", "analyst", "rule", ""] = Field(
         default="", description="Whose stop it is: the one on the books, the analyst's, or the sizing rule's"
     )
-    target: float | None = Field(default=None, description="A notional target: no seat names one yet")
+    target: float | None = Field(default=None, description="The target: a notional one unless one was named")
+    target_from: Literal["named", ""] = Field(
+        default="", description="named: a plan names it. Empty: notional, a set multiple of the distance to the stop"
+    )
     break_even: float | None = Field(
         default=None, description="Share of such trades that has to reach the target before the stop for them to pay"
     )
@@ -101,6 +104,89 @@ class ForecastSet(BaseModel):
     tickers: list[TickerForecast] = Field(default_factory=list)
     book: BookForecast | None = None
     problems: list[str] = Field(default_factory=list)
+
+
+# ── Read backwards: given how a trade ends, what happened on the way ─────────
+
+# The target is reached before the stop; the stop is touched first; neither within the horizon.
+OUTCOMES = ("good", "bad", "middle")
+
+
+class Way(BaseModel):
+    """The simulated paths that end one way."""
+
+    share: float = Field(description="Share of all paths that end this way")
+    paths: int
+    settled: dict[str, float] = Field(
+        default_factory=dict,
+        description="The session that settled it, counted from the meeting: the middle path and the quartiles. "
+                    "Empty for the ending that is neither: that one is settled when the horizon runs out",
+    )
+    adverse: dict[str, float] = Field(
+        default_factory=dict,
+        description="Largest fall below the close before it was settled, in percent: the median path, and the worst "
+                    "quarter and twentieth. Empty for the ending at the stop, where the fall is the stop",
+    )
+    sold_below: dict[str, float] = Field(
+        default_factory=dict,
+        description="For the ending at the stop: how far below the close the stop sold, in percent, on the median "
+                    "path and the worst twentieth. More than the stop's distance where the price opened through it",
+    )
+    biggest_day: float | None = Field(
+        default=None, description="Share of all the movement on the way that came on its single largest day: the median path"
+    )
+
+
+class EventOdds(BaseModel):
+    """One thing that may happen on the way, and how much more often it happens on paths that end one way than another."""
+
+    key: str
+    label: str
+    kind: Literal["calendar", "statistical", "proposed"] = Field(
+        description="calendar: on a known date. statistical: at its past frequency. proposed: a seat's judgement"
+    )
+    chance: float = Field(description="Share of all paths on which it happens before the ending is settled")
+    given: dict[str, float | None] = Field(description="The same share among the paths of each ending. None: too few paths end that way")
+    ratio: float | None = Field(
+        default=None,
+        description="Its chance given the ending at the stop over its chance given the ending at the target. "
+                    "The further from 1, the more the event says about where the trade is heading",
+    )
+    weight: float | None = Field(
+        default=None,
+        description="The log of that ratio, worked out with half a path added to each count: an event seen under one "
+                    "ending only still has a weight, and one seen on a handful of paths a small one. Events are "
+                    "ranked by how far it is from 0",
+    )
+    note: str = ""
+
+
+class Backward(BaseModel):
+    """One name's simulated paths read backwards from their three endings."""
+
+    ticker: str
+    sessions: int = Field(description="The trade's horizon, in sessions from the meeting")
+    matures_on: date
+    close: float
+    stop: float
+    target: float
+    target_from: str = ""
+    proposed: bool = Field(
+        default=False, description="Whether events a seat proposed are among those simulated: judgement, not measurement"
+    )
+    ways: dict[str, Way] = Field(description="By ending: good, bad, middle")
+    plain: dict[str, float] = Field(
+        default_factory=dict,
+        description="The three endings' chances from the plain forecast: historical volatility, nothing else",
+    )
+    shaken_out: float = Field(
+        description="Share of all paths stopped out although the price is above the meeting's close when the horizon ends"
+    )
+    target_after_stop: float = Field(
+        description="Share of all paths stopped out that go on to reach the target within the horizon"
+    )
+    events: list[EventOdds] = Field(default_factory=list, description="The most telling first")
+    notes: list[str] = Field(default_factory=list)
 
 
 # ── What a forecast turned out to be worth ───────────────────────────────────

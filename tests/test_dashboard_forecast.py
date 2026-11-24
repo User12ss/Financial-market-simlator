@@ -36,7 +36,8 @@ def test_the_quant_engineers_lines_are_shown_as_code_speaking_in_a_stage_of_thei
     lines = [event for event in body["events"] if event["stage"] == "forecast"]
     assert {(e["stage_title"], e["speaker"], e["speaker_title"], e["is_llm"], e["to_title"]) for e in lines} == {
         ("预测", "quant_engineer", "量化工程师", False, "所有人")}
-    assert [e["kind"] for e in lines] == ["market_state", "forecast", "forecast", "book_forecast", "forecast_scores"]
+    assert [e["kind"] for e in lines] == [
+        "market_state", "forecast", "forecast", "book_forecast", "backward", "backward", "forecast_scores"]
     # What it said is shown as it was recorded.
     rise = next(e for e in lines if e["ticker"] == "RISE")
     assert rise["remark"].startswith("RISE, 10 sessions on: half the simulated paths end between ")

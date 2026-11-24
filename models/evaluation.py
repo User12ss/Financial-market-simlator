@@ -246,6 +246,12 @@ class ArmEvaluation(BaseModel):
     forecasts: ForecastCard | None = Field(
         default=None, description="How the forecast engine's distributions held up. None for an arm that makes none.",
     )
+    worked_back: dict | None = Field(
+        default=None,
+        description="How the chances given to each trade's three endings held up, by reading, and how the events a "
+                    "seat proposed did (forecast.outcomes.tally, with the counts of what is waiting). None for an "
+                    "arm that works no trade back.",
+    )
     usage: UsageSummary = Field(default_factory=UsageSummary)
     lessons_written: int = 0
     lessons_total: int = 0

@@ -11,30 +11,36 @@ checked.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
 
 import config
+from data.market_calendar import trading_day_after
 from data.models import Bars, Snapshot
-from forecast import engine
+from forecast import backward, engine, outcomes
 from forecast.engine import Book, Subject
 from forecast.params import MARKET, ParamStore, Params, for_session
 from forecast.scoring import card, frame_of, in_words, reconcile, score_one
 from forecast.weights import lean, track
 from journal.store import Journal
-from models.forecast import ForecastSet, TickerForecast
+from models.forecast import Backward, ForecastSet, TickerForecast
+from models.planning import BackwardSet, ProposedEvent
 from models.signals import TickerView
 from models.trading import Account, Position
+from pipeline.scenario import for_engine
 from portfolio.sizing import usable_stop
 
 QUANT = ("quant_engineer", "Quant Engineer")
 STAGE = "forecast"
 # The horizon spoken of when a name has no view to take one from.
 DEFAULT_HORIZON = 10
+# How many of a table's most telling events the seat names aloud. The rest are in what it keeps.
+EVENTS_SAID = 2
 _WHOSE = {"position": "on the books", "analyst": "the analyst's", "rule": "the sizing rule's"}
 
 
@@ -49,11 +55,25 @@ class Line:
 
 
 @dataclass
+class Setup:
+    """What drawing a meeting's paths a second time needs: the rehearsal runs the same simulation with events added."""
+
+    params: Params
+    session: date
+    market: pd.Series
+    funds: dict[str, pd.Series]
+    names: dict[str, Subject]
+    seed: int
+
+
+@dataclass
 class Turn:
-    """The seat's turn at one meeting: what it says, and the forecast to keep if the meeting finishes."""
+    """The seat's turn at one meeting: what it says, and what to keep if the meeting finishes."""
 
     lines: list[Line]
     forecasts: ForecastSet | None = None
+    backward: BackwardSet | None = None
+    setup: Setup | None = None
 
 
 def seed_of(run_id: str) -> int:
@@ -120,6 +140,13 @@ def subjects(
             lean=tilt, lean_basis=basis, shares=position.shares if position else 0,
         ))
     return found, missing
+
+
+def unpriced(names: list[Subject], held: list[Position]) -> dict[str, float]:
+    """The holdings that are not among the names to forecast, each with the value the account carries it at:
+    the snapshot had no usable price for them."""
+    priced = {subject.ticker for subject in names}
+    return {position.ticker: position.value for position in held if position.ticker not in priced}
 
 
 # ── What it says ─────────────────────────────────────────────────────────────
@@ -207,6 +234,100 @@ def problem_line(text: str) -> Line:
     return Line("forecast_problem", text)
 
 
+# ── Working back from how a trade ends ───────────────────────────────────────
+
+def horizon_of(subject: Subject) -> int:
+    """The trade's horizon in sessions: the view's, held within the simulated days."""
+    return max(1, min(subject.view_horizon or DEFAULT_HORIZON, engine.DAYS))
+
+
+def worked_back(subject: Subject) -> bool:
+    """Whether a name is a trade to work back from: a holding, or a name the analyst would own."""
+    return subject.shares > 0 or subject.direction == "bullish"
+
+
+def work_back(
+    result: engine.Result, session: date, names: list[Subject], states: list[str],
+    labels: dict[str, dict[str, str]] | None = None,
+) -> tuple[list[Backward], list[str]]:
+    """Each trade's paths read backwards from its three endings, and a sentence for each that cannot be."""
+    forecasts = {forecast.ticker: forecast for forecast in result.tickers}
+    tables, skipped = [], []
+    for subject in sorted(names, key=lambda item: item.ticker):
+        forecast = forecasts.get(subject.ticker)
+        if forecast is None or not worked_back(subject):
+            continue        # not forecast (said already, with the reason), or not a trade anyone is considering
+        if forecast.stop is None:
+            skipped.append(f"{subject.ticker}: it has no stop, so there is no ending at the stop to work back from.")
+            continue
+        sessions = horizon_of(subject)
+        tables.append(backward.read(
+            result.traces[subject.ticker], result.states, result.market, forecast, sessions=sessions,
+            matures_on=trading_day_after(session, sessions), state_names=states, state_now=result.state_now,
+            labels=(labels or {}).get(subject.ticker),
+        ))
+    return tables, skipped
+
+
+def backward_line(table: Backward) -> Line:
+    ways = table.ways
+    text = (f"{table.ticker}, worked back from {_sessions(table.sessions)} on: the target at {table.target:,.2f} comes "
+            f"first on {ways['good'].share * 100:.0f}% of paths, the stop at {table.stop:,.2f} on "
+            f"{ways['bad'].share * 100:.0f}%, neither on {ways['middle'].share * 100:.0f}%.")
+    shaken = f"{table.shaken_out * 100:.0f}"
+    if shaken != "0":                                   # said when it comes to a whole percent
+        text += f" On {shaken}% the stop sells and the price still ends above today's close."
+    said = [event for event in table.events
+            if backward.telling(event) > 0 and event.given["bad"] is not None and event.given["good"] is not None]
+    if said:
+        text += " What tells the endings apart most: " + "; ".join(
+            f"{event.label} (on {event.given['bad'] * 100:.0f}% of the paths that end at the stop, "
+            f"{event.given['good'] * 100:.0f}% of those that reach the target)" for event in said[:EVENTS_SAID]
+        ) + "."
+    if table.proposed:
+        text = "With the scenario analyst's events put in, which are judgement and not measurement: " + text
+        if table.notes:
+            # What was left out, or cut to the largest past jump, is part of what this reading is: said, not only kept.
+            text += " " + " ".join(table.notes)
+    return Line("rehearsal" if table.proposed else "backward", text, table.model_dump(mode="json"), ticker=table.ticker)
+
+
+def rehearse(setup: Setup, states: list[str], events: list[ProposedEvent]) -> tuple[list[Backward], list[str]]:
+    """The same paths drawn again with the proposed events on them, read backwards, for the names that have any.
+
+    The market, the sector funds and every draw of a name's own are what they
+    were in the forecast: each event draws from a stream of its own. A name
+    with no event is not run again, since nothing about it would differ.
+    """
+    by_name: dict[str, list[ProposedEvent]] = {}
+    for event in events:
+        by_name.setdefault(event.ticker, []).append(event)
+    subjects = [
+        dataclasses.replace(setup.names[ticker], events=[for_engine(event) for event in group])
+        for ticker, group in sorted(by_name.items()) if ticker in setup.names
+    ]
+    if not subjects:
+        return [], []
+    result = engine.run(setup.params, setup.session, setup.market, setup.funds, subjects, seed=setup.seed, trace=True)
+    labels = {ticker: {event.key: event.label for event in group} for ticker, group in by_name.items()}
+    # A name none of whose events could be put on its paths has nothing to rehearse: its table would be the measured one again.
+    idle = [f"{ticker}: {labels[ticker].get(key, key)!r} is not simulated, {reason}"
+            for ticker, trace in sorted(result.traces.items()) if not trace.events
+            for key, reason in trace.left_out.items()]
+    tables, skipped = work_back(
+        result, setup.session, [subject for subject in subjects if result.traces.get(subject.ticker) is None
+                                or result.traces[subject.ticker].events], states, labels,
+    )
+    return tables, result.problems + idle + skipped
+
+
+def outcomes_line(scores: list, events: list, fresh: list) -> Line:
+    summary = outcomes.tally(scores, events)
+    text = (f"{len(fresh)} of the endings and events given chances at earlier meetings came due. "
+            + outcomes.in_words(summary)).strip()
+    return Line("outcome_scores", text, {"due_now": len(fresh), "tally": summary})
+
+
 # ── Working a forecast out again ─────────────────────────────────────────────
 
 def recompute(journal: Journal, run_id: str, store: ParamStore | None = None) -> ForecastSet:
@@ -247,7 +368,8 @@ def recompute(journal: Journal, run_id: str, store: ParamStore | None = None) ->
         params, table.session_date, returns_of(snapshot.market_bars[MARKET]),
         {symbol: returns_of(bars) for symbol, bars in snapshot.market_bars.items() if symbol != MARKET},
         names, seed=recorded.seed, paths=recorded.paths,
-        book=Book(cash=account.cash, equity=account.equity, high_water=account.high_water),
+        book=Book(cash=account.cash, equity=account.equity, high_water=account.high_water,
+                  unpriced=unpriced(names, table.holdings)),
     )
     return recorded.model_copy(update={
         "state_now": result.state_now, "state_ahead": result.state_ahead, "tickers": result.tickers,
@@ -265,8 +387,8 @@ def waiting(forecasts: ForecastSet) -> list:
     ]
 
 
-def ready(forecasts: ForecastSet) -> tuple[ForecastSet, list]:
-    """A forecast and the rows that wait for its horizons, made and proved writable at the seat's own turn.
+def ready(forecasts: ForecastSet, tables: BackwardSet | None = None) -> tuple:
+    """A forecast, what was worked back from it, and the rows that wait for both, made and proved writable at the seat's own turn.
 
     Everything that could go wrong short of the journal itself (making the
     rows, turning them and the forecast into text) is done here, where a
@@ -274,38 +396,51 @@ def ready(forecasts: ForecastSet) -> tuple[ForecastSet, list]:
     journal's own writing.
     """
     rows = waiting(forecasts)
-    forecasts.model_dump_json()
-    for row in rows:
-        row.model_dump_json()
-    return forecasts, rows
+    endings, events = outcomes.pending(tables) if tables is not None else ([], [])
+    for item in (forecasts, *rows, *([tables] if tables is not None else []), *endings, *events):
+        item.model_dump_json()
+    return forecasts, rows, tables, endings, events
 
 
-def keep(journal: Journal, forecasts: ForecastSet, rows: list) -> None:
-    """Put a meeting's forecast on record, in place of an earlier one for the same session.
+def keep(
+    journal: Journal, forecasts: ForecastSet, rows: list, tables: BackwardSet | None = None,
+    endings: list | None = None, events: list | None = None,
+) -> None:
+    """Put a meeting's forecast on record, and what was worked back from it, in place of earlier ones for the same session.
 
     Called as the meeting is recorded as finished, in the same transaction,
-    and only then: a meeting that fails after the seat has spoken leaves no
-    forecast on record, and the one a finished meeting of the same session
-    left stays as it was. It writes what `ready` made and does nothing else:
-    by then the orders are placed, and only a journal that cannot be written
-    to (which would stop the meeting's own ending from being recorded just
-    the same) may stand in the way.
+    and only then: a meeting that fails after the seat has spoken leaves
+    nothing of this on record, and what a finished meeting of the same
+    session left stays as it was. It writes what `ready` made and does
+    nothing else: by then the orders are placed, and only a journal that
+    cannot be written to (which would stop the meeting's own ending from
+    being recorded just the same) may stand in the way.
     """
     with journal.transaction():
         journal.save_forecast_set(forecasts)
         journal.save_forecast_scores(rows)
+        if tables is not None:
+            journal.save_backward_set(tables)
+            journal.save_outcome_scores(endings or [])
+            journal.save_event_scores(events or [])
+        else:
+            # This meeting worked no trade back. A reading an earlier meeting of the session left would stand
+            # beside this meeting's forecast as if it were its own.
+            journal.drop_backward_set(forecasts.arm, forecasts.session_date)
 
 
 def speak(
     journal: Journal, arm: str, run_id: str, snapshot: Snapshot, account: Account,
     positions: dict[str, Position], views: dict[str, TickerView], *, provider, universe: list[str],
-    now: datetime, store: ParamStore | None = None,
+    now: datetime, store: ParamStore | None = None, headlines: outcomes.Headlines | None = None,
 ) -> Turn:
-    """Forecast, reconcile what came due, and return what the seat says together with the forecast to keep.
+    """Forecast, work each trade back from its endings, reconcile what came due, and return what the seat says with what to keep.
 
-    The forecast is not put on record here: the caller keeps it (`keep`) once
-    the meeting has finished. Anything that cannot be forecast is said in
-    words, with the reason. Nothing is put in its place.
+    Nothing is put on record here: the caller keeps it (`keep`) once the
+    meeting has finished. Anything that cannot be forecast is said in words,
+    with the reason. Nothing is put in its place. `headlines` says what the
+    ledger held about a name in given days: it is what a proposed event with
+    a headline check is judged by.
     """
     session = snapshot.session_date
     index = snapshot.market_bars.get(MARKET)
@@ -328,10 +463,12 @@ def speak(
 
     funds = {symbol: returns_of(bars) for symbol, bars in snapshot.market_bars.items() if symbol != MARKET}
     seed = seed_of(run_id)
+    market = returns_of(index)
     try:
         result = engine.run(
-            params, session, returns_of(index), funds, names, seed=seed,
-            book=Book(cash=account.cash, equity=account.equity, high_water=account.high_water),
+            params, session, market, funds, names, seed=seed,
+            book=Book(cash=account.cash, equity=account.equity, high_water=account.high_water,
+                      unpriced=unpriced(names, list(positions.values()))), trace=True,
         )
     except engine.ForecastError as e:
         return Turn(lines + [problem_line(f"No forecast at this meeting: {e}")])
@@ -350,12 +487,26 @@ def speak(
         lines.append(Line("forecast_problem", "Not forecast. " + " ".join(forecasts.problems),
                           {"problems": forecasts.problems}))
 
+    # The same paths read backwards. A failure here costs the meeting this part and leaves the forecast standing.
+    tables = None
+    try:
+        read, skipped = work_back(result, session, names, forecasts.states)
+        tables = BackwardSet(
+            arm=arm, session_date=session, run_id=run_id, created_at=now, params_version=params.version, seed=seed,
+            paths=config.FORECAST_PATHS, measured=read, problems=skipped,
+        )
+        lines += [backward_line(table) for table in read]
+        if skipped:
+            lines.append(Line("backward_problem", "Not worked back. " + " ".join(skipped), {"problems": skipped}))
+    except Exception as e:
+        lines.append(problem_line(f"The trades could not be worked back at this meeting: {type(e).__name__}: {e}"))
+
+    def bars(ticker: str):
+        return frame_of(snapshot.tickers[ticker].bars) if ticker in snapshot.tickers else None
+
     # Reconciling is about earlier meetings' forecasts. If it fails, that is said, and today's forecast stands.
     try:
-        scores, fresh = reconcile(
-            journal, arm, lambda ticker: frame_of(snapshot.tickers[ticker].bars) if ticker in snapshot.tickers else None,
-            as_of=session,
-        )
+        scores, fresh = reconcile(journal, arm, bars, as_of=session)
         if fresh:
             # Today's own forecasts are counted as waiting: they go on record when the meeting finishes.
             earlier = [score for score in scores if score.session_date != session]
@@ -363,4 +514,12 @@ def speak(
     except Exception as e:
         lines.append(problem_line(
             f"The forecasts that came due could not be reconciled at this meeting: {type(e).__name__}: {e}"))
-    return Turn(lines, forecasts)
+    try:
+        endings, events, due = outcomes.reconcile(journal, arm, bars, headlines, as_of=session)
+        if due:
+            lines.append(outcomes_line(endings, events, due))
+    except Exception as e:
+        lines.append(problem_line(
+            f"The endings and events that came due could not be reconciled at this meeting: {type(e).__name__}: {e}"))
+    setup = Setup(params, session, market, funds, {subject.ticker: subject for subject in names}, seed)
+    return Turn(lines, forecasts, tables, setup)

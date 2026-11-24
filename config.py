@@ -231,6 +231,32 @@ FORECAST_TRACK_MIN: int = int(os.getenv("FORECAST_TRACK_MIN", "200"))
 FORECAST_TRACK_Z: float = float(os.getenv("FORECAST_TRACK_Z", "1.64"))
 FORECAST_TILT_CAP: float = float(os.getenv("FORECAST_TILT_CAP", "0.25"))
 
+# --- Working back from how a trade ends (plain code; it places and changes no order) ---
+# For each name with a stop the quant engineer's seat takes three endings within the trade's
+# horizon (the target comes first, the stop comes first, neither) and says what the simulated
+# paths that end each way went through. The seat is part of the forecast engine: with
+# FORECAST_ENABLED off it says nothing.
+# An ending on fewer simulated paths than this is too rare to say what led to it.
+BACKWARD_MIN_PATHS: int = int(os.getenv("BACKWARD_MIN_PATHS", "100"))
+# "The index falls (or rises) this many percent from today's close on the way" is one of the events looked for.
+BACKWARD_MARKET_MOVE_PCT: float = float(os.getenv("BACKWARD_MARKET_MOVE_PCT", "5.0"))
+# An earnings report "taken badly" (or well): the name opens at least this many of that day's expected moves away.
+BACKWARD_REPORT_MOVES: float = float(os.getenv("BACKWARD_REPORT_MOVES", "1.0"))
+
+# --- The scenario analyst (a model's seat at the desk's close meeting; its words change no order) ---
+# After the forecast it is asked, name by name, what could happen that the simulation does not
+# already contain. What it proposes is judgement, with probabilities nobody measured: the paths
+# are read backwards a second time with its events put in (the rehearsal), that reading is marked
+# as resting on judgement, and each event is scored once its days have passed. One model call
+# per name it is asked about. Off, the seat is silent and there is no rehearsal.
+SCENARIO_ENABLED: bool = os.getenv("SCENARIO_ENABLED", "true").strip().lower() == "true"
+# Events kept for one name at one meeting.
+SCENARIO_MAX_EVENTS: int = int(os.getenv("SCENARIO_MAX_EVENTS", "5"))
+# The smallest one-day move, in percent, that counts as an event. Anything smaller is an ordinary day.
+SCENARIO_MIN_MOVE_PCT: float = float(os.getenv("SCENARIO_MIN_MOVE_PCT", "1.0"))
+# Names it is asked about at one meeting: holdings first, then the names the analyst is bullish on.
+SCENARIO_MAX_NAMES: int = int(os.getenv("SCENARIO_MAX_NAMES", "8"))
+
 # --- Dashboard ---
 # A read-only web page over the journal: python -m dashboard. By default it
 # listens on this machine only. It has no login, so do not point it at a

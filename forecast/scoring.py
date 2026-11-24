@@ -37,7 +37,9 @@ _EDGES = {"50": (0.25, 0.75), "80": (0.10, 0.90), "95": (0.025, 0.975)}
 
 def frame_of(bars: Bars) -> pd.DataFrame:
     """A snapshot's bars as a table by session."""
-    return pd.DataFrame({"close": bars.close, "adj_close": bars.adj_close, "low": bars.low}, index=bars.dates)
+    return pd.DataFrame(
+        {"close": bars.close, "adj_close": bars.adj_close, "low": bars.low, "high": bars.high}, index=bars.dates,
+    )
 
 
 def place(grid: list[float], outcome: float) -> float:

@@ -166,8 +166,9 @@ def test_a_snapshots_bars_become_the_table_scoring_reads():
     bars = Bars(dates=[date(2026, 11, 23), date(2026, 11, 24)], open=[1, 2], high=[3, 4], low=[0.5, 1.5],
                 close=[2, 3], adj_close=[1.9, 2.9], volume=[10, 20])
     frame = frame_of(bars)
-    assert list(frame.index) == bars.dates and list(frame.columns) == ["close", "adj_close", "low"]
+    assert list(frame.index) == bars.dates and list(frame.columns) == ["close", "adj_close", "low", "high"]
     assert frame.at[date(2026, 11, 24), "adj_close"] == 2.9 and frame.at[date(2026, 11, 23), "low"] == 0.5
+    assert frame.at[date(2026, 11, 24), "high"] == 4
 
 
 # ── On record ────────────────────────────────────────────────────────────────

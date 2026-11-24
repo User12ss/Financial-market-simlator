@@ -22,6 +22,7 @@ from typing import Iterator
 import config
 from models.evaluation import Lesson, ViewScore
 from models.forecast import ForecastScore, ForecastSet
+from models.planning import BackwardSet, EventScore, OutcomeScore
 from models.signals import Event, MacroRegime, SignalTable, UsageSummary
 
 # Bumped whenever an existing table changes. A journal written under another
@@ -244,6 +245,42 @@ CREATE TABLE forecast_scores (
     status       TEXT NOT NULL,           -- scored, pending, unpriced
     score_json   TEXT NOT NULL,
     PRIMARY KEY (arm, session_date, ticker, sessions)
+)""",
+    # Each name's simulated paths read backwards from how the trade ends, at an arm's close
+    # meeting, with the events the scenario seat proposed: one row per session, the whole set
+    # in one piece. A session worked back again replaces its row.
+    "backward_sets": """
+CREATE TABLE backward_sets (
+    arm          TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    run_id       TEXT NOT NULL,           -- the close meeting that made it
+    set_json     TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date)
+)""",
+    # The chances given to a trade's three endings, set against the one that happened: one row
+    # per name and reading (the simulation alone, or with the proposed events put in).
+    "outcome_scores": """
+CREATE TABLE outcome_scores (
+    arm          TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    basis        TEXT NOT NULL,           -- measured, rehearsed
+    matures_on   TEXT NOT NULL,
+    status       TEXT NOT NULL,           -- scored, pending, unpriced
+    score_json   TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date, ticker, basis)
+)""",
+    # A proposed event once its days have passed: one row per event.
+    "event_scores": """
+CREATE TABLE event_scores (
+    arm          TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    key          TEXT NOT NULL,           -- its number among the name's events at that meeting
+    last_on      TEXT NOT NULL,
+    status       TEXT NOT NULL,           -- scored, pending, unpriced, cannot_be_judged
+    score_json   TEXT NOT NULL,
+    PRIMARY KEY (arm, session_date, ticker, key)
 )""",
 }
 
@@ -621,6 +658,68 @@ class Journal:
             "SELECT score_json FROM forecast_scores WHERE arm = ? ORDER BY session_date, ticker, sessions", (arm,)
         )
         return [ForecastScore.model_validate_json(row["score_json"]) for row in rows]
+
+    # ── Trades worked back from their endings ────────────────────────────
+
+    def save_backward_set(self, tables: BackwardSet) -> None:
+        """Keep a session's reading, in place of an earlier one for that session.
+
+        The scores of the earlier one go with it: they measured other numbers.
+        """
+        key = (tables.arm, tables.session_date.isoformat())
+        with self.transaction():
+            self._db.execute("DELETE FROM outcome_scores WHERE arm = ? AND session_date = ?", key)
+            self._db.execute("DELETE FROM event_scores WHERE arm = ? AND session_date = ?", key)
+            self._db.execute("INSERT OR REPLACE INTO backward_sets VALUES (?, ?, ?, ?)",
+                             (*key, tables.run_id, tables.model_dump_json()))
+
+    def drop_backward_set(self, arm: str, session: date) -> None:
+        """Remove a session's reading and its scores: a meeting held again for the session made none."""
+        key = (arm, session.isoformat())
+        with self.transaction():
+            for table in ("outcome_scores", "event_scores", "backward_sets"):
+                self._db.execute(f"DELETE FROM {table} WHERE arm = ? AND session_date = ?", key)
+
+    def backward_set(self, arm: str, session: date) -> BackwardSet | None:
+        row = self._db.execute(
+            "SELECT set_json FROM backward_sets WHERE arm = ? AND session_date = ?", (arm, session.isoformat())
+        ).fetchone()
+        return BackwardSet.model_validate_json(row["set_json"]) if row else None
+
+    def backward_sets(self, arm: str) -> list[BackwardSet]:
+        """Every session's reading for an arm, the oldest first."""
+        rows = self._db.execute("SELECT set_json FROM backward_sets WHERE arm = ? ORDER BY session_date", (arm,))
+        return [BackwardSet.model_validate_json(row["set_json"]) for row in rows]
+
+    def save_outcome_scores(self, scores: list[OutcomeScore]) -> None:
+        with self.transaction():
+            for score in scores:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO outcome_scores VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (score.arm, score.session_date.isoformat(), score.ticker, score.basis,
+                     score.matures_on.isoformat(), score.status, score.model_dump_json()),
+                )
+
+    def outcome_scores(self, arm: str) -> list[OutcomeScore]:
+        rows = self._db.execute(
+            "SELECT score_json FROM outcome_scores WHERE arm = ? ORDER BY session_date, ticker, basis", (arm,)
+        )
+        return [OutcomeScore.model_validate_json(row["score_json"]) for row in rows]
+
+    def save_event_scores(self, scores: list[EventScore]) -> None:
+        with self.transaction():
+            for score in scores:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO event_scores VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (score.arm, score.session_date.isoformat(), score.ticker, score.key,
+                     score.last_on.isoformat(), score.status, score.model_dump_json()),
+                )
+
+    def event_scores(self, arm: str) -> list[EventScore]:
+        rows = self._db.execute(
+            "SELECT score_json FROM event_scores WHERE arm = ? ORDER BY session_date, ticker, key", (arm,)
+        )
+        return [EventScore.model_validate_json(row["score_json"]) for row in rows]
 
     # ── What the books hold ──────────────────────────────────────────────
 

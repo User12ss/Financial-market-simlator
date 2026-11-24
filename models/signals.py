@@ -352,7 +352,8 @@ class Event(BaseModel):
     seq: int
     ts: datetime
     stage: Literal[
-        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "orders",
+        "briefing", "settle", "macro", "views", "forecast", "scenario", "debate", "proposals", "checks", "risk",
+        "orders",
     ]
     speaker: str
     speaker_name: str

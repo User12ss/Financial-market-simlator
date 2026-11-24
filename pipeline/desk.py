@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Callable
 
 import config
+from agents.ticker.scenario import ScenarioAnalyst
 from data.ledger import Ledger, LedgerItem, LiveQuote
 from data.market_calendar import (
     is_trading_day, last_completed_session, next_trading_day, session_close, session_open,
@@ -51,16 +52,21 @@ from data.providers import DataError
 from data.render import render_ticker
 from data.snapshot import HEADLINES_PER_TICKER, SnapshotBuilder
 from journal.store import COMPLETED, Journal
+from models.planning import ScenarioDraft
 from models.signals import CheckinRecord, Event, UsageSummary
 from forecast.params import ParamStore
-from pipeline import quant
+from pipeline import quant, scenario
 from pipeline import universe as universe_rules
 from pipeline.checkin import NEW_YORK, Checkin, CheckinResult, clock
-from pipeline.daily import Arm, DailyPipeline, RunResult, _alive_elsewhere, _print_event
+from pipeline.daily import (
+    PIPELINE, RISK_OFFICER, Arm, BudgetExceeded, DailyPipeline, RunResult, _alive_elsewhere, _print_event,
+)
+from pipeline.report import render_view
 from utils.llm_client import LLMClient, LLMError
 
 # Market-wide series the watch prices beside the book: the index and the fear gauge.
 WATCH_MARKET = ["^GSPC", "^VIX"]
+SCENARIO_STAGE = "scenario"
 # The watch starts this long before the first check-in, so that check-in has something to read.
 WATCH_LEAD = timedelta(minutes=30)
 CHECKINS = ("premarket", "midday", "afternoon")
@@ -146,6 +152,7 @@ class _DeskClose(DailyPipeline):
         self.ledger = ledger
         self.params = ParamStore(forecast_dir)
         self._forecasts: dict[str, tuple] = {}       # by run: the forecast and its waiting rows, kept when the run finishes
+        self._turns: dict[str, quant.Turn] = {}      # by run: the quant engineer's turn, for the seat that speaks after the risk gate
         self.as_of: datetime | None = None
         self._since: datetime | None = None
         self._checkins: list[CheckinRecord] = []
@@ -156,7 +163,12 @@ class _DeskClose(DailyPipeline):
         # from the moment the snapshot was made, which may be before this run when the
         # baseline collected the session's data first.
         for ticker, item in data.snapshot.tickers.items():
-            self.ledger.add_headlines(ticker, item.news, data.snapshot.created_at)
+            added = self.ledger.add_headlines(ticker, item.news, data.snapshot.created_at)
+            if item.news:
+                # A fetch that brought headlines back worked, and the ledger is told that the name was read then:
+                # it is what says, later, whether a proposed event's headline could have been seen. A fetch that
+                # brought nothing back may have failed, so it is not counted as a reading.
+                self.ledger.note_read(ticker, data.snapshot.created_at, found=len(item.news), added=added)
         self.as_of = self._now()
         arm = self.arms[0].name
         rows = self.journal.meetings(arm)
@@ -192,9 +204,10 @@ class _DeskClose(DailyPipeline):
             turn = quant.speak(
                 self.journal, run.arm.name, run.run_id, run.data.snapshot, account, positions, views,
                 provider=self.builder.market, universe=self.universe, now=self._now(), store=self.params,
+                headlines=self._headlines_read,
             )
             # Made ready here, inside the same guard: whatever could fail in writing it down fails now.
-            held = quant.ready(turn.forecasts) if turn.forecasts is not None else None
+            held = quant.ready(turn.forecasts, turn.backward) if turn.forecasts is not None else None
         except Exception as e:  # a forecast that fails must not cost the meeting its decisions
             turn, held = quant.Turn([quant.problem_line(f"No forecast at this meeting: {type(e).__name__}: {e}")]), None
         for line in turn.lines:
@@ -203,6 +216,108 @@ class _DeskClose(DailyPipeline):
         # Said now, kept later: the forecast goes on record when the meeting is recorded as finished.
         if held is not None:
             self._forecasts[run.run_id] = held
+            self._turns = {run.run_id: turn}        # one meeting, one turn: nothing of an earlier run is kept
+
+    def _after_risk(self, run, account, positions, views) -> None:
+        """The scenario analyst's turn, once every decision of the meeting has been made.
+
+        It comes this late for one reason. Its model calls count against the
+        run's spending limit like any other, and a seat that decides nothing
+        must not be able to use up what the debaters or the manager needed:
+        by now they have all spoken. If the limit is reached here, this seat
+        stops, and the orders already decided are placed as they would have been.
+        """
+        turn = self._turns.pop(run.run_id, None)
+        if turn is None or not config.SCENARIO_ENABLED or turn.backward is None or not turn.backward.measured:
+            return
+        try:
+            self._rehearsal(run, turn, positions, views)
+        except BudgetExceeded as e:
+            self._say(run, SCENARIO_STAGE, PIPELINE, "all", "scenario_problem",
+                      remark=f"The scenario analyst is not asked further. {e}")
+        except Exception as e:  # like the forecast: a rehearsal that breaks must not cost the meeting its orders
+            self._say(run, SCENARIO_STAGE, PIPELINE, "all", "scenario_problem",
+                      remark=f"The scenario analyst's turn broke off: {type(e).__name__}: {e}")
+
+    def _headlines_read(
+        self, ticker: str, first: date, last: date, after: datetime | None = None,
+    ) -> tuple[list[str], bool]:
+        """The headlines about a name that belong to the sessions from `first` to `last` and came in later than
+        `after` (the cut-off of the meeting that asks), and whether the ledger read those days without a gap."""
+        return self.ledger.read_between(ticker, first, last, after)
+
+    def _rehearsal(self, run, turn: quant.Turn, positions, views) -> None:
+        """The scenario analyst names events, code checks them, and the same paths are read backwards again with them in.
+
+        A failure of the seat or of the rehearsal is said in a line of this
+        stage and goes no further: the run is not marked as degraded by it,
+        since no decision of the meeting rests on any of this.
+        """
+        seat = ScenarioAnalyst(run.arm.llm)
+        snapshot, session = run.data.snapshot, run.data.snapshot.session_date
+        tables = {table.ticker: table for table in turn.backward.measured}
+        forecasts = {forecast.ticker: forecast for forecast in turn.forecasts.tickers}
+        # An event has to follow from a headline, so a name the ledger holds none about is not asked about.
+        known = {
+            ticker: self.ledger.items(ticker, self.as_of, config.DESK_HEADLINE_DAYS)[:config.DESK_HEADLINES_SHOWN]
+            for ticker in tables
+        }
+        quiet = sorted(ticker for ticker, items in known.items() if not items)
+        if quiet:
+            self._say(run, SCENARIO_STAGE, PIPELINE, "all", "scenario_note", payload={"tickers": quiet},
+                      remark=f"The scenario analyst is not asked about {', '.join(quiet)}: the ledger holds no "
+                             "headline to follow an event from.")
+        kept = []
+        for ticker in scenario.asked_about(tables, set(positions), views, having=set(known) - set(quiet)):
+            item = snapshot.tickers[ticker]
+            facts = render_ticker(item.model_copy(update={"news": []}))
+            listed = scenario.render_headlines(known[ticker])
+            view_text = render_view(views[ticker]) if ticker in views else ""
+            trade = scenario.render_trade(forecasts[ticker], tables[ticker])
+            try:
+                draft = self._cached(
+                    run, f"scenario:{ticker}", "\n".join((facts, listed, view_text, trade)), ScenarioDraft,
+                    lambda: seat.events(ticker, facts, listed, view_text, trade),
+                )
+            except LLMError as e:
+                self._say(run, SCENARIO_STAGE, PIPELINE, "all", "scenario_problem", ticker=ticker,
+                          remark=f"{ticker}: the scenario analyst's call failed. {e}")
+                continue
+            events, refused = scenario.check_events(
+                ticker, session, tables[ticker].sessions, tables[ticker].close, draft,
+                [facts, listed, view_text, trade, seat.system_prompt], known[ticker],
+                name=item.fundamentals.name if item.fundamentals else "",
+            )
+            self._say(run, SCENARIO_STAGE, (seat.id, seat.name), quant.QUANT[0], "proposed_events", ticker=ticker,
+                      remark=draft.remark, is_llm=True,
+                      payload={"events": [event.model_dump(mode="json") for event in events], "refused": refused})
+            for reason in refused:
+                self._say(run, SCENARIO_STAGE, RISK_OFFICER, seat.id, "event_refused", ticker=ticker,
+                          remark=f"Event refused. {reason}")
+            kept += events
+        if not kept:
+            return
+        # The events are kept, and scored when their days have passed, whether or not the rehearsal itself comes off.
+        whole = turn.backward.model_copy(update={"events": kept, "asked_at": self.as_of})
+        lines: list[quant.Line] = []
+        try:
+            rehearsed, problems = quant.rehearse(turn.setup, turn.forecasts.states, kept)
+            lines = [quant.backward_line(table) for table in rehearsed]
+            if problems:
+                lines.append(quant.Line("scenario_problem", "Not rehearsed. " + " ".join(problems), {"problems": problems}))
+            whole = whole.model_copy(update={"rehearsed": rehearsed, "problems": turn.backward.problems + problems})
+        except Exception as e:
+            lines = [quant.Line("scenario_problem", f"No rehearsal at this meeting: {type(e).__name__}: {e}")]
+        try:
+            held = quant.ready(turn.forecasts, whole)
+        except Exception as e:
+            self._say(run, SCENARIO_STAGE, quant.QUANT, "all", "scenario_problem",
+                      remark=f"The proposed events and their rehearsal cannot be kept: {type(e).__name__}: {e}")
+            return
+        for line in lines:
+            self._say(run, SCENARIO_STAGE, quant.QUANT, "all", line.kind, ticker=line.ticker, remark=line.remark,
+                      payload=line.payload)
+        self._forecasts[run.run_id] = held
 
     def _finishing(self, run) -> None:
         held = self._forecasts.pop(run.run_id, None)

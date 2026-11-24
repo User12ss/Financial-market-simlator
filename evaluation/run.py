@@ -28,6 +28,8 @@ from evaluation.prices import Prices
 from evaluation.report import to_markdown
 from evaluation.scoring import score_views, scorecard, standing_runs
 from evaluation.trades import summarize, trades_of
+from data.ledger import Ledger
+from forecast import outcomes
 from forecast.scoring import card as forecast_card
 from forecast.scoring import reconcile
 from journal.store import Journal, JournalError
@@ -80,7 +82,7 @@ def caveats(card: Scorecard, trades: TradeSummary, random: RandomBenchmark) -> l
 def evaluate(
     journal: Journal, provider: MarketDataProvider, *, now: datetime | None = None, arms: list[str] | None = None,
     simulations: int | None = None, seed: int | None = None, reviewers: dict[str, LLMClient] | None = None,
-    rescore: bool = False, benchmark: str | None = None,
+    rescore: bool = False, benchmark: str | None = None, ledger: Ledger | None = None,
 ) -> Evaluation:
     """Evaluate every arm (or the ones named). `reviewers` holds a model for each arm that is to write lessons."""
     now = now or datetime.now(timezone.utc)
@@ -100,6 +102,7 @@ def evaluate(
         symbols.update(row["ticker"] for row in journal.rows(
             "SELECT DISTINCT ticker FROM paper_fills WHERE account = ?", (arm,)))
         symbols.update(forecast.ticker for forecasts in journal.forecast_sets(arm) for forecast in forecasts.tickers)
+        symbols.update(table.ticker for tables_ in journal.backward_sets(arm) for table in tables_.measured)
         if tables and (first is None or tables[0].session_date < first):
             first = tables[0].session_date
     prices = Prices.fetch(provider, symbols, first - timedelta(days=PRICE_LEAD_DAYS), as_of) if first else Prices({})
@@ -142,6 +145,17 @@ def evaluate(
                     f"{forecasts.scored} forecast(s) reconciled, made on {days} day(s). Forecasts made on the same "
                     "day rise and fall together, so they say less than their number suggests."
                 )
+        # The trades worked back, and the events proposed for them. A proposed event checked by a headline is
+        # judged from the ledger, where there is one: without it such an event stays beyond judging.
+        worked_back = None
+        if journal.backward_sets(arm):
+            endings, events, _ = outcomes.reconcile(
+                journal, arm, prices.frame, ledger.read_between if ledger is not None else None, as_of)
+            worked_back = {
+                **outcomes.tally(endings, events),
+                "endings": {status: sum(1 for score in endings if score.status == status)
+                            for status in ("scored", "pending", "unpriced")},
+            }
         written = []
         if arm in reviewers:
             written, problems = write_lessons(
@@ -155,7 +169,7 @@ def evaluate(
             first_session=tables[0].session_date if tables else None,
             last_session=tables[-1].session_date if tables else None,
             sessions_run=len(tables), curves=curves, scorecard=card, trades=summary, random=random,
-            forecasts=forecasts,
+            forecasts=forecasts, worked_back=worked_back,
             usage=usage_of(journal, arm), lessons_written=len(written), lessons_total=len(journal.lessons(arm)),
             notes=notes,
         ))
@@ -225,9 +239,11 @@ def main(argv: list[str] | None = None) -> int:
             except LLMError as e:
                 print(f"{arm}: no lessons will be written. {e}", file=sys.stderr)
 
+    # The ledger is the desk's. An evaluation of journals that never had a desk has none, and needs none.
+    ledger = Ledger(read_only=True) if Path(config.LEDGER_PATH).is_file() else None
     try:
         evaluation = evaluate(journal, YFinanceProvider(), arms=arms, simulations=args.simulations, seed=args.seed,
-                              reviewers=reviewers, rescore=args.rescore)
+                              reviewers=reviewers, rescore=args.rescore, ledger=ledger)
     except DataError as e:
         print(f"Cannot evaluate: {e}", file=sys.stderr)
         return 1
@@ -252,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
         if arm.forecasts is not None:
             print(f"  forecasts: {arm.forecasts.scored} reconciled, {arm.forecasts.pending} not yet due, "
                   f"{arm.forecasts.unpriced} without a price")
+        if arm.worked_back is not None:
+            counts, proposed = arm.worked_back["endings"], arm.worked_back["events"]
+            print(f"  trades worked back: {counts['scored']} ending(s) reconciled, {counts['pending']} not yet due, "
+                  f"{counts['unpriced']} without a price; {proposed['scored']} of {proposed['proposed']} proposed "
+                  f"event(s) judged, {proposed['unread']} with no reading of the headlines to judge by")
         if arm.lessons_written:
             print(f"  {arm.lessons_written} lesson(s) written")
     print(f"\n  {markdown}\n  {data}")

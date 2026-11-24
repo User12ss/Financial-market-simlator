@@ -243,7 +243,8 @@ def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear
     assert (seat["bear"] - seat["bull"]) % 14 == 7
     assert (seat["portfolio_manager"], seat["judge"]) == (0, 7)
     assert [stage["id"] for stage in body["stages"]] == [
-        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "orders"]
+        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "scenario",
+        "orders"]
     assert all(figure["title"] and figure["does"] for figure in roster)
     # Each has the mark of its field and what it is a specialist in, and no two share a mark.
     assert all(figure["emblem"] and len(figure["craft"]) >= 3 for figure in roster)
