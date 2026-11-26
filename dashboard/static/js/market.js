@@ -7,26 +7,27 @@
 
 import { num, pct, signedPct, usd, word } from "./dom.js";
 import { reached, tickerOf } from "./decisions.js";
+import { t } from "./i18n.js";
 
 export const BARS_ON_SCREEN = 60;           // about three months of sessions
 const SPARK = 30;
 
 // The page's own names for the series every snapshot records. A series without one keeps its recorded name.
 const NAMES = {
-  "^GSPC": "标普 500", "^IXIC": "纳斯达克", "^VIX": "VIX 波动率", "DX-Y.NYB": "美元指数", "GC=F": "黄金期货",
-  "CL=F": "WTI 原油期货", "^IRX": "3 个月国债", "^FVX": "5 年期国债", "^TNX": "10 年期国债", "^TYX": "30 年期国债",
-  XLK: "科技", XLV: "医疗", XLF: "金融", XLE: "能源", XLY: "可选消费", XLP: "必需消费", XLI: "工业", XLB: "材料",
-  XLU: "公用事业", XLRE: "房地产", XLC: "通信服务",
-  FEDFUNDS: "联邦基金利率", CPIAUCSL: "CPI", CPILFESL: "核心 CPI", UNRATE: "失业率", PAYEMS: "非农就业",
-  DGS2: "2 年期国债", DGS10: "10 年期国债", T10Y2Y: "10 年减 2 年利差", BAMLH0A0HYM2: "高收益债利差",
-  DCOILWTICO: "WTI 原油现货",
+  "^GSPC": t("标普 500"), "^IXIC": t("纳斯达克"), "^VIX": t("VIX 波动率"), "DX-Y.NYB": t("美元指数"), "GC=F": t("黄金期货"),
+  "CL=F": t("WTI 原油期货"), "^IRX": t("3 个月国债"), "^FVX": t("5 年期国债"), "^TNX": t("10 年期国债"), "^TYX": t("30 年期国债"),
+  XLK: t("科技"), XLV: t("医疗"), XLF: t("金融"), XLE: t("能源"), XLY: t("可选消费"), XLP: t("必需消费"), XLI: t("工业"), XLB: t("材料"),
+  XLU: t("公用事业"), XLRE: t("房地产"), XLC: t("通信服务"),
+  FEDFUNDS: t("联邦基金利率"), CPIAUCSL: "CPI", CPILFESL: t("核心 CPI"), UNRATE: t("失业率"), PAYEMS: t("非农就业"),
+  DGS2: t("2 年期国债"), DGS10: t("10 年期国债"), T10Y2Y: t("10 年减 2 年利差"), BAMLH0A0HYM2: t("高收益债利差"),
+  DCOILWTICO: t("WTI 原油现货"),
 };
 const CURVE = [["^IRX", "3M"], ["^FVX", "5Y"], ["^TNX", "10Y"], ["^TYX", "30Y"]];
 
 const given = (value) => typeof value === "number" && Number.isFinite(value);
 const leanOf = (value) => (!given(value) || value === 0 ? "flat" : value > 0 ? "up" : "down");
 /** A move in percentage points, signed: how a change in a yield or a spread is quoted. */
-const points = (value) => (given(value) ? `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)} 点` : "—");
+const points = (value) => (given(value) ? t`${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)} 点` : "—");
 
 /**
  * What a screen is about at one line of the record.
@@ -83,8 +84,8 @@ export function fanOf(ticker, events, upTo) {
 
 /** One horizon of a forecast in words: where half the simulated paths end, and nine in ten. */
 export function fanText(band) {
-  return `${band.sessions} 个交易日后：一半的模拟路径落在 ${usd(band["25"])} 到 ${usd(band["75"])}，`
-    + `九成落在 ${usd(band["5"])} 到 ${usd(band["95"])}`;
+  return t`${band.sessions} 个交易日后：一半的模拟路径落在 ${usd(band["25"])} 到 ${usd(band["75"])}，`
+    + t`九成落在 ${usd(band["5"])} 到 ${usd(band["95"])}`;
 }
 
 /**
@@ -176,12 +177,12 @@ export function levelsOf(row, events, upTo) {
 
 /** What a level is called on the screen. */
 export function levelText(level) {
-  const where = level.off === "above" ? "（在图上方）" : level.off === "below" ? "（在图下方）" : "";
+  const where = level.off === "above" ? t("（在图上方）") : level.off === "below" ? t("（在图下方）") : "";
   if (level.kind === "now") {
     const change = given(level.change) ? ` ${level.change > 0 ? "▲ +" : level.change < 0 ? "▼ −" : ""}${Math.abs(level.change).toFixed(2)}%` : "";
-    return `当天盘中报价 ${usd(level.price)}${change}${where}`;
+    return t`当天盘中报价 ${usd(level.price)}${change}${where}`;
   }
-  const name = level.kind === "limit" ? "限价" : level.by === "analyst" ? "分析师建议止损" : "订单止损";
+  const name = level.kind === "limit" ? t("限价") : level.by === "analyst" ? t("分析师建议止损") : t("订单止损");
   return `${name} ${usd(level.price)}${where}`;
 }
 
@@ -189,16 +190,16 @@ export function levelText(level) {
 export function readouts(item) {
   const price = item.price || {}, tech = item.technicals || {};
   const found = [
-    { key: "close", label: "收盘", text: usd(price.close), lean: "flat" },
-    { key: "d1", label: "1 日", text: signedPct(price.change_1d_pct), lean: leanOf(price.change_1d_pct) },
-    { key: "d5", label: "5 日", text: signedPct(price.return_5d_pct), lean: leanOf(price.return_5d_pct) },
-    { key: "m1", label: "1 月", text: signedPct(price.return_1mo_pct), lean: leanOf(price.return_1mo_pct) },
-    { key: "m3", label: "3 月", text: signedPct(price.return_3mo_pct), lean: leanOf(price.return_3mo_pct) },
-    { key: "atr", label: "日均波幅 ATR", text: given(tech.atr14_pct) ? pct(tech.atr14_pct) : "—", lean: "flat" },
+    { key: "close", label: t("收盘"), text: usd(price.close), lean: "flat" },
+    { key: "d1", label: t("1 日"), text: signedPct(price.change_1d_pct), lean: leanOf(price.change_1d_pct) },
+    { key: "d5", label: t("5 日"), text: signedPct(price.return_5d_pct), lean: leanOf(price.return_5d_pct) },
+    { key: "m1", label: t("1 月"), text: signedPct(price.return_1mo_pct), lean: leanOf(price.return_1mo_pct) },
+    { key: "m3", label: t("3 月"), text: signedPct(price.return_3mo_pct), lean: leanOf(price.return_3mo_pct) },
+    { key: "atr", label: t("日均波幅 ATR"), text: given(tech.atr14_pct) ? pct(tech.atr14_pct) : "—", lean: "flat" },
     { key: "rsi", label: "RSI 14", text: num(tech.rsi14, 1), lean: "flat" },
   ];
   const place = rangePlace(price);
-  if (place !== null) found.push({ key: "range", label: "52 周区间位置", text: `${Math.round(place * 100)}%`, lean: "flat" });
+  if (place !== null) found.push({ key: "range", label: t("52 周区间位置"), text: `${Math.round(place * 100)}%`, lean: "flat" });
   return found;
 }
 
@@ -211,7 +212,7 @@ export function rangePlace(price) {
 /** The recorded levels drawn at the right edge of a chart: averages, the Bollinger band, a day's usual swing. */
 export function gauges(item) {
   const price = item.price || {}, tech = item.technicals || {};
-  const lines = [["sma20", "20 日均线"], ["sma50", "50 日均线"], ["sma200", "200 日均线"]]
+  const lines = [["sma20", t("20 日均线")], ["sma50", t("50 日均线")], ["sma200", t("200 日均线")]]
     .filter(([key]) => given(tech[key])).map(([key, label]) => ({ key, label, price: tech[key] }));
   return {
     lines,
@@ -230,25 +231,25 @@ export function sinceThen(item) {
 }
 
 export function sinceText(since) {
-  return `之后 ${since.days} 个交易日（到 ${since.through}）：${usd(since.from)} → ${usd(since.to)}，${signedPct(since.change_pct)}`;
+  return t`之后 ${since.days} 个交易日（到 ${since.through}）：${usd(since.from)} → ${usd(since.to)}，${signedPct(since.change_pct)}`;
 }
 
 /** One recorded series as a reading: its name, its value, and its recent moves in the units they are quoted in. */
 function reading(point) {
   if ("series_id" in point) {                                     // a macro series: latest, previous, year over year
-    const value = point.unit === "%" || point.unit === "pp" ? `${point.latest_value.toFixed(2)}${point.unit === "%" ? "%" : " 点"}`
-      : point.unit === "thousand jobs" ? `${num(point.latest_value)} 千人` : num(point.latest_value, 2);
+    const value = point.unit === "%" || point.unit === "pp" ? `${point.latest_value.toFixed(2)}${point.unit === "%" ? "%" : t(" 点")}`
+      : point.unit === "thousand jobs" ? t`${num(point.latest_value)} 千人` : num(point.latest_value, 2);
     const moves = [];
     if (given(point.previous_value)) {
       const move = point.latest_value - point.previous_value;
       moves.push({
-        label: "较上期", lean: leanOf(move),
-        text: point.unit === "thousand jobs" ? `${move > 0 ? "+" : move < 0 ? "−" : ""}${num(Math.abs(move))} 千人`
+        label: t("较上期"), lean: leanOf(move),
+        text: point.unit === "thousand jobs" ? t`${move > 0 ? "+" : move < 0 ? "−" : ""}${num(Math.abs(move))} 千人`
           : point.unit === "index" ? (move > 0 ? "+" : move < 0 ? "−" : "") + num(Math.abs(move), 2) : points(move),
       });
     }
-    if (given(point.yoy_change_pct)) moves.push({ label: "同比", text: signedPct(point.yoy_change_pct), lean: leanOf(point.yoy_change_pct) });
-    return { id: point.series_id, name: NAMES[point.series_id] || point.name, value, as_of: point.latest_date, moves };
+    if (given(point.yoy_change_pct)) moves.push({ label: t("同比"), text: signedPct(point.yoy_change_pct), lean: leanOf(point.yoy_change_pct) });
+    return { id: point.series_id, name: NAMES[point.series_id] || point.name, value, as_of: point.latest_date, moves, trend: null };
   }
   const yields = point.group === "yields";                        // a yield's moves are quoted in points, not percent
   const move = (label, percent, own) => ({
@@ -257,8 +258,51 @@ function reading(point) {
   return {
     id: point.symbol, name: NAMES[point.symbol] || point.name, as_of: point.last_date,
     value: yields ? `${point.value.toFixed(2)}%` : num(point.value, 2),
-    moves: [move("1 日", point.change_1d_pct, point.change_1d), move("5 日", point.return_5d_pct, point.change_5d),
-      move("1 月", point.return_1mo_pct, point.change_1mo)],
+    moves: [move(t("1 日"), point.change_1d_pct, point.change_1d), move(t("5 日"), point.return_5d_pct, point.change_5d),
+      move(t("1 月"), point.return_1mo_pct, point.change_1mo)],
+    trend: trendOf(point),
+  };
+}
+
+// How many sessions back the snapshot measures its "5 日" and "1 月" changes from (data/snapshot.py).
+const WEEK = 5, MONTH = 21;
+
+/**
+ * Where a market series has been lately, oldest first, as far as the record says.
+ *  - "daily": its recorded daily closes (the index and the sector funds, since snapshots began keeping them);
+ *  - "marks": no closes on record, so the four values the snapshot does give: the session's own, and that
+ *    value less its recorded change over one session, five and twenty-one. Nothing between them is known,
+ *    and nothing is drawn as if it were.
+ * `back` is how many sessions before the snapshot's session a value stood. Null with fewer than two values.
+ */
+export function trendOf(point) {
+  if (!given(point.value)) return null;
+  if (Array.isArray(point.closes) && point.closes.filter(given).length >= 2) {
+    const closes = point.closes.filter(given);
+    return { kind: "daily", points: closes.map((value, at) => ({ back: closes.length - 1 - at, value })) };
+  }
+  const marks = [[MONTH, point.change_1mo], [WEEK, point.change_5d], [1, point.change_1d]]
+    .filter(([, change]) => given(change)).map(([back, change]) => ({ back, value: point.value - change }));
+  return marks.length ? { kind: "marks", points: [...marks, { back: 0, value: point.value }] } : null;
+}
+
+/**
+ * A trend on a small plot: across by how long ago, up by value. Returns the line, the same line closed along
+ * the bottom (for a wash under it), where each value sits, and which way it went from its first value to its last.
+ */
+export function trendPlot(trend, width, height, pad = 2.5) {
+  const values = trend.points.map((point) => point.value);
+  const low = Math.min(...values), high = Math.max(...values), spread = high - low || 1;
+  const far = Math.max(...trend.points.map((point) => point.back)) || 1;
+  const dots = trend.points.map((point) => ({
+    x: pad + (1 - point.back / far) * (width - 2 * pad), y: pad + ((high - point.value) / spread) * (height - 2 * pad),
+    back: point.back, value: point.value,
+  }));
+  const line = dots.map((dot, at) => `${at ? "L" : "M"}${dot.x.toFixed(1)},${dot.y.toFixed(1)}`).join(" ");
+  const first = dots[0], last = dots[dots.length - 1];
+  return {
+    line, dots, area: `${line} L${last.x.toFixed(1)},${height} L${first.x.toFixed(1)},${height} Z`,
+    lean: leanOf(last.value - first.value),
   };
 }
 
@@ -333,7 +377,7 @@ export function tape(market) {
  */
 export function citationText(cited) {
   const metric = word("metric", cited.metric), value = num(cited.value, 2);
-  if (cited.actual === null || cited.actual === undefined) return `${metric} ${value}（快照里没有这项）`;
+  if (cited.actual === null || cited.actual === undefined) return t`${metric} ${value}（快照里没有这项）`;
   const actual = num(cited.actual, 2);
-  return actual === value ? `${metric} ${value}` : `${metric} ${value}（快照里是 ${actual}）`;
+  return actual === value ? `${metric} ${value}` : t`${metric} ${value}（快照里是 ${actual}）`;
 }

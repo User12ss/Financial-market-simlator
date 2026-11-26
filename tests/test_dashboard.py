@@ -201,8 +201,9 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
 
     scripts = {path.name: path.read_text(encoding="utf-8") for path in (STATIC / "js").glob("*.js")}
     assert set(scripts) == {
-        "app.js", "charts.js", "day.js", "decisions.js", "dom.js", "emblems.js", "figures.js", "live.js", "market.js",
-        "meeting.js", "motion.js", "pages.js", "playback.js", "screen.js", "tape.js", "trail.js"}
+        "app.js", "backdrop.js", "brief.js", "charts.js", "day.js", "decisions.js", "dom.js", "emblems.js", "en.js", "figures.js", "i18n.js", "links.js",
+        "live.js", "market.js", "meeting.js", "motion.js", "network.js", "pages.js", "playback.js", "screen.js",
+        "tape.js", "team.js", "trail.js"}
     everything = "\n".join(scripts.values())
     # One place asks the server for anything, and it only reads.
     assert [name for name, text in scripts.items() if "fetch(" in text] == ["dom.js"]
@@ -218,17 +219,18 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
 def test_the_pages_own_logic_passes_its_tests():
     """Playback, keeping a room in step with a live run, how a decision came about, how the trail shows it line
     by line, which run the 决策 page reads, what the market screens show and when, each figure's panel, text
-    kept as text and revealed unchanged, number formats, seats, a check-in of the desk read off its record, and
-    the strip of the day's meetings: tests/js, run by node."""
+    kept as text and revealed unchanged, number formats, seats, a check-in of the desk read off its record, the
+    strip of the day's meetings, and the meeting at a glance with the links between its seats: tests/js, run by
+    node."""
     files = sorted(path.name for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     assert files == ["checkin.test.mjs", "day.test.mjs", "decisions.test.mjs", "decisions_page.test.mjs",
-                     "dom.test.mjs", "forecasts_page.test.mjs", "format.test.mjs", "live.test.mjs", "market.test.mjs",
-                     "motion.test.mjs",
-                     "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "trail.test.mjs"]
+                     "dom.test.mjs", "english.test.mjs", "forecasts_page.test.mjs", "format.test.mjs", "links.test.mjs", "live.test.mjs",
+                     "market.test.mjs", "motion.test.mjs",
+                     "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "team.test.mjs", "trail.test.mjs"]
     result = subprocess.run([NODE, "--test", *(f"tests/js/{name}" for name in files)],
                             cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert int(re.search(r"pass (\d+)", result.stdout).group(1)) >= 127 and re.search(r"fail 0\b", result.stdout)
+    assert int(re.search(r"pass (\d+)", result.stdout).group(1)) >= 160 and re.search(r"fail 0\b", result.stdout)
 
 
 # ── Who is in the room ───────────────────────────────────────────────────────
@@ -1083,7 +1085,16 @@ def test_the_market_data_shown_for_a_run_is_what_its_own_snapshot_recorded(week,
             mode="json", exclude={"name", "quote_type", "sector", "industry"})
         assert mine["usable"] is item.usable and mine["issues"] == [issue.model_dump(mode="json") for issue in item.issues]
         assert mine["next_earnings"] == (item.next_earnings.isoformat() if item.next_earnings else None)
-    assert body["market"] == [point.model_dump(mode="json") for point in snapshot.market]
+    # Each market series as recorded. Where the snapshot kept a series' daily bars (the index and the sector
+    # funds), its latest closes go with it, for the line in its tile; a series without bars gets none, and
+    # nothing is made up for it.
+    assert [{key: value for key, value in point.items() if key != "closes"} for point in body["market"]] == [
+        point.model_dump(mode="json") for point in snapshot.market]
+    kept = {point["symbol"]: point["closes"] for point in body["market"] if "closes" in point}
+    assert set(kept) == set(snapshot.market_bars) & {point.symbol for point in snapshot.market}
+    for symbol, closes in kept.items():
+        recorded = snapshot.market_bars[symbol].close
+        assert closes == [round(value, 4) for value in recorded[-60:]] and 2 <= len(closes) <= 60
     assert body["macro"] == [point.model_dump(mode="json") for point in snapshot.macro]
 
     # The same run by name, and with nothing named the latest session.

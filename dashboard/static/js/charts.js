@@ -5,6 +5,7 @@
 // hover-only and nothing is told by colour alone.
 
 import { el, svg, clear, showTip, hideTip, table } from "./dom.js";
+import { t } from "./i18n.js";
 
 const css = (name) => `var(${name})`;
 const given = (value) => value !== null && value !== undefined;
@@ -49,7 +50,7 @@ function legend(keys) {
 }
 
 function tableTwin(node) {
-  return el("details", {}, el("summary", { text: "查看数据表" }), node);
+  return el("details", {}, el("summary", { text: t("查看数据表") }), node);
 }
 
 /** Where a point in the chart's own units sits on the screen. */
@@ -66,7 +67,7 @@ function onScreen(frame, x, y) {
 export function lineChart({ series, valueText, label }) {
   const shown = series.filter((item) => item.points.length > 0);
   const days = [...new Set(shown.flatMap((item) => item.points.map((point) => point.d)))].sort();
-  if (days.length === 0) return el("p", { class: "empty", text: "还没有可以画的净值记录。" });
+  if (days.length === 0) return el("p", { class: "empty", text: t("还没有可以画的净值记录。") });
   const values = shown.flatMap((item) => item.points.map((point) => point.v));
   const marks = ticks(Math.min(...values), Math.max(...values));
   const low = marks[0], high = marks[marks.length - 1];
@@ -163,7 +164,7 @@ export function lineChart({ series, valueText, label }) {
     return frame;
   }
 
-  const columns = [{ title: "交易日", cell: (day) => day }].concat(shown.map((item, at) => ({
+  const columns = [{ title: t("交易日"), cell: (day) => day }].concat(shown.map((item, at) => ({
     title: item.name, num: true, cell: (day) => (lookup[at].has(day) ? valueText(lookup[at].get(day)) : null),
   })));
   return el("div", { class: "chart" },
@@ -193,7 +194,7 @@ export function rateBars({ rows, barName, markerName, label }) {
       const round = Math.min(4, width);
       const shape = `M${x(0)},${mid - thick / 2} h${width - round} q${round},0 ${round},${round} v${thick - 2 * round} ` +
         `q0,${round} ${-round},${round} h${-(width - round)} z`;
-      const text = given(row.value) ? `${Math.round(row.value * 100)}%` : "没有数据";
+      const text = given(row.value) ? `${Math.round(row.value * 100)}%` : t("没有数据");
       const tipRows = [{ color: css("--series-1"), value: text, name: barName }];
       if (given(row.marker)) tipRows.push({ color: css("--ink"), value: `${Math.round(row.marker * 100)}%`, name: markerName });
       if (row.note) tipRows.push({ value: row.note, name: "" });
@@ -228,9 +229,9 @@ export function quantileStrip({ quantiles, value, valueName, valueText, label })
   const low = marks[0], high = marks[marks.length - 1];
   const rows = [
     { color: css("--series-1"), value: valueText(value), name: valueName },
-    { color: css("--ink"), value: valueText(quantiles["50"]), name: "随机结果的中位数" },
-    { color: css("--band"), value: `${valueText(quantiles["25"])} 到 ${valueText(quantiles["75"])}`, name: "中间一半" },
-    { color: css("--muted"), value: `${valueText(quantiles["5"])} 到 ${valueText(quantiles["95"])}`, name: "5% 到 95%" },
+    { color: css("--ink"), value: valueText(quantiles["50"]), name: t("随机结果的中位数") },
+    { color: css("--band"), value: t`${valueText(quantiles["25"])} 到 ${valueText(quantiles["75"])}`, name: t("中间一半") },
+    { color: css("--muted"), value: t`${valueText(quantiles["5"])} 到 ${valueText(quantiles["95"])}`, name: t("5% 到 95%") },
   ];
 
   function draw(W) {
@@ -267,17 +268,17 @@ export function quantileStrip({ quantiles, value, valueName, valueText, label })
   }
 
   const twin = table(
-    [{ title: "位置", cell: (row) => row.name }, { title: "盈亏", num: true, cell: (row) => row.text }],
+    [{ title: t("位置"), cell: (row) => row.name }, { title: t("盈亏"), num: true, cell: (row) => row.text }],
     [
       { name: valueName, text: valueText(value) },
-      ...["5", "25", "50", "75", "95"].map((key) => ({ name: `随机结果的 ${key}% 分位`, text: valueText(quantiles[key]) })),
+      ...["5", "25", "50", "75", "95"].map((key) => ({ name: t`随机结果的 ${key}% 分位`, text: valueText(quantiles[key]) })),
     ]);
   return el("div", { class: "chart" },
     legend([
       { name: valueName, color: css("--series-1"), mark: "dot" },
-      { name: "随机结果的中间一半（25%–75%）", color: css("--band"), mark: "box" },
-      { name: "5%–95% 的范围", color: css("--muted"), mark: "line" },
-      { name: "中位数", color: css("--ink"), mark: "tick" },
+      { name: t("随机结果的中间一半（25%–75%）"), color: css("--band"), mark: "box" },
+      { name: t("5%–95% 的范围"), color: css("--muted"), mark: "line" },
+      { name: t("中位数"), color: css("--ink"), mark: "tick" },
     ]),
     fitted(draw), tableTwin(twin));
 }
@@ -287,7 +288,7 @@ export function meter({ name, valueText, limitText, share, tripped }) {
   return el("div", { class: tripped ? "meter tripped" : "meter" },
     el("div", { class: "row spread" },
       el("span", { text: name }),
-      el("span", { class: "small muted", text: `${valueText}，上限 ${limitText}` })),
-    el("div", { class: "bar", role: "img", "aria-label": `${name}：${valueText}，上限 ${limitText}` },
+      el("span", { class: "small muted", text: t`${valueText}，上限 ${limitText}` })),
+    el("div", { class: "bar", role: "img", "aria-label": t`${name}：${valueText}，上限 ${limitText}` },
       el("div", { class: "fill", style: `width:${Math.round(Math.min(1, Math.max(0, share)) * 100)}%` })));
 }

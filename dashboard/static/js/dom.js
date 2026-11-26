@@ -2,6 +2,8 @@
 // recorded text reaches the page through textContent, so what a model wrote
 // can never be read as markup. The only request this page ever makes is GET.
 
+import { localize, t } from "./i18n.js";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
 export const DASH = "—";
 
@@ -43,9 +45,10 @@ export async function getJSON(path, params = {}) {
   const address = query.size ? `${path}?${query}` : path;
   try {
     const response = await fetch(address, { method: "GET", cache: "no-store" });
-    return { ok: response.ok, status: response.status, data: await response.json() };
+    // In English the server's own names and tallies are put into English here, once, for every page.
+    return { ok: response.ok, status: response.status, data: localize(await response.json()) };
   } catch (error) {
-    return { ok: false, status: 0, data: { error: "连不上看板服务。它可能已经停了。" } };
+    return { ok: false, status: 0, data: { error: t("连不上看板服务。它可能已经停了。") } };
   }
 }
 
@@ -108,10 +111,10 @@ export function clock(iso) {
 export function span(seconds) {
   if (missing(seconds)) return DASH;
   const whole = Math.round(seconds);
-  if (whole < 60) return `${whole} 秒`;
+  if (whole < 60) return t`${whole} 秒`;
   const minutes = Math.floor(whole / 60);
-  if (minutes < 60) return `${minutes} 分 ${whole % 60} 秒`;
-  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+  if (minutes < 60) return t`${minutes} 分 ${whole % 60} 秒`;
+  return t`${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
 export function bytes(count) {
@@ -126,34 +129,34 @@ export function bytes(count) {
 // rule wrote is never passed through here: it is shown as recorded.
 
 const WORDS = {
-  side: { buy: "买入", sell: "卖出" },
-  kind: { market: "市价", limit: "限价", stop: "止损" },
-  direction: { bullish: "看多", neutral: "中性", bearish: "看空" },
-  action: { buy: "买入", sell: "卖出", trim: "减仓", hold: "持有", keep: "保留", withdraw: "撤回买单" },
+  side: { buy: t("买入"), sell: t("卖出") },
+  kind: { market: t("市价"), limit: t("限价"), stop: t("止损") },
+  direction: { bullish: t("看多"), neutral: t("中性"), bearish: t("看空") },
+  action: { buy: t("买入"), sell: t("卖出"), trim: t("减仓"), hold: t("持有"), keep: t("保留"), withdraw: t("撤回买单") },
   // The desk's meetings through the day, and what an analyst's update at a check-in does to a view that stands.
-  meeting: { premarket: "盘前会", midday: "午间碰头", afternoon: "尾盘碰头", close: "收盘会" },
-  effect: { unchanged: "不变", strengthened: "加强", weakened: "削弱", broken: "不成立" },
-  verdict: { approved: "批准", reduced: "削减", rejected: "拒绝" },
-  check: { accepted: "接受", rejected: "拒绝" },
+  meeting: { premarket: t("盘前会"), midday: t("午间碰头"), afternoon: t("尾盘碰头"), close: t("收盘会") },
+  effect: { unchanged: t("不变"), strengthened: t("加强"), weakened: t("削弱"), broken: t("不成立") },
+  verdict: { approved: t("批准"), reduced: t("削减"), rejected: t("拒绝") },
+  check: { accepted: t("接受"), rejected: t("拒绝") },
   run: {
-    ok: "正常完成", degraded: "降级完成", failed: "失败", running: "运行中", superseded: "已被重跑取代",
-    interrupted: "中断（进程已不在）",
+    ok: t("正常完成"), degraded: t("降级完成"), failed: t("失败"), running: t("运行中"), superseded: t("已被重跑取代"),
+    interrupted: t("中断（进程已不在）"),
   },
-  appetite: { risk_on: "偏进取", neutral: "中性", risk_off: "偏防守" },
-  stance: { supportive: "偏多", neutral: "中性", restrictive: "偏空" },
-  ownership: { own: "持有", do_not_own: "不持有" },
-  tilt: { overweight: "超配", underweight: "低配" },
-  trigger: { top_candidate: "头号候选", exit_signal: "退出信号" },
-  debater: { bull: "多方", bear: "空方" },
-  trade: { open: "持仓中", closed: "已平仓" },
-  position: { candidate: "候选", held: "已持有" },
+  appetite: { risk_on: t("偏进取"), neutral: t("中性"), risk_off: t("偏防守") },
+  stance: { supportive: t("偏多"), neutral: t("中性"), restrictive: t("偏空") },
+  ownership: { own: t("持有"), do_not_own: t("不持有") },
+  tilt: { overweight: t("超配"), underweight: t("低配") },
+  trigger: { top_candidate: t("头号候选"), exit_signal: t("退出信号") },
+  debater: { bull: t("多方"), bear: t("空方") },
+  trade: { open: t("持仓中"), closed: t("已平仓") },
+  position: { candidate: t("候选"), held: t("已持有") },
   // The figures an analyst may cite, by the snapshot's own names for them.
   metric: {
-    close: "收盘价", change_1d_pct: "1 日涨跌%", return_5d_pct: "5 日涨跌%", return_1mo_pct: "1 月涨跌%",
-    return_3mo_pct: "3 月涨跌%", return_1y_pct: "1 年涨跌%", high_52w: "52 周高点", low_52w: "52 周低点",
-    sma20: "20 日均线", sma50: "50 日均线", sma200: "200 日均线", rsi14: "RSI 14", macd: "MACD",
-    macd_signal: "MACD 信号线", atr14_pct: "ATR%", trailing_pe: "市盈率", forward_pe: "预期市盈率",
-    profit_margin_pct: "利润率%", beta: "Beta", market_cap_billion: "市值（十亿美元）",
+    close: t("收盘价"), change_1d_pct: t("1 日涨跌%"), return_5d_pct: t("5 日涨跌%"), return_1mo_pct: t("1 月涨跌%"),
+    return_3mo_pct: t("3 月涨跌%"), return_1y_pct: t("1 年涨跌%"), high_52w: t("52 周高点"), low_52w: t("52 周低点"),
+    sma20: t("20 日均线"), sma50: t("50 日均线"), sma200: t("200 日均线"), rsi14: "RSI 14", macd: "MACD",
+    macd_signal: t("MACD 信号线"), atr14_pct: "ATR%", trailing_pe: t("市盈率"), forward_pe: t("预期市盈率"),
+    profit_margin_pct: t("利润率%"), beta: "Beta", market_cap_billion: t("市值（十亿美元）"),
   },
 };
 
@@ -177,7 +180,7 @@ export function state(level, label) {
 }
 
 export function runState(run) {
-  if (!run) return state("idle", "没有运行记录");
+  if (!run) return state("idle", t("没有运行记录"));
   const level = {
     ok: "good", degraded: "warning", failed: "critical", interrupted: "critical", running: "live",
   }[run.status] || "idle";
@@ -204,7 +207,7 @@ export function empty(...children) {
  * A table. Each column: { title, num, cell(row) } where cell returns text or a node.
  * Returns the empty note instead when there are no rows.
  */
-export function table(columns, rows, none = "没有记录。") {
+export function table(columns, rows, none = t("没有记录。")) {
   if (!rows || rows.length === 0) return empty(none);
   const head = el("tr", {}, columns.map((column) => el("th", { class: column.num ? "num" : null, text: column.title })));
   const body = rows.map((row) => el("tr", {}, columns.map((column) => {

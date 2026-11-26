@@ -5,6 +5,7 @@
 // no page in sight.
 
 import { el, clear, word } from "./dom.js";
+import { t } from "./i18n.js";
 
 const two = (part) => String(part).padStart(2, "0");
 
@@ -18,20 +19,20 @@ export function minute(iso) {
 export function ago(iso, now) {
   const minutes = Math.floor((now - new Date(iso).getTime()) / 60000);
   if (!Number.isFinite(minutes)) return "—";
-  if (minutes < 1) return "刚刚";
-  if (minutes < 60) return `${minutes} 分钟前`;
-  if (minutes < 60 * 24) return `${Math.floor(minutes / 60)} 小时前`;
-  return `${Math.floor(minutes / 60 / 24)} 天前`;
+  if (minutes < 1) return t("刚刚");
+  if (minutes < 60) return t`${minutes} 分钟前`;
+  if (minutes < 60 * 24) return t`${Math.floor(minutes / 60)} 小时前`;
+  return t`${Math.floor(minutes / 60 / 24)} 天前`;
 }
 
 const moved = (value) => `${value > 0 ? "▲ +" : value < 0 ? "▼ −" : ""}${Math.abs(value).toFixed(2)}%`;
 
 /** How a meeting stands, in a word or two, for its place on the day's strip. */
 function standing(meeting) {
-  if (meeting.live) return "进行中";
-  if (meeting.status === "failed") return "失败";
-  if (meeting.status === "interrupted") return "中断";
-  return `${meeting.events} 条${meeting.status === "degraded" ? "，有缺漏" : ""}`;
+  if (meeting.live) return t("进行中");
+  if (meeting.status === "failed") return t("失败");
+  if (meeting.status === "interrupted") return t("中断");
+  return t`${meeting.events} 条${meeting.status === "degraded" ? t("，有缺漏") : ""}`;
 }
 
 /** One entry per meeting of the day, in the order they were held. `shown` is the one in the room. */
@@ -54,15 +55,15 @@ export function watchText(watch, now) {
   if (!watch) return null;
   const headlines = watch.headlines || {}, quotes = watch.quotes || {};
   const parts = [
-    `最近一次巡检 ${minute(watch.at)}（${ago(watch.at, now)}）`,
-    `盯着 ${watch.tickers} 只股票，新消息 ${headlines.added || 0} 条，报价 ${quotes.count || 0} 个`,
+    t`最近一次巡检 ${minute(watch.at)}（${ago(watch.at, now)}）`,
+    t`盯着 ${watch.tickers} 只股票，新消息 ${headlines.added || 0} 条，报价 ${quotes.count || 0} 个`,
   ];
   const biggest = (watch.moves || [])[0];
-  if (biggest) parts.push(`当天波动最大 ${biggest.ticker} ${moved(biggest.change_pct)}`);
-  const missing = [...(headlines.failed || []).map((ticker) => `${ticker} 的新闻`), ...(quotes.error ? ["报价"] : [])];
-  if (missing.length) parts.push(`没取到：${missing.join("、")}`);
+  if (biggest) parts.push(t`当天波动最大 ${biggest.ticker} ${moved(biggest.change_pct)}`);
+  const missing = [...(headlines.failed || []).map((ticker) => t`${ticker} 的新闻`), ...(quotes.error ? [t("报价")] : [])];
+  if (missing.length) parts.push(t`没取到：${missing.join("、")}`);
   const next = watch.next_meeting;
-  if (next && new Date(next.at).getTime() > now) parts.push(`下一场 ${minute(next.at)} ${word("meeting", next.kind)}`);
+  if (next && new Date(next.at).getTime() > now) parts.push(t`下一场 ${minute(next.at)} ${word("meeting", next.kind)}`);
   return parts.join(" · ");
 }
 
@@ -73,9 +74,9 @@ export function watchText(watch, now) {
 export function dayStrip({ onPick, onNow = null, now = () => Date.now() }) {
   const title = el("strong", { class: "day-title" });
   const chips = el("div", { class: "day-meetings" });
-  const back = el("button", { type: "button", class: "day-now", hidden: true, text: "回到当下", onclick: () => onNow && onNow() });
+  const back = el("button", { type: "button", class: "day-now", hidden: true, text: t("回到当下"), onclick: () => onNow && onNow() });
   const watchLine = el("div", { class: "day-watch small" });
-  const node = el("section", { class: "day", "aria-label": "这一天的会议", hidden: true },
+  const node = el("section", { class: "day", "aria-label": t("这一天的会议"), hidden: true },
     el("div", { class: "day-row" }, title, chips, back), watchLine);
   let state = { data: null, shown: null, away: false };
 
@@ -83,9 +84,9 @@ export function dayStrip({ onPick, onNow = null, now = () => Date.now() }) {
     const { data, shown } = state;
     node.hidden = !data || !data.day;
     if (node.hidden) return;
-    title.textContent = `${data.day} 的会议`;
+    title.textContent = t`${data.day} 的会议`;
     clear(chips);
-    if (data.meetings.length === 0) chips.append(el("span", { class: "muted", text: "这一天还没有开过会。" }));
+    if (data.meetings.length === 0) chips.append(el("span", { class: "muted", text: t("这一天还没有开过会。") }));
     for (const chip of dayChips(data.meetings, shown)) {
       chips.append(el("button", {
         type: "button", class: chip.live ? "day-chip live" : "day-chip", "aria-pressed": String(chip.pressed),

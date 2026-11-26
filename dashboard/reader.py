@@ -37,6 +37,7 @@ FILLS_SHOWN = 100
 RUNS_SHOWN = 60
 SESSIONS_SHOWN = 30                 # how far back the page that sets sessions side by side goes
 BARS_SHOWN = 120                    # daily bars of a ticker sent to the page: about half a year
+TREND_SHOWN = 60                    # daily closes of a market series sent to the page, for the line in its tile
 AFTER_SHOWN = 60                    # bars after a session, from later sessions' snapshots
 SNAPSHOTS_KEPT = SESSIONS_SHOWN + 2 # snapshots held in memory once read
 SAME_PRICE = 0.005                  # two snapshots agree on a day's close when they are this close (as a share of it)
@@ -819,9 +820,19 @@ class Reader:
         return {
             **answer, "available": True, "reason": None, "captured_at": snapshot.created_at.isoformat(),
             "tickers": tickers,
-            "market": [point.model_dump(mode="json") for point in snapshot.market],
+            "market": [self._market_point(point, snapshot) for point in snapshot.market],
             "macro": [point.model_dump(mode="json") for point in snapshot.macro],
         }
+
+    @staticmethod
+    def _market_point(point, snapshot) -> dict:
+        """A market series as the snapshot recorded it, with its latest daily closes where the snapshot kept its
+        bars (the index and the sector funds, since the forecast engine needed them). The others have none."""
+        answer = point.model_dump(mode="json")
+        bars = snapshot.market_bars.get(point.symbol)
+        if bars is not None and len(bars.close) >= 2:
+            answer["closes"] = [round(value, 4) for value in bars.close[-TREND_SHOWN:]]
+        return answer
 
     # ── How the runs went ────────────────────────────────────────────────
 

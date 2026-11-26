@@ -2,6 +2,8 @@
 // live connection has heard, and how a meeting room is fed from it. No page in
 // sight here, so these rules can be tested on their own.
 
+import { t } from "./i18n.js";
+
 /** What the live connection has heard so far: the arm's newest run and everything said in it. */
 export function newLive() {
   return { run: null, session: null, events: [], heard: false };
@@ -58,7 +60,7 @@ export function roomFeed({
     const mine = ++asked;
     const answer = await fetchMeeting(target);
     if (mine !== asked) return false;                 // asked again since: this answer is already out of date
-    onProblem(answer.ok ? null : (answer.data && answer.data.error) || "读不到这一场的记录。");
+    onProblem(answer.ok ? null : (answer.data && answer.data.error) || t("读不到这一场的记录。"));
     if (!answer.ok) return false;
     const text = JSON.stringify(answer.data);
     if (text !== shown) {

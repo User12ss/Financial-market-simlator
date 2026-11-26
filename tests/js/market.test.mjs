@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { buildTrail } from "../../dashboard/static/js/decisions.js";
 import {
   citationText, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, rangePlace, readings,
-  readouts, sectors, sinceText, sinceThen, sparkOf, sparkPath, tape, yieldCurve,
+  readouts, sectors, sinceText, sinceThen, sparkOf, sparkPath, tape, yieldCurve, trendOf, trendPlot,
 } from "../../dashboard/static/js/market.js";
 
 import { MARKET, PERSONAS } from "./market_fixture.mjs";
@@ -203,19 +203,50 @@ test("each recorded series is read in the units it is quoted in", () => {
   assert.deepEqual(stocks, {
     id: "^GSPC", name: "标普 500", as_of: "2026-11-12", value: "7,592.40",
     moves: [{ label: "1 日", text: "−0.35%", lean: "down" }, { label: "5 日", text: "+3.25%", lean: "up" }, { label: "1 月", text: "−1.64%", lean: "down" }],
+    trend: null,                    // its changes are on record in percent only here: there is no value to draw from
   });
   // A yield is a percentage, and its moves are in points, never a percent of a percent.
-  assert.deepEqual(short, {
+  const { trend, ...rest } = short;
+  assert.deepEqual(rest, {
     id: "^IRX", name: "3 个月国债", as_of: "2026-11-12", value: "4.13%",
     moves: [{ label: "1 日", text: "+0.01 点", lean: "up" }, { label: "5 日", text: "+0.14 点", lean: "up" }, { label: "1 月", text: "−0.04 点", lean: "down" }],
   });
-  assert.deepEqual(funds, { id: "FEDFUNDS", name: "联邦基金利率", value: "3.88%", as_of: "2026-10-01", moves: [{ label: "较上期", text: "+0.13 点", lean: "up" }] });
+  // Where it has been: the session's value less each recorded change, oldest first, each with how many sessions back.
+  assert.equal(trend.kind, "marks");
+  assert.deepEqual(trend.points.map((point) => [point.back, Number(point.value.toFixed(4))]), [[21, 4.17], [5, 3.99], [1, 4.12], [0, 4.13]]);
+  assert.deepEqual(funds, {
+    id: "FEDFUNDS", name: "联邦基金利率", value: "3.88%", as_of: "2026-10-01", moves: [{ label: "较上期", text: "+0.13 点", lean: "up" }], trend: null });
   assert.deepEqual(cpi.moves, [{ label: "较上期", text: "+1.10", lean: "up" }, { label: "同比", text: "+3.01%", lean: "up" }]);
   assert.deepEqual([cpi.value, jobs.value, jobs.moves], ["331.20", "160,250 千人", [{ label: "较上期", text: "−50 千人", lean: "down" }]]);
   assert.deepEqual([spread.value, spread.moves[0].text], ["0.24 点", "−0.01 点"]);
   // A series the page has no name of its own for keeps its recorded name; one the snapshot lacks is left out.
-  assert.deepEqual(added, { id: "NEWONE", name: "A series added later", value: "61.50", as_of: "2026-11-11", moves: [] });
+  assert.deepEqual(added, { id: "NEWONE", name: "A series added later", value: "61.50", as_of: "2026-11-11", moves: [], trend: null });
   assert.deepEqual(readings(["^TYX"], MARKET)[0].moves.map((move) => move.text), ["—", "—", "—"]);
+});
+
+test("a series' trend is its recorded closes where there are any, else the four values the snapshot gives, and never a guess", () => {
+  const point = { symbol: "^GSPC", value: 100, change_1d: 2, change_5d: -5, change_1mo: 10 };
+  assert.deepEqual(trendOf(point), { kind: "marks", points: [{ back: 21, value: 90 }, { back: 5, value: 105 }, { back: 1, value: 98 }, { back: 0, value: 100 }] });
+  // A change the snapshot does not give leaves its value out; with none at all, or no value, there is no trend.
+  assert.deepEqual(trendOf({ value: 100, change_1d: 2, change_5d: null }).points.map((mark) => mark.back), [1, 0]);
+  assert.equal(trendOf({ value: 100 }), null);
+  assert.equal(trendOf({ value: null, change_1d: 1 }), null);
+  // Daily closes win, oldest first, the last of them the session's own; a single close is no line.
+  assert.deepEqual(trendOf({ ...point, closes: [97, 98, 100] }),
+    { kind: "daily", points: [{ back: 2, value: 97 }, { back: 1, value: 98 }, { back: 0, value: 100 }] });
+  assert.equal(trendOf({ ...point, closes: [100] }).kind, "marks");
+});
+
+test("a trend is drawn across by how long ago and up by value, and says which way it went", () => {
+  const drawn = trendPlot({ kind: "marks", points: [{ back: 20, value: 90 }, { back: 5, value: 110 }, { back: 0, value: 100 }] }, 100, 20, 0);
+  // Twenty sessions across the whole width: five back is three quarters of the way; the highest value is at the top.
+  assert.deepEqual(drawn.dots.map((dot) => [dot.x, dot.y]), [[0, 20], [75, 0], [100, 10]]);
+  assert.equal(drawn.line, "M0.0,20.0 L75.0,0.0 L100.0,10.0");
+  assert.equal(drawn.area, "M0.0,20.0 L75.0,0.0 L100.0,10.0 L100.0,20 L0.0,20 Z");
+  assert.equal(drawn.lean, "up");
+  assert.equal(trendPlot({ kind: "daily", points: [{ back: 1, value: 5 }, { back: 0, value: 4 }] }, 10, 10).lean, "down");
+  // A series that never moved is a level line, not a division by nothing.
+  assert.deepEqual(trendPlot({ kind: "daily", points: [{ back: 1, value: 5 }, { back: 0, value: 5 }] }, 10, 10, 0).dots.map((dot) => dot.y), [0, 0]);
 });
 
 test("the sector funds are set in order of their month, the market series and the yield curve as recorded", () => {

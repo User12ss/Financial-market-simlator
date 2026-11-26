@@ -7,6 +7,7 @@
 
 import { el, svg, clear } from "./dom.js";
 import { sparkPath, tape } from "./market.js";
+import { t } from "./i18n.js";
 
 const ARROW = { up: "▲ ", down: "▼ ", flat: "" };
 
@@ -17,7 +18,7 @@ function entry(item) {
     line ? svg("svg", { class: `spark ${item.lean}`, viewBox: "0 0 44 14", "aria-hidden": "true" }, svg("path", { d: line })) : null,
     el("span", { class: "tape-value", text: item.value }),
     el("span", { class: item.lean === "flat" ? "tape-move" : `tape-move ${item.lean}`, text: `${ARROW[item.lean]}${item.move}` }),
-    item.swing ? el("span", { class: "tape-swing", title: "日均波幅：ATR 占收盘价的比例", text: `波幅 ${item.swing}` }) : null);
+    item.swing ? el("span", { class: "tape-swing", title: t("日均波幅：ATR 占收盘价的比例"), text: t`波幅 ${item.swing}` }) : null);
 }
 
 export function tickerTape() {
@@ -25,7 +26,7 @@ export function tickerTape() {
   const note = el("span", { class: "tape-note" });
   // Moving text has to be stoppable without a pointer resting on it: a button does it for keyboard and touch.
   const pause = el("button", {
-    type: "button", class: "tape-pause", "aria-pressed": "false", "aria-label": "让行情带停住", text: "⏸",
+    type: "button", class: "tape-pause", "aria-pressed": "false", "aria-label": t("让行情带停住"), text: "⏸",
     onclick: () => {
       const stopped = !track.classList.contains("paused");
       track.classList.toggle("paused", stopped);
@@ -33,7 +34,7 @@ export function tickerTape() {
       pause.textContent = stopped ? "▶" : "⏸";
     },
   });
-  const node = el("div", { class: "tape", hidden: true, role: "region", "aria-label": "行情带" },
+  const node = el("div", { class: "tape", hidden: true, role: "region", "aria-label": t("行情带") },
     note, pause, el("div", { class: "tape-window" }, track));
   let shown = null;
 
@@ -46,7 +47,7 @@ export function tickerTape() {
     node.hidden = items.length === 0;
     clear(track);
     if (items.length === 0) return;
-    note.textContent = `${market.session} 收盘`;
+    note.textContent = t`${market.session} 收盘`;
     // Twice over, so the strip can run round without a gap. The second copy is not read out.
     track.append(el("div", { class: "tape-run" }, items.map(entry)),
       el("div", { class: "tape-run", "aria-hidden": "true" }, items.map(entry)));

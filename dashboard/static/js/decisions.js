@@ -7,6 +7,7 @@
 // lines up to that point. No page in sight, so it can be tested on its own.
 
 import { word } from "./dom.js";
+import { t } from "./i18n.js";
 
 /** The steps a ticker can go through, in the order the pipeline takes them. */
 export const STEPS = ["view", "debate", "ruling", "proposal", "check", "risk", "order"];
@@ -192,28 +193,28 @@ export function outcome(row, index = Infinity) {
  * only then is a ticker said to have got no further.
  */
 export function outcomeText(result, ended = false) {
-  const more = ended ? "，之后没有进一步动作" : "";
+  const more = ended ? t("，之后没有进一步动作") : "";
   switch (result.kind) {
-    case "ordered": return `已下单：${word("side", result.side)} ${result.shares} 股`;
-    case "noted": return `记下，留给收盘会决定：${word("action", result.action)}`;
-    case "withdrawn": return `已撤回等待成交的买单：${result.shares} 股`;
-    case "risk_rejected": return "风控拒绝，没有下单";
+    case "ordered": return t`已下单：${word("side", result.side)} ${result.shares} 股`;
+    case "noted": return t`记下，留给收盘会决定：${word("action", result.action)}`;
+    case "withdrawn": return t`已撤回等待成交的买单：${result.shares} 股`;
+    case "risk_rejected": return t("风控拒绝，没有下单");
     case "sized":
-      return `风控${word("verdict", result.verdict)}：${word("side", result.side)} ${result.shares} 股${ended ? "，这一次没有新的下单记录" : ""}`;
+      return t`风控${word("verdict", result.verdict)}：${word("side", result.side)} ${result.shares} 股${ended ? t("，这一次没有新的下单记录") : ""}`;
     case "check_rejected":
-      if (result.checkin) return `${word("action", result.action)}的决定被规则退回${result.kept ? "，保持原样" : ""}`;
-      return `${word("action", result.action)}的提案被规则退回${result.kept ? "，按规则继续持有" : ""}`;
+      if (result.checkin) return t`${word("action", result.action)}的决定被规则退回${result.kept ? t("，保持原样") : ""}`;
+      return t`${word("action", result.action)}的提案被规则退回${result.kept ? t("，按规则继续持有") : ""}`;
     case "kept":
-      if (result.checkin) return result.source === "default" ? "没有决定，按规则保持原样" : "保持原样，不动";
-      return result.source === "default" ? "没有提案，按规则继续持有" : "继续持有，不动";
-    case "defaulted": return `没有提案，按规则默认${word("action", result.action)}${more}`;
-    case "accepted": return `${word("action", result.action)}的提案通过检查${more}`;
-    case "proposed": return `组合经理提出${word("action", result.action)}${more}`;
-    case "ruled": return `裁判裁定${word("ownership", result.stance)}${more}`;
-    case "debating": return ended ? "辩论过，没有裁决" : "正在辩论";
-    case "viewed": return `分析师${word("direction", result.direction)}${more}`;
-    case "updated": return `分析师认为原来的观点${word("effect", result.effect)}${more}`;
-    default: return "还没轮到";
+      if (result.checkin) return result.source === "default" ? t("没有决定，按规则保持原样") : t("保持原样，不动");
+      return result.source === "default" ? t("没有提案，按规则继续持有") : t("继续持有，不动");
+    case "defaulted": return t`没有提案，按规则默认${word("action", result.action)}${more}`;
+    case "accepted": return t`${word("action", result.action)}的提案通过检查${more}`;
+    case "proposed": return t`组合经理提出${word("action", result.action)}${more}`;
+    case "ruled": return t`裁判裁定${word("ownership", result.stance)}${more}`;
+    case "debating": return ended ? t("辩论过，没有裁决") : t("正在辩论");
+    case "viewed": return t`分析师${word("direction", result.direction)}${more}`;
+    case "updated": return t`分析师认为原来的观点${word("effect", result.effect)}${more}`;
+    default: return t("还没轮到");
   }
 }
 
@@ -254,22 +255,22 @@ export function stepText(name, step, { brief = false, upTo = Infinity } = {}) {
     case "debate": {
       const said = step.lines.filter((line) => line.index <= upTo);
       const rounds = Math.max(0, ...said.map((line) => line.round));
-      return brief ? `${rounds} 轮` : `${rounds} 轮 · ${said.length} 次发言`;
+      return brief ? t`${rounds} 轮` : t`${rounds} 轮 · ${said.length} 次发言`;
     }
     case "ruling": return `${word("ownership", step.stance)} ${two(step.confidence)}`.trim();
     case "proposal": return `${word("action", step.action)} ${two(step.confidence)}`.trim();
     case "check":
-      if (step.source === "default") return `默认${word("action", step.action)}`;
-      if (step.status === "rejected" && keptBy(step, upTo)) return brief ? "拒绝·默认持有" : "拒绝，按规则继续持有";
+      if (step.source === "default") return t`默认${word("action", step.action)}`;
+      if (step.status === "rejected" && keptBy(step, upTo)) return brief ? t("拒绝·默认持有") : t("拒绝，按规则继续持有");
       return word("check", step.status);
     case "risk":
-      if (step.verdict === "rejected") return "拒绝";
-      if (step.verdict === "reduced") return brief ? `削减到 ${step.approved} 股` : `削减 ${step.requested}→${step.approved} 股`;
-      return `批准 ${step.approved} 股`;
+      if (step.verdict === "rejected") return t("拒绝");
+      if (step.verdict === "reduced") return brief ? t`削减到 ${step.approved} 股` : t`削减 ${step.requested}→${step.approved} 股`;
+      return t`批准 ${step.approved} 股`;
     case "order":
-      if (step.noted) return brief ? `记下·${word("action", step.noted)}` : `记下，留给收盘会：${word("action", step.noted)}`;
-      if (step.withdrawn) return brief ? `撤回 ${step.shares} 股` : `撤回等待成交的买单 ${step.shares} 股`;
-      return `${word("side", step.side)} ${step.shares} 股`;
+      if (step.noted) return brief ? t`记下·${word("action", step.noted)}` : t`记下，留给收盘会：${word("action", step.noted)}`;
+      if (step.withdrawn) return brief ? t`撤回 ${step.shares} 股` : t`撤回等待成交的买单 ${step.shares} 股`;
+      return t`${word("side", step.side)} ${step.shares} 股`;
     default: return "";
   }
 }
@@ -325,7 +326,7 @@ export function standings(events, index) {
         lean: { bullish: "up", bearish: "down" }[said.direction] || "flat",
       };
     } else if (event.kind === "argument") {
-      signs[event.speaker] = { text: `${event.ticker} 第 ${said.round || 1} 轮`, lean: "flat" };
+      signs[event.speaker] = { text: t`${event.ticker} 第 ${said.round || 1} 轮`, lean: "flat" };
     } else if (event.kind === "ruling") {
       signs.judge = {
         text: `${event.ticker} ${word("ownership", said.stance)} ${two(said.confidence)}`.trim(),
@@ -337,19 +338,19 @@ export function standings(events, index) {
       for (const item of said.proposals || []) tally[item.action] = (tally[item.action] || 0) + 1;
       const parts = ["buy", "sell", "trim", "hold"].filter((action) => tally[action])
         .map((action) => `${word("action", action)} ${tally[action]}`);
-      signs.portfolio_manager = { text: parts.length ? parts.join(" · ") : "没有提案", lean: "flat" };
+      signs.portfolio_manager = { text: parts.length ? parts.join(" · ") : t("没有提案"), lean: "flat" };
     } else if (event.kind === "accepted" || event.kind === "rejected") {
       checks[event.kind] += 1;
-      signs.risk_officer = { text: `通过 ${checks.accepted} · 退回 ${checks.rejected}`, lean: "flat" };
+      signs.risk_officer = { text: t`通过 ${checks.accepted} · 退回 ${checks.rejected}`, lean: "flat" };
     } else if (event.kind.startsWith("risk_") && event.kind.slice(5) in gate) {
       gate[event.kind.slice(5)] += 1;
-      signs.risk_officer = { text: `批准 ${gate.approved} · 削减 ${gate.reduced} · 拒绝 ${gate.rejected}`, lean: "flat" };
+      signs.risk_officer = { text: t`批准 ${gate.approved} · 削减 ${gate.reduced} · 拒绝 ${gate.rejected}`, lean: "flat" };
     } else if (checkin && (event.kind === "noted" || event.kind === "order_withdrawn" || event.kind === "order_placed")) {
       desk[{ noted: "noted", order_withdrawn: "withdrawn", order_placed: "orders" }[event.kind]] += 1;
-      signs.trader = { text: `留给收盘会 ${desk.noted} · 撤回 ${desk.withdrawn} · 下单 ${desk.orders}`, lean: "flat" };
+      signs.trader = { text: t`留给收盘会 ${desk.noted} · 撤回 ${desk.withdrawn} · 下单 ${desk.orders}`, lean: "flat" };
     } else if (event.kind === "fill" || event.kind === "order_placed") {
       desk[event.kind === "fill" ? "fills" : "orders"] += 1;
-      signs.trader = { text: `成交 ${desk.fills} · 下单 ${desk.orders}`, lean: "flat" };
+      signs.trader = { text: t`成交 ${desk.fills} · 下单 ${desk.orders}`, lean: "flat" };
     } else if (event.kind === "view_update") {
       signs.ticker_analyst = {
         text: `${event.ticker} ${word("effect", said.effect)}`,
@@ -361,7 +362,7 @@ export function standings(events, index) {
       for (const item of said.decisions || []) tally[item.action] = (tally[item.action] || 0) + 1;
       const parts = ["keep", "trim", "sell", "withdraw"].filter((action) => tally[action])
         .map((action) => `${word("action", action)} ${tally[action]}`);
-      signs.portfolio_manager = { text: parts.length ? parts.join(" · ") : "没有决定", lean: "flat" };
+      signs.portfolio_manager = { text: parts.length ? parts.join(" · ") : t("没有决定"), lean: "flat" };
     }
   });
   return { signs, board };
@@ -383,13 +384,13 @@ export function lastSaid(events, index, speaker) {
 export function fateText(cell) {
   // A sale the checks filled in themselves, where the manager's answer said nothing of the holding, is said to be
   // one. (A holding they kept by default has no order and no verdict, and gets its own words further down.)
-  const own = cell.source === "default" ? "没有提案，默认" : "";
-  if (cell.ordered) return `${own}${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
+  const own = cell.source === "default" ? t("没有提案，默认") : "";
+  if (cell.ordered) return t`${own}${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
   if (!cell.action) return "";
-  if (cell.verdict === "rejected") return `${own}${word("action", cell.action)}，风控拒绝`;
-  if (cell.check === "rejected") return `${word("action", cell.action)}被规则退回${cell.kept_by_default ? "，默认持有" : ""}`;
-  if (cell.action === "hold") return cell.source === "default" ? "没有提案，默认持有" : "持有";
-  return `${own}${word("action", cell.action)}，没有下单`;
+  if (cell.verdict === "rejected") return t`${own}${word("action", cell.action)}，风控拒绝`;
+  if (cell.check === "rejected") return t`${word("action", cell.action)}被规则退回${cell.kept_by_default ? t("，默认持有") : ""}`;
+  if (cell.action === "hold") return cell.source === "default" ? t("没有提案，默认持有") : t("持有");
+  return t`${own}${word("action", cell.action)}，没有下单`;
 }
 
 /**

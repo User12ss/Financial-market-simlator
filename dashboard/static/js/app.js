@@ -5,14 +5,34 @@ import { el, clear, getJSON, empty } from "./dom.js";
 import { hearEvent, hearRun, newLive, reconnected } from "./live.js";
 import { overviewPage, roomPage, decisionsPage, bookPage, evaluationPage, replayPage, statusPage } from "./pages.js";
 import { tickerTape } from "./tape.js";
+import { english, localize, setLang, t } from "./i18n.js";
 
 const TABS = [
-  ["overview", "总览", overviewPage], ["room", "会议室", roomPage], ["decisions", "决策", decisionsPage],
-  ["book", "持仓和订单", bookPage], ["evaluation", "评估", evaluationPage], ["replay", "回放", replayPage],
-  ["status", "运行状态", statusPage],
+  ["overview", t("总览"), overviewPage], ["room", t("会议室"), roomPage], ["decisions", t("决策"), decisionsPage],
+  ["book", t("持仓和订单"), bookPage], ["evaluation", t("评估"), evaluationPage], ["replay", t("回放"), replayPage],
+  ["status", t("运行状态"), statusPage],
 ];
 const REFRESH_MS = 20000;
 const RETRY_MS = 5000;
+
+// The page itself is written in Chinese. In English, its own fixed words (the name, the two chips, the footer)
+// are looked up like any other, and the document says which language it is in.
+if (english) {
+  document.documentElement.lang = "en";
+  document.title = t("交易看板");
+  for (const node of document.querySelectorAll(".brand-name, .brand .chip, .arm-pick span, .foot")) node.textContent = t(node.textContent.trim());
+  for (const node of document.querySelectorAll("[title], [aria-label]")) {
+    for (const name of ["title", "aria-label"]) if (node.hasAttribute(name)) node.setAttribute(name, t(node.getAttribute(name)));
+  }
+}
+// The switch names the language it leads to, in that language.
+const language = document.getElementById("lang");
+if (language) {
+  language.textContent = english ? "\u4e2d\u6587" : "English";
+  language.title = english ? "\u5207\u6362\u5230\u4e2d\u6587\u754c\u9762" : "Switch the dashboard to English";
+  language.setAttribute("aria-label", language.title);
+  language.addEventListener("click", () => setLang(english ? "zh" : "en"));
+}
 
 const main = document.getElementById("main");
 const tabs = document.getElementById("tabs");
@@ -74,9 +94,9 @@ function paintLive() {
   liveChip.hidden = app.connected && !(run && run.live);
   if (!app.connected) {
     // Without the connection nothing new can arrive, so the page must not look live.
-    clear(liveChip).append(el("span", { class: "state state-warning", text: "和看板服务的连接断了，正在重连" }));
+    clear(liveChip).append(el("span", { class: "state state-warning", text: t("和看板服务的连接断了，正在重连") }));
   } else if (run && run.live) {
-    clear(liveChip).append(el("span", { class: "state state-live", text: `流程正在运行：${app.live.session}` }));
+    clear(liveChip).append(el("span", { class: "state state-live", text: t`流程正在运行：${app.live.session}` }));
   }
 }
 
@@ -102,7 +122,7 @@ function listen() {
   paintLive();
   app.source = new EventSource(`/api/stream?arm=${encodeURIComponent(app.arm)}`);
   app.source.addEventListener("run", (message) => {
-    const told = JSON.parse(message.data);
+    const told = localize(JSON.parse(message.data));
     const changed = hearRun(app.live, told);
     paintLive();
     if (app.page && app.page.onStream) app.page.onStream(told);
@@ -111,7 +131,7 @@ function listen() {
     if (changed) readTape();
   });
   app.source.addEventListener("event", (message) => {
-    const told = JSON.parse(message.data);
+    const told = localize(JSON.parse(message.data));
     hearEvent(app.live, told);
     if (app.page && app.page.onStream) app.page.onStream(told);
   });
@@ -134,7 +154,7 @@ async function start() {
   if (!arms.ok || !arms.data.journal || arms.data.arms.length === 0) {
     paintTabs(null);
     clear(main).append(empty(
-      arms.ok ? "还没有任何运行记录：每日流程还没有跑过。跑过第一次之后，这个页面会自己出现内容。" : arms.data.error,
+      arms.ok ? t("还没有任何运行记录：每日流程还没有跑过。跑过第一次之后，这个页面会自己出现内容。") : arms.data.error,
       arms.ok ? el("br") : null,
       arms.ok ? el("code", { text: arms.data.path }) : null));
     window.setTimeout(start, RETRY_MS);

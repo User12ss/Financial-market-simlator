@@ -211,8 +211,21 @@ test("a macro analyst speaking brings up the recorded series of that analyst's f
   assert.deepEqual(wearing(screen.node, "heat-cell"), []);
   assert.match(words(screen.node), /每位宏观分析师拿到的是同一张完整的数据表。/);
 
+  // A macro series has only its latest and its previous value on record: no line is drawn for it. A yield has
+  // the snapshot's four values, joined by a dashed line with a mark on each and one more on the last.
+  const [short, long, spread] = wearing(screen.node, "read-tile");
+  assert.deepEqual(wearing(spread, "trend"), []);
+  assert.equal(wearing(short, "trend")[0].attributes.class, "trend down sparse");                 // 4.17 a month ago, 4.13 now
+  assert.equal(wearing(short, "trend-dot").length, 4);
+  assert.equal(wearing(short, "trend-last").length, 1);
+  assert.equal(wearing(short, "trend")[0].attributes["aria-label"],
+    "3 个月国债 的四个记录值连成的线：一个月前（21 个交易日） 4.17，5 个交易日前 3.99，前一个交易日 4.12，这一场 4.13");
+  assert.equal(wearing(long, "trend")[0].attributes.class, "trend down sparse");
+
   screen.show(at(11));                                         // the equity analyst: indices and the sector funds
-  assert.deepEqual(wearing(screen.node, "read-tile").map((tile) => words(tile.children[0])), ["标普 500", "VIX 波动率"]);
+  assert.deepEqual(wearing(screen.node, "read-name").map(words), ["标普 500", "VIX 波动率"]);
+  // Neither index has its changes in points on record here, only in percent: there is nothing to draw a line from.
+  assert.deepEqual(wearing(screen.node, "trend"), []);
   assert.deepEqual(wearing(screen.node, "curve"), []);
   const cells = wearing(screen.node, "heat-cell");
   assert.deepEqual(cells.map(words), ["医疗▲ +7.97%", "能源▼ −4.88%", "科技▼ −8.75%", "A fund with no name here—"]);
@@ -226,10 +239,23 @@ test("with nothing about a ticker or a field being said, the screen shows the ma
   for (const context of [at(9), { ...at(-1), event: undefined }]) {
     screen.show(context);
     assert.deepEqual(head(screen), ["大盘", "这一场用的行情快照"]);
-    assert.deepEqual(wearing(screen.node, "read-tile").map((tile) => words(tile.children[0])), ["标普 500", "VIX 波动率"]);
+    assert.deepEqual(wearing(screen.node, "read-name").map(words), ["标普 500", "VIX 波动率"]);
     assert.equal(wearing(screen.node, "heat-cell").length, 4);
     assert.equal(wearing(screen.node, "curve").length, 1);
+    // The curve and the sector funds stand side by side under the tiles, so that all three fit the screen at once.
+    const [pair] = wearing(screen.node, "holo-pair");
+    assert.deepEqual(pair.children.map((child) => child.attributes.class), ["curve", "heat"]);
+    assert.match(words(screen.node), /实线是记录的日线；虚线只连着四个记录值。/);
   }
+  // With the daily closes on record (the index, since snapshots began keeping its bars) the line is theirs, and solid.
+  const kept = { ...MARKET, market: MARKET.market.map((point) => (point.symbol === "^GSPC" ? { ...point, closes: [7400, 7500, 7450, 7592.4] } : point)) };
+  const later = marketScreen({ personas: PERSONAS });
+  later.load(kept);
+  later.show({ ...at(-1), event: undefined });
+  const [index] = wearing(later.node, "read-tile");
+  assert.equal(wearing(index, "trend")[0].attributes.class, "trend up");
+  assert.equal(wearing(index, "trend")[0].attributes["aria-label"], "标普 500 最近 4 个交易日的收盘走势");
+  assert.deepEqual(wearing(index, "trend-dot"), []);
 });
 
 test("the screen is drawn again only when what it shows has changed, and sweeps only when it turns to something else", () => {

@@ -12,16 +12,17 @@ import {
   STEPS, buildTrail, firstLine, funnel, isLine, lean, lineAt, outcome, outcomeText, reached, stepText,
 } from "./decisions.js";
 import { replay } from "./motion.js";
+import { t } from "./i18n.js";
 
-const NAMES = { view: "观点", debate: "辩论", ruling: "裁决", proposal: "提案", check: "检查", risk: "风控", order: "下单" };
+const NAMES = { view: t("观点"), debate: t("辩论"), ruling: t("裁决"), proposal: t("提案"), check: t("检查"), risk: t("风控"), order: t("下单") };
 const WHO = {
-  view: "标的分析师", debate: "多方和空方", ruling: "裁判", proposal: "组合经理", check: "风控官（规则）",
-  risk: "风控官（规则）", order: "交易员（规则）",
+  view: t("标的分析师"), debate: t("多方和空方"), ruling: t("裁判"), proposal: t("组合经理"), check: t("风控官（规则）"),
+  risk: t("风控官（规则）"), order: t("交易员（规则）"),
 };
 const GLYPH = { up: "▲", down: "▼", stop: "✕", flat: "" };
 const FUNNEL = [
-  ["views", "观点"], ["ruled", "辩论后裁决"], ["proposed", "要动的提案"], ["accepted", "通过检查"],
-  ["sized", "风控放行"], ["ordered", "下单"],
+  ["views", t("观点")], ["ruled", t("辩论后裁决")], ["proposed", t("要动的提案")], ["accepted", t("通过检查")],
+  ["sized", t("风控放行")], ["ordered", t("下单")],
 ];
 
 /** How many tickers got how far, as a row of steps that narrows. `set(counts)` moves it. */
@@ -48,8 +49,8 @@ export function funnelBar() {
       step.fill.style.width = `${Math.round((value / widest) * 100)}%`;
       step.node.classList.toggle("empty-step", value === 0);
     }
-    kept.textContent = `继续持有 ${counts.kept}`;
-    back.textContent = `被退回或拒绝 ${counts.turned_back}`;
+    kept.textContent = t`继续持有 ${counts.kept}`;
+    back.textContent = t`被退回或拒绝 ${counts.turned_back}`;
     shown = { ...counts };
   }
   return { node, set };
@@ -64,12 +65,12 @@ export function funnelBar() {
  */
 export function decisionTrail({
   onSeek, whole: always = false,
-  lead = "每只股票一行，从左到右是它走过的每一步，随播放一格一格出现。点任一格，回到那一句原话。",
+  lead = t("每只股票一行，从左到右是它走过的每一步，随播放一格一格出现。点任一格，回到那一句原话。"),
 }) {
   const state = { events: [], trail: [], rows: [], index: -1, whole: always, live: false, run: null, count: -1 };
   const bar = funnelBar();
   const whole = always ? null : el("button", {
-    type: "button", class: "chip", "aria-pressed": "false", text: "直接看最终结果",
+    type: "button", class: "chip", "aria-pressed": "false", text: t("直接看最终结果"),
     onclick: () => {
       state.whole = !state.whole;
       whole.setAttribute("aria-pressed", String(state.whole));
@@ -77,14 +78,14 @@ export function decisionTrail({
     },
   });
   const head = el("div", { class: "trail-row trail-head", hidden: true },
-    el("span", { text: "标的" }),
+    el("span", { text: t("标的") }),
     el("div", { class: "trail-steps" }, STEPS.map((name) => el("span", { text: NAMES[name], title: WHO[name] }))),
-    el("span", { text: "走到了哪一步" }));
+    el("span", { text: t("走到了哪一步") }));
   const body = el("div", { class: "trail-body" }, head);
   const none = el("p", { class: "empty", hidden: true });
   const aside = el("p", { class: "small muted" });
   const node = el("section", { class: "card trail" },
-    el("div", { class: "row spread" }, el("h2", { text: "这一场的决策是怎么做出来的" }), whole),
+    el("div", { class: "row spread" }, el("h2", { text: t("这一场的决策是怎么做出来的") }), whole),
     el("p", { class: "sub", text: lead }),
     bar.node, el("div", { class: "scroll" }, body), none, aside);
 
@@ -127,7 +128,7 @@ export function decisionTrail({
     item.cells = STEPS.map((name, at) => cell(item, name, at));
     item.lit = el("i", { class: "rail-lit" });
     item.result = el("span", { class: "trail-result" });
-    item.held = el("span", { class: "chip chip-quiet", text: "持仓", hidden: true });
+    item.held = el("span", { class: "chip chip-quiet", text: t("持仓"), hidden: true });
     item.again = el("span", { class: "trail-note", hidden: true });
     item.said = null;
     item.root = el("div", { class: "trail-row" },
@@ -186,7 +187,7 @@ export function decisionTrail({
       item.lit.style.width = `${((furthest - first) / STEPS.length) * 100}%`;
       item.held.hidden = !(reached(item.row.view, upTo) && item.row.view.held);
       item.again.hidden = !(item.row.repeats && reached(item.row.proposal, upTo));
-      item.again.textContent = item.again.hidden ? "" : `另有 ${item.row.repeats} 条重复提案不算`;
+      item.again.textContent = item.again.hidden ? "" : t`另有 ${item.row.repeats} 条重复提案不算`;
       const text = outcomeText(outcome(item.row, upTo), ended);
       if (text !== item.said) {
         item.result.textContent = text;
@@ -199,15 +200,15 @@ export function decisionTrail({
     });
     head.hidden = showing === 0;
     none.hidden = showing > 0;
-    none.textContent = state.events.length ? "到这一句为止，还没有哪只股票走到观点这一步。" : "这一场还没有记录。";
+    none.textContent = state.events.length ? t("到这一句为止，还没有哪只股票走到观点这一步。") : t("这一场还没有记录。");
     // Old orders that filled or were taken back, once the record has got to them.
     const opened = state.trail.flatMap((row) => row.fills.filter((fill) => fill.index <= upTo).map((fill) =>
-      `${row.ticker} ${word("side", fill.side)} ${fill.shares} 股${fill.pnl_pct === null ? "" : `（${signedPct(fill.pnl_pct)}）`}`));
+      t`${row.ticker} ${word("side", fill.side)} ${fill.shares} 股${fill.pnl_pct === null ? "" : `（${signedPct(fill.pnl_pct)}）`}`));
     const taken = state.trail.filter((row) => reached(row.withdrawn, upTo)).map((row) =>
-      `${row.ticker} ${word("side", row.withdrawn.side)} ${row.withdrawn.shares} 股`);
+      t`${row.ticker} ${word("side", row.withdrawn.side)} ${row.withdrawn.shares} 股`);
     aside.textContent = [
-      opened.length ? `这一场开头成交的旧订单：${opened.join("，")}。` : "",
-      taken.length ? `这一场撤回的旧订单：${taken.join("，")}。` : "",
+      opened.length ? t`这一场开头成交的旧订单：${opened.join("，")}。` : "",
+      taken.length ? t`这一场撤回的旧订单：${taken.join("，")}。` : "",
     ].join("");
     aside.hidden = !aside.textContent;
   }
