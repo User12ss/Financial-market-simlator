@@ -29,7 +29,9 @@ from journal.store import COMPLETED
 from forecast.scoring import card as forecast_card
 from models.evaluation import Evaluation
 from models.forecast import ForecastScore, ForecastSet
+from models.planning import Contingency, Plan, Trigger
 from models.signals import SignalTable
+from pipeline.plans import acts, identity
 from risk.gate import halted
 
 STAGE_TITLES = dict(STAGES)
@@ -44,6 +46,13 @@ SAME_PRICE = 0.005                  # two snapshots agree on a day's close when 
 # Not a status the journal holds. It is what the page calls a run that is on record as
 # running although the process that was running it no longer exists.
 INTERRUPTED = "interrupted"
+# A check-in held because a condition of a plan said to call a meeting. A day may have more than one.
+CALLED = "called"
+# What the page shows of each version of a plan. Recorded sentences among them are passed on as they are.
+PLAN_FIELDS = (
+    "version", "session_date", "created_at", "source", "held", "thesis", "direction", "horizon", "ends_on", "close",
+    "stop", "target", "chances", "changes", "basis", "refused", "data_warnings",
+)
 
 
 class NoJournal(Exception):
@@ -163,10 +172,13 @@ class Reader:
         return found["as_of"] if found else None
 
     def _day_meetings(self, db: sqlite3.Connection, arm: str, day: str) -> list[sqlite3.Row]:
-        """The meetings of one trading day, in the order they were held: for each kind, the one that is shown."""
+        """The meetings of one trading day, in the order they were held: for each kind, the one that is shown.
+
+        A check-in called by a plan is a meeting of its own, not another attempt at one: each is listed.
+        """
         by_kind: dict[str, list[sqlite3.Row]] = {}
         for row in self._checkins(db, arm, " AND day = ?", (day,)):
-            by_kind.setdefault(row["kind"], []).append(row)
+            by_kind.setdefault(row["run_id"] if row["kind"] == CALLED else row["kind"], []).append(row)
         found = [_shown(rows) for rows in by_kind.values()]
         close = self._shown_run(db, arm, day)
         if close is not None:
@@ -185,6 +197,8 @@ class Reader:
         """Whether a meeting is the one shown for its day and kind, or another attempt at it."""
         if _kind(row) == "close":
             return self._shown_run(db, arm, row["session_date"])["run_id"] == row["run_id"]
+        if _kind(row) == CALLED:
+            return True                             # each called check-in is a meeting of its own
         attempts = self._checkins(db, arm, " AND day = ? AND kind = ?", (row["session_date"], row["kind"]))
         return _shown(attempts)["run_id"] == row["run_id"]
 
@@ -616,6 +630,59 @@ class Reader:
                 mode="json", exclude={"tickers": {"__all__": {"horizons": {"__all__": {"grid", "naive_grid"}}}}}),
         }
 
+    # ── The desk's plans ─────────────────────────────────────────────────
+
+    def plans(self, arm: str) -> dict:
+        """The desk's plan for each trade: the ones that stand, every version of each, and the ones that are over.
+
+        Read from the journal as the close meetings and the watch left it.
+        Each plan's conditions are those of its latest version, in its own
+        order, then any condition an earlier version had that has since been
+        dropped and that held while it stood, so that every condition found
+        to hold is on the page. Only the desk keeps plans; a journal from
+        before them has none.
+        """
+        nothing = {"arm": arm, "has_plans": False, "standing": [], "ended": []}
+        with self._db() as db:
+            tables = {row["name"] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('plans', 'plan_triggers', 'paper_positions')")}
+            if "plans" not in tables:
+                return nothing
+            rows = db.execute(
+                "SELECT plan_json, closed_on, closed_why FROM plans WHERE arm = ? ORDER BY ticker, opened, version", (arm,)
+            ).fetchall()
+            fired = db.execute("SELECT trigger_json FROM plan_triggers WHERE arm = ?", (arm,)).fetchall() \
+                if "plan_triggers" in tables else []
+            held = {row["ticker"] for row in db.execute(
+                "SELECT ticker FROM paper_positions WHERE account = ?", (arm,))} if "paper_positions" in tables else None
+        try:
+            versions = [(Plan.model_validate_json(row["plan_json"]), row["closed_on"], row["closed_why"] or "") for row in rows]
+            triggers = [Trigger.model_validate_json(row["trigger_json"]) for row in fired]
+        except ValueError:
+            return nothing                          # written by another version of the program
+        by_plan: dict[tuple[str, str], list] = {}
+        for plan, closed_on, closed_why in versions:
+            by_plan.setdefault((plan.ticker, plan.opened.isoformat()), []).append((plan, closed_on, closed_why))
+        standing, ended = [], []
+        for (ticker, opened), found in by_plan.items():
+            plans = [plan for plan, _, _ in found]
+            mine = {trigger.identity: trigger for trigger in triggers
+                    if trigger.ticker == ticker and trigger.opened.isoformat() == opened}
+            conditions = _conditions(plans, mine)
+            _, closed_on, closed_why = found[-1]
+            if closed_on is None:
+                standing.append({
+                    "ticker": ticker, "opened": opened, "held_now": None if held is None else ticker in held,
+                    "versions": [_version(plan) for plan in plans], "conditions": conditions,
+                })
+            else:
+                ended.append({
+                    "ticker": ticker, "opened": opened, "closed_on": closed_on, "closed_why": closed_why,
+                    "versions": len(plans), "last_version": _version(plans[-1]), "conditions": conditions,
+                })
+        ended.sort(key=lambda item: (item["closed_on"], item["opened"]), reverse=True)
+        return {"arm": arm, "has_plans": bool(by_plan), "standing": standing, "ended": ended}
+
     # ── How decisions changed from session to session ────────────────────
 
     def history(self, arm: str) -> dict:
@@ -630,7 +697,9 @@ class Reader:
         Only the first proposal for a ticker counts, as in the pipeline:
         `action`, `source` and `check` are that one's, and later ones are
         counted in `repeats`. `kept_by_default` says the checks kept the
-        holding by their own default after turning the proposal back.
+        holding by their own default after turning the proposal back. A sale
+        a condition of the ticker's plan put in (source "plan") takes the
+        place of whatever was decided before it, as it did at the meeting.
         """
         with self._db() as db:
             rows = db.execute(
@@ -665,7 +734,11 @@ class Reader:
                 if not proposal.ticker:
                     continue                            # written for no ticker at all: it is no ticker's decision
                 cell = of(proposal.ticker)
-                if cell["action"] is None:
+                if proposal.source == "plan":
+                    # A sale a condition of the ticker's plan put in: the decision before it was set aside for it.
+                    cell.update(action=proposal.action, source=proposal.source, check=proposal.status,
+                                kept_by_default=False)
+                elif cell["action"] is None:
                     cell.update(action=proposal.action, source=proposal.source, check=proposal.status)
                 elif proposal.source == "default":
                     cell["kept_by_default"] = True
@@ -873,6 +946,44 @@ def _bars(bars: Bars, start: int, stop: int) -> dict:
         "dates": [day.isoformat() for day in bars.dates[start:stop]],
         **{column: getattr(bars, column)[start:stop] for column in ("open", "high", "low", "close", "volume")},
     }
+
+
+def _version(plan: Plan) -> dict:
+    """One version of a plan, as the page shows it."""
+    return {key: value for key, value in plan.model_dump(mode="json").items() if key in PLAN_FIELDS}
+
+
+def _conditions(versions: list[Plan], triggers: dict[str, Trigger]) -> list[dict]:
+    """A plan's conditions and where each stands: the latest version's first, then the dropped ones that held.
+
+    A condition is matched to what was found of it by its identity, which is
+    the same in every version: it fires once in a plan's life.
+    """
+    def entry(item: Contingency, version: int, dropped: bool) -> dict:
+        trigger = triggers.get(identity(item))
+        return {
+            # Whether code carries it out is asked of the same rule the desk asks, not read off the record alone.
+            **item.model_dump(mode="json"), "automatic": acts(item), "in_version": version, "dropped": dropped,
+            "state": "waiting" if trigger is None else trigger.status,
+            "trigger": None if trigger is None else trigger.model_dump(mode="json", include={
+                "version", "fired_at", "session_date", "found_by", "evidence", "result", "handled_by", "handled_on"}),
+        }
+
+    latest = versions[-1]
+    listed = [entry(item, latest.version, False) for item in latest.contingencies]
+    seen = {identity(item) for item in latest.contingencies}
+    for plan in reversed(versions[:-1]):
+        for item in plan.contingencies:
+            name = identity(item)
+            if name not in seen and name in triggers:
+                seen.add(name)
+                listed.append(entry(item, plan.version, True))
+    # A trigger whose condition no version on record has (it cannot happen through the desk) is still shown.
+    for name, trigger in triggers.items():
+        if name not in seen:
+            seen.add(name)
+            listed.append(entry(trigger.contingency, trigger.version, True))
+    return listed
 
 
 def _run(row: sqlite3.Row, as_of: str | None = None) -> dict:

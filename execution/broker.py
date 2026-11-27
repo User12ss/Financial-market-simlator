@@ -1,7 +1,7 @@
 """What the trading pipeline needs from a broker, whichever broker it is.
 
 The paper broker implements this now. A real broker's adapter will implement
-the same five calls later, and nothing above this line has to change.
+the same calls later, and nothing above this line has to change.
 """
 
 from __future__ import annotations
@@ -37,4 +37,12 @@ class Broker(Protocol):
 
         Returns whether there was such an order. Used when a session's
         decisions are made again and one of them changed.
+        """
+
+    def raise_stop(self, ticker: str, price: float) -> bool:
+        """Move a position's protective stop up to `price`.
+
+        A stop is only ever raised: a price at or below the stop that stands
+        changes nothing, and neither does a position without a stop. Returns
+        whether the stop moved.
         """

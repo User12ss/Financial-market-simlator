@@ -12,7 +12,7 @@ from data.models import Fundamentals
 from data.providers import BAR_COLUMNS, DataError
 from data.snapshot import SnapshotBuilder
 from journal.store import Journal
-from models.planning import ProposedEventDraft, ScenarioDraft
+from models.planning import ContingencyDraft, PlanDraft, ProposedEventDraft, ScenarioDraft
 from models.signals import (
     Citation, DebateArgumentDraft, DebateRulingDraft, DomainAssessmentDraft, ProposalDraft, ProposalSetDraft,
     SectorCall, TickerViewDraft,
@@ -185,6 +185,25 @@ def scenario(*events: ProposedEventDraft, remark="Nothing particular to add."):
     return ScenarioDraft(events=list(events), remark=remark)
 
 
+def condition(kind="close_below_average", action="exit", reason="The trend would be broken.", level=None, average=None,
+              on_session=None, value=None, **fields):
+    """One condition of a drafted plan. By default the one a rising name's plan can always keep.
+
+    A draft gives one number, `value`. Here it may be given under the name it has for the kind: a `level` for a
+    price or a chance, an `average`, or the session a day falls `on_session`.
+    """
+    if value is None:
+        given = {"close_below_average": 200 if average is None else average, "date": on_session}.get(kind, level)
+        value = 0 if given is None else given
+    return ContingencyDraft(condition=kind, action=action, reason=reason, value=value, **fields)
+
+
+def plan_draft(wrong=None, *others, thesis="The trend carries it.", change="", remark="That is the plan."):
+    """The portfolio manager's plan for one name: by default, out on a close below the 200-day average."""
+    return PlanDraft(thesis=thesis, wrong_if=wrong or condition(), contingencies=list(others), change=change,
+                     remark=remark)
+
+
 class ScriptedLLM:
     """Stands in for LLMClient. `replies` maps a schema to an object, an exception, or a
     function of (system prompt, user message) that returns either."""
@@ -197,6 +216,7 @@ class ScriptedLLM:
             DebateRulingDraft: ruling(),
             ProposalSetDraft: proposals(),
             ScenarioDraft: scenario(),
+            PlanDraft: plan_draft(),
         }
         self.calls: list[tuple[str, str, str]] = []     # schema name, system prompt, user message
         self.usage = UsageLog()

@@ -24,6 +24,13 @@ const EDGES = new RegExp(`^[${SPACE}]+|[${SPACE}]+$`, "g");
 export const tickerOf = (written) => String(written ?? "").replace(EDGES, "").toUpperCase();
 const two = (value) => (typeof value === "number" ? value.toFixed(2) : "");
 
+/** A sale code put in because a condition of the ticker's plan held, in words that say it was the plan. */
+export function planText(action) {
+  if (action === "sell") return t("按计划卖出");
+  if (action === "trim") return t("按计划减仓");
+  return t`按计划${word("action", action)}`;
+}
+
 /**
  * Every ticker the session's record mentions, in order of first mention, with
  * the step each line belongs to. `index` is the line's place in the record.
@@ -32,7 +39,9 @@ const two = (value) => (typeof value === "number" ? value.toFixed(2) : "");
  * is kept here, with the check that was made of it; later ones are counted in
  * `repeats`. A holding left without an accepted decision is held by the
  * checks' own default: that line is `check.kept` when it follows a proposal
- * that was turned back, and the check itself when nothing was proposed.
+ * that was turned back, and the check itself when nothing was proposed. A sale
+ * that a condition of the ticker's plan put in (`plan_action`) sets aside the
+ * decision checked before it: it is the check that stands, with source "plan".
  *
  * A check-in of the desk (it opens with the news desk's briefing) goes through
  * fewer steps, and they mean other things. Its "view" is the analyst's update
@@ -87,6 +96,9 @@ export function buildTrail(events) {
       } else if (!row.check) {
         row.check = { index, status: event.kind, action: said.action, source: "portfolio_manager", kept: null };
       }                                                    // else: the check of a repeated proposal, which never counts
+    } else if (event.kind === "plan_action") {
+      // What was decided before it is kept beside it, for a playback that has not reached the plan's line yet.
+      row.check = { index, status: "accepted", action: said.action, source: "plan", kept: null, before: row.check };
     } else if (event.kind === "risk_approved" || event.kind === "risk_reduced" || event.kind === "risk_rejected") {
       const decision = said.decision || {}, request = said.request || {};
       row.risk = {
@@ -158,17 +170,23 @@ const keptBy = (check, index) =>
 export function outcome(row, index = Infinity) {
   const seen = (step) => reached(step, index);
   // Said only of a check-in's rows, so a close meeting's outcomes are exactly what they always were.
+  if (row.check && row.check.source === "plan" && row.check.before && !seen(row.check)) {
+    return outcome({ ...row, check: row.check.before }, index);     // the plan's line is still to come
+  }
   const checkin = row.checkin ? { checkin: true } : {};
+  // Said only of a sale the plan put in, so every other outcome is exactly what it always was.
+  const plan = seen(row.check) && row.check.source === "plan" ? { plan: row.check.action } : {};
   if (seen(row.order)) {
     if (row.order.noted) return { kind: "noted", action: row.order.noted };
     if (row.order.withdrawn) return { kind: "withdrawn", shares: row.order.shares };
-    return { kind: "ordered", side: row.order.side, shares: row.order.shares };
+    return { kind: "ordered", side: row.order.side, shares: row.order.shares, ...plan };
   }
   if (seen(row.risk)) {
-    if (row.risk.verdict === "rejected") return { kind: "risk_rejected", side: row.risk.side };
-    return { kind: "sized", verdict: row.risk.verdict, side: row.risk.side, shares: row.risk.approved };
+    if (row.risk.verdict === "rejected") return { kind: "risk_rejected", side: row.risk.side, ...plan };
+    return { kind: "sized", verdict: row.risk.verdict, side: row.risk.side, shares: row.risk.approved, ...plan };
   }
   if (seen(row.check)) {
+    if (row.check.source === "plan") return { kind: "planned", action: row.check.action };
     if (soldByDefault(row.check)) return { kind: "defaulted", action: row.check.action };
     if (row.check.source === "default") return { kind: "kept", source: "default", ...checkin };
     if (row.check.status === "rejected") {
@@ -194,6 +212,11 @@ export function outcome(row, index = Infinity) {
  */
 export function outcomeText(result, ended = false) {
   const more = ended ? t("，之后没有进一步动作") : "";
+  if (result.plan) {
+    // A sale the plan put in: said first, then where it got to, in the words used for any other.
+    const { plan, ...rest } = result;
+    return t`${planText(plan)}，${outcomeText(rest, ended)}`;
+  }
   switch (result.kind) {
     case "ordered": return t`已下单：${word("side", result.side)} ${result.shares} 股`;
     case "noted": return t`记下，留给收盘会决定：${word("action", result.action)}`;
@@ -208,6 +231,7 @@ export function outcomeText(result, ended = false) {
       if (result.checkin) return result.source === "default" ? t("没有决定，按规则保持原样") : t("保持原样，不动");
       return result.source === "default" ? t("没有提案，按规则继续持有") : t("继续持有，不动");
     case "defaulted": return t`没有提案，按规则默认${word("action", result.action)}${more}`;
+    case "planned": return `${planText(result.action)}${more}`;
     case "accepted": return t`${word("action", result.action)}的提案通过检查${more}`;
     case "proposed": return t`组合经理提出${word("action", result.action)}${more}`;
     case "ruled": return t`裁判裁定${word("ownership", result.stance)}${more}`;
@@ -261,6 +285,7 @@ export function stepText(name, step, { brief = false, upTo = Infinity } = {}) {
     case "proposal": return `${word("action", step.action)} ${two(step.confidence)}`.trim();
     case "check":
       if (step.source === "default") return t`默认${word("action", step.action)}`;
+      if (step.source === "plan") return planText(step.action);
       if (step.status === "rejected" && keptBy(step, upTo)) return brief ? t("拒绝·默认持有") : t("拒绝，按规则继续持有");
       return word("check", step.status);
     case "risk":
@@ -290,7 +315,7 @@ export function lean(name, step) {
   }
   if (name === "check") {
     if (step.status === "rejected") return "stop";
-    return soldByDefault(step) ? "down" : "flat";             // no proposal carries the arrow for a sale by default
+    return soldByDefault(step) || step.source === "plan" ? "down" : "flat";             // no proposal carries the arrow for a sale by default
   }
   if (name === "risk") return step.verdict === "rejected" ? "stop" : "flat";
   return "flat";
@@ -384,6 +409,13 @@ export function lastSaid(events, index, speaker) {
 export function fateText(cell) {
   // A sale the checks filled in themselves, where the manager's answer said nothing of the holding, is said to be
   // one. (A holding they kept by default has no order and no verdict, and gets its own words further down.)
+  if (cell.source === "plan") {
+    // A sale a condition of the ticker's plan put in, in place of what was decided before it.
+    const planned = planText(cell.action);
+    if (cell.ordered) return t`${planned}：${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
+    if (cell.verdict === "rejected") return t`${planned}，风控拒绝`;
+    return t`${planned}，没有下单`;
+  }
   const own = cell.source === "default" ? t("没有提案，默认") : "";
   if (cell.ordered) return t`${own}${word("side", cell.ordered.side)} ${cell.ordered.shares} 股，风控放行`;
   if (!cell.action) return "";

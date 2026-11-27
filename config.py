@@ -257,6 +257,36 @@ SCENARIO_MIN_MOVE_PCT: float = float(os.getenv("SCENARIO_MIN_MOVE_PCT", "1.0"))
 # Names it is asked about at one meeting: holdings first, then the names the analyst is bullish on.
 SCENARIO_MAX_NAMES: int = int(os.getenv("SCENARIO_MAX_NAMES", "8"))
 
+# --- Plans (the desk only; the daily pipeline has none). These change what the desk trades ---
+# Every holding and every buy about to be made has a plan: why, where the stop is, by when it should
+# have worked, and a short list of "if this, then that". The portfolio manager drafts it (one model
+# call a name, and only when there is a reason to look at the plan again), code checks it, and code
+# holds the desk to it. The only actions code carries out by itself are ones that take risk off
+# (sell, sell half, take back a buy, raise a stop), and only on a price or a date. A headline can
+# call a meeting and nothing else. Off, the desk keeps no plans and nothing below applies.
+PLAN_ENABLED: bool = os.getenv("PLAN_ENABLED", "true").strip().lower() == "true"
+# What happens when the time a trade was given runs out with the position still held.
+#   exit_unless_ahead  a position that is not ahead of its cost is sold at the next open: a trade that
+#                      has not worked in the time it was given. One that is ahead is not sold by the
+#                      clock: it is put before the meeting, and its plan is looked at again
+#   exit               sold at the next open, ahead or not
+#   call_meeting       nothing is sold: it is put before the meeting
+#   off                plans have no clock
+PLAN_TIME_STOP: str = os.getenv("PLAN_TIME_STOP", "exit_unless_ahead").strip().lower()
+# Whether one of the simulation's own chances ("the chance of ending at the stop is above 60%") may set
+# off a sale. Off, such a condition can only call a meeting: the forecasts have to be reconciled against
+# what happened for long enough before anything is sold on them.
+PLAN_CHANCE_ACTS: bool = os.getenv("PLAN_CHANCE_ACTS", "false").strip().lower() == "true"
+# Conditions of the manager's own that one plan may hold, beyond the one that says what would show it wrong.
+PLAN_MAX_CONDITIONS: int = int(os.getenv("PLAN_MAX_CONDITIONS", "5"))
+# Names whose plan the manager is asked for at one meeting. Beyond it the desk's own plan stands in.
+PLAN_MAX_NAMES: int = int(os.getenv("PLAN_MAX_NAMES", "10"))
+# No new position is opened when the name's earnings report is due within this many sessions
+# after the meeting: the position would be opened into the report. 0 turns the rule off.
+PLAN_NO_ENTRY_BEFORE_REPORT: int = int(os.getenv("PLAN_NO_ENTRY_BEFORE_REPORT", "2"))
+# Meetings the watch may call on one day because a plan's condition held. Each is a check-in, with model calls.
+DESK_CALLED_MAX: int = int(os.getenv("DESK_CALLED_MAX", "2"))
+
 # --- Dashboard ---
 # A read-only web page over the journal: python -m dashboard. By default it
 # listens on this machine only. It has no login, so do not point it at a

@@ -287,6 +287,41 @@ def test_stop_does_not_fill_when_the_low_stays_above_it(broker):
     assert broker.positions()["AAA"].shares == 10
 
 
+def test_a_stop_can_be_raised_and_then_sells_where_it_was_raised_to(broker):
+    opened(broker, shares=10, stop=95)
+    assert broker.raise_stop("AAA", 97.5) is True
+    [stop] = broker.orders()
+    assert (stop.kind, stop.shares, stop.stop_price, stop.status) == ("stop", 10, 97.5, "open")
+    assert broker.positions()["AAA"].stop_price == 97.5
+    bars = [(FRI, 100, 100, 100, 100), (MON, 100, 100, 100, 100), (TUE, 99, 99, 97, 98)]
+    fill = broker.sync(snap(TUE, ticker("AAA", bars))).fills[0]
+    assert (fill.kind, fill.price, fill.shares) == ("stop", 97.5, 10) and broker.positions() == {}
+
+
+def test_a_stop_is_never_lowered_and_only_the_accounts_own_is_moved(broker, journal):
+    opened(broker, shares=10, stop=95)
+    assert broker.raise_stop("AAA", 95) is False and broker.raise_stop("AAA", 90) is False
+    assert broker.positions()["AAA"].stop_price == 95
+    assert broker.raise_stop("BBB", 99) is False                    # nothing held under that name
+    other = PaperBroker(journal, "other", initial_cash=10_000, slippage_bps=0)
+    assert other.raise_stop("AAA", 99) is False and broker.positions()["AAA"].stop_price == 95
+
+
+def test_a_position_without_a_stop_is_given_none_by_raising(broker):
+    opened(broker, shares=10)
+    assert broker.raise_stop("AAA", 97) is False
+    assert broker.orders() == [] and broker.positions()["AAA"].stop_price is None
+
+
+def test_a_filled_or_cancelled_stop_is_not_moved(broker):
+    opened(broker, shares=10, stop=95)
+    bars = [(FRI, 100, 100, 100, 100), (MON, 100, 100, 100, 100), (TUE, 99, 99, 94, 96)]
+    broker.sync(snap(TUE, ticker("AAA", bars)))
+    assert broker.raise_stop("AAA", 97) is False
+    [stop] = [order for order in broker.orders(open_only=False) if order.kind == "stop"]
+    assert (stop.status, stop.stop_price) == ("filled", 95)
+
+
 def test_a_position_can_be_stopped_out_on_the_day_it_opens(broker):
     broker.sync(snap(FRI, flat("AAA", FRI)))
     broker.submit(buy(shares=10, stop=95), FRI)

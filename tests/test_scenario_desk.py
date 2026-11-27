@@ -144,7 +144,9 @@ def test_the_seat_speaks_once_every_decision_is_made_and_before_the_orders_are_p
     stages = [event.stage for event in desk.journal.events(result.run_id)]
     first, last = stages.index("scenario"), len(stages) - 1 - stages[::-1].index("scenario")
     assert set(stages[first:last + 1]) == {"scenario"}
-    assert stages[first - 1] == "risk" and stages[last + 1] == "orders"
+    # The plans come between the risk gate and this seat: the desk is held to them, and to nothing said here.
+    assert stages[first - 1] == "plans" and stages[last + 1] == "orders"
+    assert stages[stages.index("plans") - 1] == "risk" and "plans" not in stages[:stages.index("risk")]
     assert "scenario" not in stages[:stages.index("risk")]
     said = lines(desk, result.run_id)
     # Neither is held and the analyst is as sure of one as of the other: by name.

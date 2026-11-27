@@ -101,6 +101,137 @@ class BackwardSet(BaseModel):
     problems: list[str] = Field(default_factory=list)
 
 
+# ── The plan for a trade ─────────────────────────────────────────────────────
+
+# What a plan may watch for. Every kind is something code can check.
+ConditionKind = Literal[
+    "price_below", "price_above", "close_below_average", "date", "chance_below", "chance_above", "headline",
+]
+# What a plan may say to do. The list is closed: nothing in it opens a position or adds to one.
+ActionKind = Literal["exit", "trim", "withdraw", "tighten_stop", "call_meeting"]
+# The actions code carries out by itself when a plan's condition holds. Each takes risk off.
+AUTOMATIC: tuple[str, ...] = ("exit", "trim", "withdraw", "tighten_stop")
+# The conditions that may set such an action off: prices and dates. Outside text cannot bring any of them about.
+HARD: tuple[str, ...] = ("price_below", "price_above", "close_below_average", "date")
+# The simulation's own chances. They are the desk's own arithmetic, not outside text, but a forecast earns the
+# right to sell by being reconciled: until the setting says so (PLAN_CHANCE_ACTS) they call a meeting and nothing else.
+CHANCES: tuple[str, ...] = ("chance_below", "chance_above")
+AVERAGES: tuple[int, ...] = (20, 50, 200)
+Ending = Literal["good", "bad", "middle"]
+
+
+class ContingencyDraft(Draft):
+    """One condition as the manager drafts it. The number every kind of condition needs is one field, and it has
+    to be given: asked for a field of its own per kind, each of them optional, the local model named a kind and
+    left its number out, ten plans out of ten."""
+
+    condition: ConditionKind = Field(
+        description="What to watch for. price_below / price_above: the price reaches `value`. close_below_average: "
+                    "a close below the `value`-day average. date: the close of the session `value` trading days "
+                    "from today. chance_below / chance_above: the simulation's chance of the `ending` passes "
+                    "`value`. headline: a later headline about the ticker has one of `keywords`"
+    )
+    value: float = Field(
+        description="The number the condition needs. price_below / price_above: the price. close_below_average: 20, "
+                    "50 or 200. date: how many trading days from today, 1 being the next session. chance_below / "
+                    "chance_above: the chance, above 0 and below 1. headline: 0"
+    )
+    ending: Ending | None = Field(default=None, description="For the chance conditions: good (the target first), bad (the stop first) or middle")
+    keywords: list[str] = Field(default_factory=list, description="For headline: one to four distinctive words")
+    action: ActionKind = Field(
+        description="What to do when it holds. exit: sell the position. trim: sell half. withdraw: take back a buy "
+                    "that has not filled. tighten_stop: raise the stop to `new_stop`. call_meeting: bring the desk together"
+    )
+    new_stop: float | None = Field(default=None, description="For tighten_stop: the new stop, above the present one and below the last close")
+    reason: str = Field(description="Why this condition and this action (1 sentence)")
+
+
+class PlanDraft(Draft):
+    thesis: str = Field(description="Why the desk owns it, or is about to (1-2 sentences)")
+    wrong_if: ContingencyDraft = Field(
+        description="What would show the plan is wrong: a price, an average or a date, with exit or trim as its action"
+    )
+    contingencies: list[ContingencyDraft] = Field(description="Further conditions and what to do on each. None is a normal answer")
+    change: str = Field(description="For a plan being looked at again: what you changed and why (1 sentence). Empty for a first plan")
+    remark: str = Field(description="One short sentence, in your own voice, said to the desk")
+
+
+class Condition(BaseModel):
+    kind: ConditionKind
+    level: float | None = None
+    average: int | None = None
+    on: date | None = None
+    ending: Ending | None = None
+    keywords: list[str] = Field(default_factory=list)
+
+
+class Contingency(BaseModel):
+    """One thing a plan watches for, and what happens when it holds."""
+
+    key: str = Field(description="Its name within the plan: time, wrong, or a number")
+    condition: Condition
+    action: ActionKind
+    new_stop: float | None = None
+    reason: str
+    source: Literal["manager", "rule"] = Field(description="rule: every plan has it, whoever wrote the rest")
+    automatic: bool = Field(description="Whether code carries the action out itself when the condition holds")
+
+
+class Plan(BaseModel):
+    """What the desk means to do with one name, in a form code can hold it to. Numbered: looked at again, it is a new version."""
+
+    arm: str
+    ticker: str
+    opened: date = Field(description="The session its first version was made after: it tells one plan for a name from a later one")
+    version: int
+    run_id: str = Field(description="The close meeting that made this version")
+    session_date: date
+    created_at: datetime
+    source: Literal["manager", "default"] = Field(
+        description="default: the manager gave no plan that passed the checks, and the desk's own stands in"
+    )
+    held: bool = Field(description="False: the buy was waiting to fill at the next open when this version was made")
+    thesis: str
+    direction: str = Field(default="", description="The analyst's view when this version was made")
+    horizon: int = Field(description="Sessions the trade was given when the plan was first made")
+    ends_on: date = Field(description="The session at whose close the time runs out. Fixed by the first version")
+    close: float
+    stop: float | None = None
+    stop_from: str = ""
+    target: float | None = Field(default=None, description="A notional target: nobody names one yet")
+    chances: dict[str, float] = Field(default_factory=dict, description="The three endings' chances at this meeting, from the simulation alone")
+    contingencies: list[Contingency] = Field(default_factory=list)
+    changes: list[str] = Field(default_factory=list, description="What differs from the version before, worked out by code")
+    basis: str = Field(default="", description="Why it was looked at again: what code found changed, and the manager's own words")
+    refused: list[str] = Field(default_factory=list, description="What of the manager's draft was refused, and why")
+    data_warnings: list[str] = Field(default_factory=list)
+    closed_on: date | None = Field(default=None, description="The session at whose close meeting the plan was found to be over")
+    closed_why: str = ""
+
+
+class Trigger(BaseModel):
+    """A plan's condition found to hold: when, on what evidence, and what became of its action."""
+
+    arm: str
+    ticker: str
+    opened: date
+    version: int = Field(description="The version of the plan that stood when it was found")
+    identity: str = Field(description="What it watched for and what it does, as one string: a condition fires once in a plan's life")
+    contingency: Contingency
+    fired_at: datetime
+    session_date: date = Field(description="The trading day it was found on")
+    found_by: Literal["watch", "close"] = Field(description="A round of the watch during the session, or the close meeting")
+    evidence: str = Field(description="What was seen, in words")
+    status: Literal["fired", "done", "not_done", "heard"] = Field(
+        default="fired",
+        description="fired: found, its action still to come. done: carried out. not_done: it could not be, and why "
+                    "is in `result`. heard: it called a meeting, and a meeting was held",
+    )
+    result: str = ""
+    handled_by: str = Field(default="", description="The meeting that carried it out or heard it")
+    handled_on: date | None = Field(default=None, description="The session whose close meeting handled it, or the day of the check-in")
+
+
 # ── What they turned out to be worth ─────────────────────────────────────────
 
 class OutcomeScore(BaseModel):

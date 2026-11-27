@@ -258,9 +258,19 @@ def test_the_snapshot_keeps_the_bars_the_forecast_was_made_from(week):
 # ── It changes nothing else ──────────────────────────────────────────────────
 
 def record_of(desk, results) -> dict:
-    """Everything the meetings said, asked and did, the quant engineer's and the scenario analyst's turns left out."""
+    """Everything the meetings said, asked and did, the quant engineer's and the scenario analyst's turns left out.
+
+    A plan keeps what the simulation gave its trade's endings, and the notional target they were worked out for.
+    Those two fields are the forecast's own figures set down by code, and are left out with it.
+    """
+    def payload(event) -> str:
+        kept = event.payload
+        if event.kind == "plan":
+            kept = {key: value for key, value in kept.items() if key not in ("chances", "target")}
+        return json.dumps(kept, sort_keys=True)
+
     events = [
-        [(e.stage, e.speaker, e.addressed_to, e.kind, e.ticker, e.remark, json.dumps(e.payload, sort_keys=True))
+        [(e.stage, e.speaker, e.addressed_to, e.kind, e.ticker, e.remark, payload(e))
          for e in desk.journal.events(result.run_id) if e.stage not in ("forecast", "scenario")]
         for result in results
     ]

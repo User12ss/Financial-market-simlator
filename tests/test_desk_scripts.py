@@ -138,14 +138,16 @@ def test_a_meeting_that_failed_passes_on_the_exit_code_and_says_why(box):
     )]
 
 
-@pytest.mark.parametrize("answer", ["", "Cannot start: no model\n", "lunch\n", "close meeting\n"])
-def test_only_one_of_the_four_kinds_of_meeting_starts_one(box, answer):
+@pytest.mark.parametrize("answer", ["", "Cannot start: no model\n", "lunch\n", "close meeting\n", "calledx\n",
+                                    "called meeting\n", "Called\n"])
+def test_only_one_of_the_five_kinds_of_meeting_starts_one(box, answer):
     (box.fake / "due.txt").write_text(answer)
     assert box.run("desk_tick.sh").returncode == 0
     assert "-m pipeline.desk meet" not in runs(box) and box.notifications() == []
 
 
-@pytest.mark.parametrize("kind", ["premarket", "midday", "afternoon", "close"])
+# "called" is the check-in a condition of one of the desk's plans asked for.
+@pytest.mark.parametrize("kind", ["premarket", "midday", "afternoon", "called", "close"])
 def test_each_kind_of_meeting_is_handed_over_under_its_own_name(box, kind):
     (box.fake / "due.txt").write_text(f"{kind}\n")
     assert box.run("desk_tick.sh").returncode == 0

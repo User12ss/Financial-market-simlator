@@ -11,6 +11,9 @@
 #   own until the next round is due (DESK_KEEP_AWAKE=0 turns that off; closing
 #   the lid still puts it to sleep).
 #
+#   The same round looks at the conditions of the desk's plans and records the
+#   ones that hold. One that says to call a meeting makes a meeting due.
+#
 #   A meeting, when one is due. That part is handed to scripts/daily_run.sh,
 #   which takes the same lock as the daily pipeline, starts Ollama when the
 #   model needs it and stops it afterwards, writes the log and says how the
@@ -59,6 +62,7 @@ esac
 DUE="$("$PYTHON" -m pipeline.desk due 2>> "$LOG" | tail -n 1)"
 case "$DUE" in
     premarket|midday|afternoon|close) ;;
+    called) ;;                               # a condition of one of the desk's plans said to meet
     *) exit 0 ;;
 esac
 

@@ -379,3 +379,58 @@ test("the record is cut into stretches by stage, and a debate by ticker", () => 
   ]);
   assert.deepEqual(stretches([]), []);
 });
+
+// A close meeting at which a condition of UPA's plan held: the manager said nothing of UPA, so the checks kept it by
+// default; then code, by the plan, set that aside and put in a sale, which the risk gate let through.
+const BY_PLAN = [
+  /* 0 */ line("views", "ticker_analyst", "view", "UPA", { direction: "bullish", confidence: 0.6, held: true }),
+  /* 1 */ line("views", "ticker_analyst", "view", "UPB", { direction: "bullish", confidence: 0.6, held: true }),
+  /* 2 */ proposed(["UPB", "hold", 0.6]),
+  /* 3 */ checked("accepted", "UPB", "hold"),
+  /* 4 */ checked("accepted", "UPA", "hold", "default"),
+  /* 5 */ line("checks", "risk_officer", "plan_action", "UPA", {
+    ticker: "UPA", action: "sell", confidence: 1, reason: "[wrong] On the price at or below 404.65: sell the position, by itself.",
+    source: "plan", status: "accepted", note: "",
+  }),
+  /* 6 */ line("risk", "risk_officer", "risk_approved", "UPA", sized("approved", "sell", 24, 24)),
+  /* 7 */ line("orders", "trader", "order_placed", "UPA", { side: "sell", shares: 24 }),
+];
+
+test("a sale a plan put in is the check that stands for its ticker, and says it was the plan", () => {
+  const [upa, upb] = buildTrail(BY_PLAN);
+  assert.deepEqual(upa.check, { index: 5, status: "accepted", action: "sell", source: "plan", kept: null,
+    before: { index: 4, status: "accepted", action: "hold", source: "default", kept: null } });
+  assert.equal(upb.check.source, "portfolio_manager");
+  assert.deepEqual([stepText("check", upa.check), stepText("check", upa.check, { brief: true }), lean("check", upa.check)],
+    ["按计划卖出", "按计划卖出", "down"]);
+  // Before the plan's line it was kept by default, as recorded; from it on, the plan's sale stands.
+  assert.equal(outcomeText(outcome(upa, 4)), "没有提案，按规则继续持有");
+  assert.deepEqual(outcome(upa, 5), { kind: "planned", action: "sell" });
+  assert.equal(outcomeText(outcome(upa, 5)), "按计划卖出");
+  assert.equal(outcomeText(outcome(upa, 6)), "按计划卖出，风控批准：卖出 24 股");
+  assert.equal(outcomeText(outcome(upa), true), "按计划卖出，已下单：卖出 24 股");
+  const trim = buildTrail([BY_PLAN[0], { ...BY_PLAN[5], payload: { ...BY_PLAN[5].payload, action: "trim" } }])[0];
+  assert.equal(outcomeText(outcome(trim), true), "按计划减仓，之后没有进一步动作");
+  assert.equal(stepText("check", trim.check), "按计划减仓");
+  // It is a sale the checks let through, like any other.
+  const counted = funnel(buildTrail(BY_PLAN));
+  assert.deepEqual([counted.accepted, counted.ordered, counted.kept], [1, 1, 1]);
+  // Every other row's outcome is what it always was: no plan is said of it.
+  assert.equal("plan" in outcome(upb), false);
+  // A plan's condition that held where the manager's own decision already does as much leaves that decision standing.
+  const noted = line("checks", "risk_officer", "plan_note", "UPB", {});
+  const [, kept] = buildTrail([...BY_PLAN.slice(0, 4), noted]);
+  assert.deepEqual(kept.check, { index: 3, status: "accepted", action: "hold", source: "portfolio_manager", kept: null });
+  assert.equal(outcomeText(outcome(kept)), "继续持有，不动");
+});
+
+test("in the grid a sale a plan put in has its own words, not the manager's", () => {
+  const cell = (fields) => ({
+    direction: "bullish", confidence: 0.6, held: true, action: "sell", source: "plan", check: "accepted", repeats: 0,
+    kept_by_default: false, verdict: null, approved_shares: null, ordered: null, ...fields,
+  });
+  assert.equal(fateText(cell({ verdict: "approved", approved_shares: 24, ordered: { side: "sell", shares: 24 } })), "按计划卖出：卖出 24 股，风控放行");
+  assert.equal(fateText(cell({ action: "trim", verdict: "approved", ordered: { side: "sell", shares: 12 } })), "按计划减仓：卖出 12 股，风控放行");
+  assert.equal(fateText(cell({ verdict: "rejected" })), "按计划卖出，风控拒绝");
+  assert.equal(fateText(cell({})), "按计划卖出，没有下单");
+});

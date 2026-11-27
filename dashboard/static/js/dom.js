@@ -134,7 +134,8 @@ const WORDS = {
   direction: { bullish: t("看多"), neutral: t("中性"), bearish: t("看空") },
   action: { buy: t("买入"), sell: t("卖出"), trim: t("减仓"), hold: t("持有"), keep: t("保留"), withdraw: t("撤回买单") },
   // The desk's meetings through the day, and what an analyst's update at a check-in does to a view that stands.
-  meeting: { premarket: t("盘前会"), midday: t("午间碰头"), afternoon: t("尾盘碰头"), close: t("收盘会") },
+  // A called one is held because a condition of a plan said to meet.
+  meeting: { premarket: t("盘前会"), midday: t("午间碰头"), afternoon: t("尾盘碰头"), called: t("临时碰头"), close: t("收盘会") },
   effect: { unchanged: t("不变"), strengthened: t("加强"), weakened: t("削弱"), broken: t("不成立") },
   verdict: { approved: t("批准"), reduced: t("削减"), rejected: t("拒绝") },
   check: { accepted: t("接受"), rejected: t("拒绝") },

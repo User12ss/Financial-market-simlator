@@ -23,7 +23,8 @@ STAGES = [
     ("forecast", "预测"),       # only at the desk's close meeting: the forecast engine's distributions
     ("debate", "辩论"),
     ("proposals", "提案"), ("checks", "检查"), ("risk", "风控"),
-    ("scenario", "推演"),       # only there too, once every decision is made: events a seat proposes, and the paths read backwards with them in
+    ("plans", "计划"),          # only at the desk's close meeting too: the plan for each trade, what held, and what was done about it
+    ("scenario", "推演"),      # only there too, once every decision is made: events a seat proposes, and the paths read backwards with them in
     ("orders", "下单"),
 ]
 

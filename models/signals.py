@@ -203,7 +203,8 @@ class TradeProposal(BaseModel):
     action: Action
     confidence: float
     reason: str
-    source: Literal["portfolio_manager", "default"] = "portfolio_manager"
+    # plan: put in by code because a condition of the name's plan held (the desk only; always a sell or a trim).
+    source: Literal["portfolio_manager", "default", "plan"] = "portfolio_manager"
     status: Literal["accepted", "rejected"]
     note: str = Field(default="", description="Why it was rejected, or why a default was filled in")
 
@@ -220,7 +221,8 @@ class UsageSummary(BaseModel):
 
 Effect =Literal["unchanged", "strengthened", "weakened", "broken"]
 CheckinAction = Literal["keep", "trim", "sell", "withdraw"]
-MeetingKind = Literal["premarket", "midday", "afternoon", "close"]
+# called: a check-in held because a condition of one of the desk's plans said to call a meeting.
+MeetingKind = Literal["premarket", "midday", "afternoon", "called", "close"]
 
 
 class ViewUpdateDraft(Draft):
@@ -327,6 +329,10 @@ class CheckinRecord(BaseModel):
     noted: list[CheckinDecision] = Field(
         default_factory=list, description="What a check-in during the session left for the close meeting to decide",
     )
+    calls: list[str] = Field(
+        default_factory=list,
+        description="Conditions of the desk's plans that had held and said to meet, as they were put before this meeting",
+    )
     halted: str = ""
     warnings: list[str] = Field(default_factory=list)
     usage: UsageSummary = Field(default_factory=UsageSummary)
@@ -353,7 +359,7 @@ class Event(BaseModel):
     ts: datetime
     stage: Literal[
         "briefing", "settle", "macro", "views", "forecast", "scenario", "debate", "proposals", "checks", "risk",
-        "orders",
+        "plans", "orders",
     ]
     speaker: str
     speaker_name: str

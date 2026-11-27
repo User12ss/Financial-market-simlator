@@ -8,10 +8,11 @@ import {
 } from "./dom.js";
 import { lineChart, rateBars, quantileStrip, meter } from "./charts.js";
 import { dayStrip } from "./day.js";
-import { buildTrail, fateText, funnel, outcome, outcomeText } from "./decisions.js";
+import { buildTrail, fateText, funnel, outcome, outcomeText, planText } from "./decisions.js";
 import { roomFeed } from "./live.js";
 import { meetingRoom } from "./meeting.js";
 import { countUp } from "./motion.js";
+import { plansSection } from "./plans.js";
 import { decisionTrail, funnelBar } from "./trail.js";
 import { t } from "./i18n.js";
 
@@ -216,7 +217,7 @@ function paintBook(node, data) {
 
   node.append(card(t("组合经理的提案，和规则检查的结果"), null, table([
     { title: t("标的"), cell: (row) => el("strong", { text: row.ticker }) },
-    { title: t("动作"), cell: (row) => word("action", row.action) },
+    { title: t("动作"), cell: (row) => (row.source === "plan" ? planText(row.action) : word("action", row.action)) },
     { title: t("把握度"), num: true, cell: (row) => num(row.confidence, 2) },
     { title: t("检查结果"), cell: (row) => word("check", row.status) },
     { title: t("理由（原文）"), said: true, cell: (row) => row.reason },
@@ -233,7 +234,17 @@ function paintBook(node, data) {
   ], signals.risk, t("这一场没有订单送到风控。"))));
 }
 
-export const bookPage = (ctx) => dataPage(ctx, "/api/book", paintBook);
+/** The page reads the book and, beside it, the desk's plans for the same trades. Both are read on every refresh. */
+async function readBook(ctx) {
+  const [book, plans] = await Promise.all([getJSON("/api/book", { arm: ctx.arm }), getJSON("/api/plans", { arm: ctx.arm })]);
+  if (!book.ok) return book;
+  return { ...book, data: { ...book.data, plans: plans.ok ? plans.data : null } };
+}
+
+export const bookPage = (ctx) => dataPage(ctx, () => readBook(ctx), (node, data) => {
+  paintBook(node, data);
+  node.append(plansSection(data.plans));
+});
 
 // ── 评估 ─────────────────────────────────────────────────────────────────────
 

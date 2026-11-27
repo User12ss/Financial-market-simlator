@@ -262,6 +262,21 @@ class PaperBroker:
             )
         return bool(found)
 
+    def raise_stop(self, ticker: str, price: float) -> bool:
+        """Move the position's protective stop up to `price`. Never down: a lower price changes nothing."""
+        with self.journal.transaction():
+            found = self.journal.rows(
+                "SELECT order_id FROM paper_orders WHERE account = ? AND ticker = ? AND kind = 'stop' "
+                "AND status = 'open' AND stop_price < ?",
+                (self.name, ticker, price),
+            )
+            for row in found:
+                self.journal.write(
+                    "UPDATE paper_orders SET stop_price = ? WHERE order_id = ? AND account = ?",
+                    (price, row["order_id"], self.name),
+                )
+        return bool(found)
+
     # ── Bringing the books up to a session ───────────────────────────────
 
     def sync(self, snapshot: Snapshot) -> SyncResult:

@@ -231,6 +231,23 @@ a.chip { text-decoration: none; }
 .state-warning::before { background: var(--warning);  }
 .state-critical::before { background: var(--critical);  }
 .state-live::before { background: var(--accent); box-shadow: 0 0 0 0 var(--glow); animation: beacon 1.4s ease-out infinite; }
+.state-info::before { background: var(--accent-2); }
+
+/* The desk's plans, on the book page: one block per trade, ruled off from the next like rows of a blotter. */
+.plan { display: grid; gap: 8px; padding: 12px 0; border-top: 1px solid var(--hairline); min-width: 0; }
+.plan:first-of-type { border-top: 0; padding-top: 0; }
+.plan-head { gap: 8px 12px; }
+.plan-ticker { font: 600 15px/1.3 var(--mono); color: var(--ink); }
+.plan-chances { gap: 6px 8px; }
+.plan-chances strong { font-family: var(--mono); color: var(--ink); }
+.plan-fired { display: grid; gap: 2px; padding-left: 8px; border-left: 2px solid var(--ring); }
+.plan-finals { gap: 4px 10px; }
+.plan-timeline { list-style: none; margin: 8px 0 0; padding: 0 0 0 10px; border-left: 1px solid var(--ring); display: grid; gap: 10px; }
+.plan-version { display: grid; gap: 4px; min-width: 0; }
+.plan-ended { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--hairline); }
+/* In English a plan's conditions and actions are phrases long enough to run the table 26px over at 1024px:
+   there they may break onto a second line. In Chinese they are a few characters and stay on one. */
+:root:lang(en) .plan td:not(.said), :root:lang(en) .plan-ended td:not(.said):not(.num) { white-space: normal; }
 
 /* Figures: the hero number and the tiles beside it. */
 .kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }

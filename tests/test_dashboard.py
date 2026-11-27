@@ -45,7 +45,7 @@ STATIC = Path(dashboard_app.__file__).parent / "static"
 ODD = '<b>UPA</b> & "quoted" <script>alert(1)</script> 不改写'
 ADDRESSES = {
     "/api/roster", "/api/arms", "/api/sessions", "/api/meeting", "/api/day", "/api/market", "/api/overview", "/api/book",
-    "/api/history", "/api/evaluation", "/api/status", "/api/stream",
+    "/api/history", "/api/evaluation", "/api/status", "/api/stream", "/api/plans",
 }
 
 
@@ -202,7 +202,7 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
     scripts = {path.name: path.read_text(encoding="utf-8") for path in (STATIC / "js").glob("*.js")}
     assert set(scripts) == {
         "app.js", "backdrop.js", "brief.js", "charts.js", "day.js", "decisions.js", "dom.js", "emblems.js", "en.js", "figures.js", "i18n.js", "links.js",
-        "live.js", "market.js", "meeting.js", "motion.js", "network.js", "pages.js", "playback.js", "screen.js",
+        "live.js", "market.js", "meeting.js", "motion.js", "network.js", "pages.js", "plans.js", "playback.js", "screen.js",
         "tape.js", "team.js", "trail.js"}
     everything = "\n".join(scripts.values())
     # One place asks the server for anything, and it only reads.
@@ -225,7 +225,7 @@ def test_the_pages_own_logic_passes_its_tests():
     files = sorted(path.name for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     assert files == ["checkin.test.mjs", "day.test.mjs", "decisions.test.mjs", "decisions_page.test.mjs",
                      "dom.test.mjs", "english.test.mjs", "forecasts_page.test.mjs", "format.test.mjs", "links.test.mjs", "live.test.mjs",
-                     "market.test.mjs", "motion.test.mjs",
+                     "market.test.mjs", "motion.test.mjs", "plans_page.test.mjs",
                      "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "team.test.mjs", "trail.test.mjs"]
     result = subprocess.run([NODE, "--test", *(f"tests/js/{name}" for name in files)],
                             cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -245,8 +245,8 @@ def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear
     assert (seat["bear"] - seat["bull"]) % 14 == 7
     assert (seat["portfolio_manager"], seat["judge"]) == (0, 7)
     assert [stage["id"] for stage in body["stages"]] == [
-        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "scenario",
-        "orders"]
+        "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "plans",
+        "scenario", "orders"]
     assert all(figure["title"] and figure["does"] for figure in roster)
     # Each has the mark of its field and what it is a specialist in, and no two share a mark.
     assert all(figure["emblem"] and len(figure["craft"]) >= 3 for figure in roster)

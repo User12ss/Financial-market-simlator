@@ -199,6 +199,7 @@ def create_app(
         Route("/api/overview", page(lambda arm, request: reader.overview(arm)), methods=["GET"]),
         Route("/api/book", page(lambda arm, request: reader.book(arm)), methods=["GET"]),
         Route("/api/history", page(lambda arm, request: reader.history(arm)), methods=["GET"]),
+        Route("/api/plans", page(lambda arm, request: reader.plans(arm)), methods=["GET"]),
         Route("/api/evaluation", page(lambda arm, request: reader.evaluation(arm)), methods=["GET"]),
         Route("/api/status", page(lambda arm, request: reader.status(arm)), methods=["GET"]),
         Route("/api/stream", stream, methods=["GET"]),

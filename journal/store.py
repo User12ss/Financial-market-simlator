@@ -22,7 +22,7 @@ from typing import Iterator
 import config
 from models.evaluation import Lesson, ViewScore
 from models.forecast import ForecastScore, ForecastSet
-from models.planning import BackwardSet, EventScore, OutcomeScore
+from models.planning import BackwardSet, EventScore, OutcomeScore, Plan, Trigger
 from models.signals import Event, MacroRegime, SignalTable, UsageSummary
 
 # Bumped whenever an existing table changes. A journal written under another
@@ -281,6 +281,34 @@ CREATE TABLE event_scores (
     status       TEXT NOT NULL,           -- scored, pending, unpriced, cannot_be_judged
     score_json   TEXT NOT NULL,
     PRIMARY KEY (arm, session_date, ticker, key)
+)""",
+    # The desk's plan for each trade: one row per version. A plan is told from a later one for the
+    # same name by the session its first version was made after.
+    "plans": """
+CREATE TABLE plans (
+    arm          TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    opened       TEXT NOT NULL,           -- the session the plan's first version was made after
+    version      INTEGER NOT NULL,
+    session_date TEXT NOT NULL,           -- the session this version was made after
+    run_id       TEXT NOT NULL,           -- the close meeting that made it
+    closed_on    TEXT,                    -- the session whose close meeting found the plan to be over
+    closed_why   TEXT,
+    plan_json    TEXT NOT NULL,
+    PRIMARY KEY (arm, ticker, opened, version)
+)""",
+    # A plan's condition found to hold: one row per condition, which fires once in a plan's life.
+    "plan_triggers": """
+CREATE TABLE plan_triggers (
+    arm          TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    opened       TEXT NOT NULL,
+    identity     TEXT NOT NULL,           -- what it watched for and what it does
+    session_date TEXT NOT NULL,           -- the trading day it was found on
+    found_by     TEXT NOT NULL,           -- watch, close
+    status       TEXT NOT NULL,           -- fired, done, not_done, heard
+    trigger_json TEXT NOT NULL,
+    PRIMARY KEY (arm, ticker, opened, identity)
 )""",
 }
 
@@ -720,6 +748,99 @@ class Journal:
             "SELECT score_json FROM event_scores WHERE arm = ? ORDER BY session_date, ticker, key", (arm,)
         )
         return [EventScore.model_validate_json(row["score_json"]) for row in rows]
+
+    # ── The desk's plans ─────────────────────────────────────────────────
+
+    def save_plans(self, plans: list[Plan]) -> None:
+        with self.transaction():
+            for plan in plans:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan.arm, plan.ticker, plan.opened.isoformat(), plan.version, plan.session_date.isoformat(),
+                     plan.run_id, plan.closed_on.isoformat() if plan.closed_on else None, plan.closed_why or None,
+                     plan.model_dump_json(exclude={"closed_on", "closed_why"})),
+                )
+
+    def plans(self, arm: str) -> list[Plan]:
+        """Every version of every plan of an arm: by name, then by the plan's first session, then by version."""
+        rows = self._db.execute(
+            "SELECT plan_json, closed_on, closed_why FROM plans WHERE arm = ? ORDER BY ticker, opened, version", (arm,)
+        )
+        return [
+            Plan.model_validate_json(row["plan_json"]).model_copy(update={
+                "closed_on": date.fromisoformat(row["closed_on"]) if row["closed_on"] else None,
+                "closed_why": row["closed_why"] or "",
+            })
+            for row in rows
+        ]
+
+    def standing_plans(self, arm: str) -> dict[str, Plan]:
+        """The plan that stands for each name: the latest version of its plan that has not been found over."""
+        standing: dict[str, Plan] = {}
+        for plan in self.plans(arm):
+            if plan.closed_on is None:
+                standing[plan.ticker] = plan          # a later plan, and a later version, come later
+        return standing
+
+    def close_plan(self, arm: str, ticker: str, opened: date, session: date, why: str) -> None:
+        """Mark every version of a plan as over: found so at the close meeting of `session`."""
+        with self.transaction():
+            self._db.execute(
+                "UPDATE plans SET closed_on = ?, closed_why = ? WHERE arm = ? AND ticker = ? AND opened = ?",
+                (session.isoformat(), why, arm, ticker, opened.isoformat()),
+            )
+
+    def add_triggers(self, triggers: list[Trigger]) -> list[Trigger]:
+        """Keep the triggers not on record yet, and return those. A condition fires once in a plan's life."""
+        added = []
+        with self.transaction():
+            for trigger in triggers:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO plan_triggers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (trigger.arm, trigger.ticker, trigger.opened.isoformat(), trigger.identity,
+                     trigger.session_date.isoformat(), trigger.found_by, trigger.status, trigger.model_dump_json()),
+                )
+                if cursor.rowcount:
+                    added.append(trigger)
+        return added
+
+    def save_trigger(self, trigger: Trigger) -> None:
+        """Write a trigger as it now stands, in place of what was on record for it."""
+        with self.transaction():
+            self._db.execute(
+                "INSERT OR REPLACE INTO plan_triggers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (trigger.arm, trigger.ticker, trigger.opened.isoformat(), trigger.identity,
+                 trigger.session_date.isoformat(), trigger.found_by, trigger.status, trigger.model_dump_json()),
+            )
+
+    def plan_triggers(self, arm: str, status: str | None = None) -> list[Trigger]:
+        """An arm's triggers, the earliest found first."""
+        sql, params = "SELECT trigger_json FROM plan_triggers WHERE arm = ?", [arm]
+        if status is not None:
+            sql, params = sql + " AND status = ?", params + [status]
+        triggers = [Trigger.model_validate_json(row["trigger_json"]) for row in self._db.execute(sql, tuple(params))]
+        return sorted(triggers, key=lambda trigger: (trigger.fired_at, trigger.ticker, trigger.contingency.key))
+
+    def forget_plans_of(self, arm: str, session: date) -> None:
+        """Take back what a close meeting of this session left about plans: the session is being held again.
+
+        The versions it made go, the plans it found over stand again, the
+        triggers it found go, and those it carried out or heard are to be
+        handled again. What a check-in or the watch left is not touched.
+        """
+        day = session.isoformat()
+        with self.transaction():
+            runs = {row["run_id"] for row in self._db.execute(
+                "SELECT run_id FROM runs WHERE arm = ? AND session_date = ?", (arm, day))}
+            self._db.execute("DELETE FROM plans WHERE arm = ? AND session_date = ?", (arm, day))
+            self._db.execute(
+                "UPDATE plans SET closed_on = NULL, closed_why = NULL WHERE arm = ? AND closed_on = ?", (arm, day))
+            self._db.execute(
+                "DELETE FROM plan_triggers WHERE arm = ? AND found_by = 'close' AND session_date = ?", (arm, day))
+            for trigger in self.plan_triggers(arm):
+                if trigger.status != "fired" and trigger.handled_by in runs:
+                    self.save_trigger(trigger.model_copy(update={
+                        "status": "fired", "result": "", "handled_by": "", "handled_on": None}))
 
     # ── What the books hold ──────────────────────────────────────────────
 

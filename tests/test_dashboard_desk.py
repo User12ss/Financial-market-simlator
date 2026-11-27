@@ -334,7 +334,7 @@ def test_looking_at_the_desks_pages_leaves_the_journal_and_the_ledger_exactly_as
     for path, params in [
         ("/api/meeting", {}), ("/api/meeting", {"run_id": desk.premarket.meeting_id}), ("/api/day", {}),
         ("/api/day", {"day": "2026-11-16"}), ("/api/sessions", {}), ("/api/market", {"run_id": desk.midday.meeting_id}),
-        ("/api/overview", {}), ("/api/book", {}), ("/api/history", {}), ("/api/status", {}),
+        ("/api/overview", {}), ("/api/book", {}), ("/api/history", {}), ("/api/status", {}), ("/api/plans", {}),
     ]:
         assert get(client, path, arm=ARM, **params)[0] == 200, path
     stream(client, arm=ARM, polls=2)

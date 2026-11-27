@@ -50,11 +50,13 @@ from data.snapshot import load_snapshot
 from execution.paper import PaperBroker, sector_of
 from execution.placement import place
 from journal.store import COMPLETED, Journal
+from models.planning import Trigger
 from models.signals import (
     CheckinAction, CheckinDecision, CheckinDraft, CheckinRecord, Event, PriceNow, ShownItem, TickerBriefing,
     TickerView, TradeProposal, ViewUpdate, ViewUpdateDraft,
 )
 from models.trading import Order, OrderRequest, Position, RiskDecision
+from pipeline import plans
 from pipeline.checks import figure_warning
 from pipeline.daily import RISK_OFFICER, TRADER, Arm, BudgetExceeded, _slug, usage_since
 from pipeline.report import render_holding, render_view
@@ -102,6 +104,7 @@ class _Meeting:
     degraded: bool = False
     seq: int = 0
     model_checked: bool = False
+    calls: list[Trigger] = field(default_factory=list)      # conditions of the desk's plans that this meeting hears
 
     def problem(self, message: str) -> None:
         """Something went wrong that makes this check-in incomplete."""
@@ -210,12 +213,13 @@ def _headline(published: datetime | None, publisher: str, title: str) -> str:
 
 def render_checkin(
     briefing: TickerBriefing, view: TickerView, position: Position | None, order: Order | None,
-    earlier: list[LedgerItem], session: date, at_open: Order | None = None,
+    earlier: list[LedgerItem], session: date, at_open: Order | None = None, calls: list[Trigger] | None = None,
 ) -> str:
     """Everything the analyst is shown about one ticker at a check-in.
 
     `order` is still waiting to fill. `at_open` was due to fill at today's
-    open, which has passed, and is not booked yet.
+    open, which has passed, and is not booked yet. `calls` are conditions
+    of the desk's plan for the ticker that have held and call a meeting.
     """
     ticker = briefing.ticker
     lines = [f"STANDING VIEW (from the close meeting of {session})", render_view(view), "", "THE DESK'S POSITION"]
@@ -259,11 +263,21 @@ def render_checkin(
     if earlier:
         lines += ["", "EARLIER HEADLINES, already known at the last meeting:"]
         lines += [f"- {_headline(entry.published_at, entry.publisher, entry.title)}" for entry in earlier]
+    if calls:
+        lines += ["", "THE DESK'S OWN PLAN FOR IT says to meet when one of its conditions holds, and this has:"]
+        lines += [f"- {plans.trigger_line(trigger)}" for trigger in calls]
     return "\n".join(lines)
 
 
-def check_update(briefing: TickerBriefing, draft: ViewUpdateDraft, shown: list[str]) -> ViewUpdate:
-    """The update to keep. Nothing in it is refused, but what cannot be verified is marked."""
+def check_update(
+    briefing: TickerBriefing, draft: ViewUpdateDraft, shown: list[str], called: bool = False,
+) -> ViewUpdate:
+    """The update to keep. Nothing in it is refused, but what cannot be verified is marked.
+
+    `called`: a condition of the desk's plan for the ticker has held and is
+    before the analyst. That is something to change a view on, as a new
+    headline or a large move is.
+    """
     by_number = {entry.number: entry.item_id for entry in briefing.new_items}
     cited, unknown = [], []
     for number in draft.cited:
@@ -278,7 +292,7 @@ def check_update(briefing: TickerBriefing, draft: ViewUpdateDraft, shown: list[s
             f"Cites headline number(s) {', '.join(str(n) for n in unknown)}, which it was not shown."
         )
     moved = bool(briefing.trading and briefing.trading.beyond_usual)
-    if draft.effect != "unchanged" and not cited and not moved:
+    if draft.effect != "unchanged" and not cited and not moved and not called:
         warnings.append(
             f"Says the view is {draft.effect} without naming a new headline, and the price has not moved "
             "beyond its usual range."
@@ -353,6 +367,7 @@ def _due_line(order: Order, position: Position | None) -> str:
 def manager_briefing(
     briefings: list[TickerBriefing], updates: dict[str, ViewUpdate], positions: dict[str, Position],
     waiting: dict[str, Order], at_open: dict[str, Order] | None = None,
+    calls: dict[str, list[Trigger]] | None = None,
 ) -> str:
     """Everything the portfolio manager is shown at a check-in."""
     at_open = at_open or {}
@@ -377,6 +392,10 @@ def manager_briefing(
     quiet = [b.ticker for b in briefings if b.ticker not in updates]
     if quiet:
         lines += ["", f"NOT REVIEWED (nothing new, or no standing view): {', '.join(quiet)}"]
+    if calls:
+        lines += ["", "CONDITIONS OF THE DESK'S OWN PLANS THAT HAVE HELD AND CALL FOR A MEETING:"]
+        lines += [f"- {ticker}: {plans.trigger_line(trigger)}"
+                  for ticker, group in sorted(calls.items()) for trigger in group]
     return "\n".join(lines)
 
 
@@ -455,9 +474,16 @@ class Checkin:
         try:
             record = self._hold(meeting)
             status = "degraded" if meeting.degraded else "ok"
-            self.journal.finish_meeting(
-                meeting_id, status, self._now(), record.usage, record_json=record.model_dump_json(),
-            )
+            # The meeting's ending and the hearing of what called it are saved together: a condition is
+            # heard exactly when a meeting that was shown it is on record as held.
+            with self.journal.transaction():
+                self.journal.finish_meeting(
+                    meeting_id, status, self._now(), record.usage, record_json=record.model_dump_json(),
+                )
+                for trigger in meeting.calls:
+                    self.journal.save_trigger(trigger.model_copy(update={
+                        "status": "heard", "result": f"Heard at the {kind} check-in of {clock(meeting.as_of)}.",
+                        "handled_by": meeting_id, "handled_on": day}))
         except Exception as e:  # recorded: a check-in that failed decides nothing
             message = str(e) if isinstance(e, (CheckinFailure, BudgetExceeded)) else f"{type(e).__name__}: {e}"
             self.journal.finish_meeting(
@@ -510,6 +536,14 @@ class Checkin:
                    if order.kind != "stop" and order.order_id not in had_their_open}
         sold = left_at_open(positions, waiting, at_open)
         tickers = sorted((set(positions) | set(waiting) | set(at_open)) - set(sold))
+        # Conditions of the desk's plans that say to meet, found by now and heard by no meeting yet.
+        calls: dict[str, list[Trigger]] = {}
+        if config.PLAN_ENABLED:
+            for trigger in plans.calling(self.journal.plan_triggers(arm.name, status="fired"),
+                                         self.journal.standing_plans(arm.name), as_of):
+                if trigger.ticker in tickers:
+                    calls.setdefault(trigger.ticker, []).append(trigger)
+        meeting.calls = [trigger for ticker in sorted(calls) for trigger in calls[ticker]]
 
         # 1. briefing
         briefings = [
@@ -521,6 +555,8 @@ class Checkin:
             )
             for ticker in tickers
         ]
+        # A name whose plan called the meeting is put before the analyst whether or not anything else is new.
+        briefings = [b.model_copy(update={"affected": True}) if b.ticker in calls else b for b in briefings]
         affected = [b for b in briefings if b.affected]
         # What is "new" is only what the watch has fetched. When it last looked is said with it, so a
         # watch that has stopped cannot pass for a quiet market.
@@ -541,6 +577,11 @@ class Checkin:
         for briefing in affected:
             self._say(meeting, "briefing", NEWS_DESK, CheckinAnalyst.id, "news", ticker=briefing.ticker,
                       remark=describe(briefing), payload=briefing.model_dump(mode="json"))
+        for trigger in meeting.calls:
+            self._say(meeting, "briefing", NEWS_DESK, CheckinAnalyst.id, "plan_call", ticker=trigger.ticker,
+                      payload=trigger.model_dump(mode="json"),
+                      remark=(f"{trigger.ticker}: a condition of the desk's plan was found to hold at "
+                              f"{clock(trigger.fired_at)}, and it says to meet. {plans.trigger_line(trigger)}"))
 
         # 2. views
         analyst = CheckinAnalyst(arm.llm)
@@ -559,14 +600,14 @@ class Checkin:
                 if entry.item_id not in shown_ids and entry.first_seen <= since
             ][:EARLIER_SHOWN]
             text = render_checkin(briefing, view, positions.get(ticker), waiting.get(ticker), earlier,
-                                  meeting.session, at_open.get(ticker))
+                                  meeting.session, at_open.get(ticker), calls.get(ticker))
             try:
                 draft = self._cached(meeting, f"update:{ticker}", text, ViewUpdateDraft,
                                      lambda: analyst.update(ticker, text))
             except LLMError as e:
                 meeting.problem(f"{ticker}: the analyst call failed. {e}")
                 continue
-            update = check_update(briefing, draft, [text, analyst.system_prompt])
+            update = check_update(briefing, draft, [text, analyst.system_prompt], called=ticker in calls)
             updates[ticker] = update
             self._say(meeting, "views", (analyst.id, analyst.name), CheckinManager.id, "view_update", ticker=ticker,
                       remark=draft.remark, payload=update.model_dump(mode="json"), is_llm=True)
@@ -576,7 +617,7 @@ class Checkin:
         pm_summary = ""
         if updates:
             manager = CheckinManager(arm.llm, meeting.can_act)
-            text = manager_briefing(briefings, updates, positions, waiting, at_open)
+            text = manager_briefing(briefings, updates, positions, waiting, at_open, calls)
             draft = None
             try:
                 draft = self._cached(meeting, "decisions", text, CheckinDraft, lambda: manager.decide(text))
@@ -604,6 +645,7 @@ class Checkin:
             meeting_id=meeting.meeting_id, arm=arm.name, kind=meeting.kind, day=meeting.day,
             session_date=meeting.session, as_of=as_of, since=since, can_act=meeting.can_act, book=briefings,
             updates=list(updates.values()), decisions=decisions, pm_summary=pm_summary,
+            calls=[f"{trigger.ticker}: {plans.trigger_line(trigger)}" for trigger in meeting.calls],
         )
         wanted = [d for d in decisions if d.status == "accepted" and d.action != "keep"]
         if meeting.can_act:

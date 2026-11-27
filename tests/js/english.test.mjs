@@ -132,3 +132,37 @@ test("in English the whole room speaks English, and what was recorded is still w
   assert.equal(words(wearing(room.node, "words")[0]), "Own it.Own it.");
   assert.ok(everything(room.node).includes("Reduced: buy TMO, 20 shares cut to 10."));
 });
+
+test("in English the desk's plans speak English, and what was recorded is word for word what it was", async () => {
+  const { PLANS, CONDITIONS } = await import("./plan_fixture.mjs");
+  const { actionText, conditionText, foundText, plansSection, stateText, whoText, sourceText } = await import("../../dashboard/static/js/plans.js");
+  assert.deepEqual(CONDITIONS.map((row) => conditionText(row.condition)), [
+    "At the close of 2026-11-30", "Price at or below 404.65", "Price at or above 412.40", "A close below the 50-day average",
+    "Simulated chance of “Stop first” above 60%", "A headline with subpoena / recall", "Simulated chance of “Target first” below 20%",
+    "At the close of 2026-11-17",
+  ]);
+  assert.deepEqual(CONDITIONS.map(actionText), ["Sell the whole position", "Sell the whole position", "Raise the stop to 403.56", "Sell half",
+    "Call a meeting", "Call a meeting", "Withdraw the unfilled buy", "Sell half"]);
+  assert.deepEqual(["waiting", "fired", "done", "not_done", "heard"].map(stateText),
+    ["Not triggered yet", "Triggered, to be handled", "Carried out", "Not carried out", "Heard at a meeting"]);
+  assert.deepEqual([whoText({ automatic: true }), whoText({ automatic: false }), sourceText("manager"), sourceText("default")],
+    ["Carried out by code", "Decided at a meeting", "Drafted by the Portfolio Manager", "Desk default"]);
+  assert.equal(foundText(CONDITIONS[1].trigger), "Found by the intraday watch on 2026-11-17 at 10:00 New York time");
+  assert.equal(foundText(CONDITIONS[6].trigger), "Found by the close meeting on 2026-11-17 at 18:30 New York time");
+  assert.equal(word("meeting", "called"), "Called check-in");
+  assert.equal(fromServer("计划"), "Plans");
+  // A sale a plan put in, in the trail and in the grid.
+  assert.deepEqual([outcomeText({ kind: "planned", action: "sell" }), outcomeText({ kind: "planned", action: "trim" })],
+    ["Sold by its plan", "Trimmed by its plan"]);
+  assert.equal(outcomeText({ kind: "ordered", side: "sell", shares: 24, plan: "sell" }), "Sold by its plan; Order placed: sell 24 shares");
+
+  const section = plansSection(PLANS);
+  assert.deepEqual(everything(section).filter((text) => HAN.test(String(text))), []);
+  assert.equal(words(wearing(section, "plan-head")[1]), "UPBVersion 1Desk defaultStop $400.83Runs to the close of 2026-11-30Buy waiting to fill");
+  for (const said of ["The trend carries it.", "It traded at 402.74.", "Heard at the called check-in of 2026-11-16 10:05 New York time.",
+    "Dropped: [1] On the close of 2026-11-17: sell half, by itself. Half off after two sessions.",
+    "The position was sold at the open on 2026-11-18, at 402.54."]) assert.ok(everything(section).includes(said), said);
+  for (const none of [{ arm: "fake/a", has_plans: false }, { arm: "desk/fake/a", has_plans: false }, null]) {
+    assert.deepEqual(everything(plansSection(none)).filter((text) => HAN.test(String(text))), []);
+  }
+});
