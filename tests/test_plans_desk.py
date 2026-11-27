@@ -1249,7 +1249,9 @@ def as_cli(desk, monkeypatch) -> None:
     def build(arm, universe=None, on_event=None):
         desk._on_event = on_event
         return desk
-    monkeypatch.setattr(desk_module, "desk_arm", lambda spec=None: desk.arm)
+    # The list of desks itself is stood in for, not the making of one: the machine's own settings (a DESK_ARMS
+    # in its .env, which config reads) must not decide how many desks this test runs.
+    monkeypatch.setattr(desk_module, "desk_arms", lambda spec=None: [desk.arm])
     monkeypatch.setattr(desk_module, "Desk", build)
     monkeypatch.setattr(desk_module.universe_rules, "load_universe", lambda path=None: desk.universe)
 
