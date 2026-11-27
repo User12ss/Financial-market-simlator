@@ -249,6 +249,22 @@ class OllamaProvider(_HttpProvider):
         usage = Usage(self.name, model, prompt_tokens, int(data.get("eval_count") or 0), elapsed)
         return text, usage
 
+    def unload(self, model: str) -> None:
+        """Have Ollama let go of a model now. It otherwise keeps one in memory for minutes after its last call.
+
+        For a machine that holds one model at a time: before another is loaded, the one just used goes. Best
+        effort, and never an error: the worst that not unloading does is a slower machine. A model that is not
+        loaded is not asked about, since asking would load it first.
+        """
+        try:
+            listed = self._http.get(f"{self.base_url}/api/ps", timeout=5)
+            listed.raise_for_status()
+            loaded = {entry.get("name", "") for entry in listed.json().get("models", [])}
+            if model in loaded or f"{model}:latest" in loaded:
+                self._http.post(f"{self.base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=30)
+        except (httpx.HTTPError, ValueError, AttributeError):
+            pass
+
     def check(self, model):
         try:
             response = self._http.get(f"{self.base_url}/api/tags", timeout=5)
@@ -451,6 +467,15 @@ class LLMClient:
         if fast:
             return self._providers[self.fast_provider_name], self.fast_model
         return self._providers[self.provider_name], self.model
+
+    def release(self) -> None:
+        """Let go of the local models this client has called: see OllamaProvider.unload. A hosted model has nothing to let go of."""
+        for name, provider in self._providers.items():
+            unload = getattr(provider, "unload", None)
+            if unload is None:
+                continue
+            for model in sorted({call.model for call in self.usage.calls if call.provider == name}):
+                unload(model)
 
     def describe(self) -> str:
         main = f"{self.provider_name} / {self.model}"

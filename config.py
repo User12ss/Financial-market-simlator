@@ -197,6 +197,10 @@ PIPELINE_LESSONS_PER_TICKER: int = int(os.getenv("PIPELINE_LESSONS_PER_TICKER", 
 LEDGER_PATH: str = os.getenv("LEDGER_PATH", "").strip() or str(PROJECT_ROOT / "data_store" / "ledger.sqlite3")
 # Check-ins, as New York times. One before the open and up to two during the
 # session; a time at or after the day's close is skipped on that day.
+# Desks to run side by side, each on its own paper account: a list of PROVIDER:MODEL, with commas between.
+# Empty, as shipped, there is one desk, on the configured model. A desk listed here for the first time
+# starts from nothing: its own cash, no positions, and its first meeting is a close meeting.
+DESK_ARMS: str = os.getenv("DESK_ARMS", "").strip()
 DESK_PREMARKET: str = os.getenv("DESK_PREMARKET", "").strip() or "08:30"
 DESK_MIDDAY: str = os.getenv("DESK_MIDDAY", "").strip() or "12:00"
 DESK_AFTERNOON: str = os.getenv("DESK_AFTERNOON", "").strip() or "15:00"

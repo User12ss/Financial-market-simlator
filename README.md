@@ -408,6 +408,15 @@ scripts/schedule.sh uninstall desk
 
 While the watch is on, each round keeps the Mac from going to sleep on its own until the next one (`DESK_KEEP_AWAKE=0` turns that off). A closed lid still puts it to sleep, and launchd does not wake it: keep the Mac on with the lid open from before the open until after the close, or run the desk somewhere that stays on. The log is `data_store/logs/desk_<date>.log`.
 
+**Two models side by side.** `DESK_ARMS` lists the desks to run, as `PROVIDER:MODEL` with commas between, for example `DESK_ARMS=ollama:qwen2.5-coder:7b,ollama:qwen3.5:9b-q4_K_M`. Each is a desk of its own: its own paper account under its own name (`desk/<provider>/<model>`), its own meetings, plans and scores. They read the same market data and the same ledger, and decide apart, which is how one model is set against another. Empty, as shipped, there is one desk, on the configured model, and nothing is different. `--arm` on the command line runs that one desk only.
+
+- A desk listed for the first time starts from nothing: the starting cash, no positions. Its first meeting is the next close meeting; it holds no check-in before that. The desk that was running goes on as it was, with its book. Taking a desk off the list stops its meetings and leaves its records and its account where they are: nobody watches its positions from then on, and listing it again takes it up from there.
+- In a round, the watch goes to each desk in turn and says what it did in one line, and each desk that has a meeting due holds it, one after the other, under the one lock. A desk that cannot meet (its model is missing, say) is said to have failed, and the next still meets.
+- Before the next desk's model is called, the one just used is unloaded. Ollama otherwise keeps a model in memory for minutes after its last call, and a 16 GB machine does not hold two.
+- The models are called by the same settings. A model that thinks before it answers needs `OLLAMA_THINK=false`, which a model that does not think takes no harm from.
+- It costs time: every meeting is held once for each desk. A close meeting has from two hours after the close until the next open, which is room for several. Should the next session open before a later desk's turn comes, that desk's meeting for the session is refused as too late, as any close meeting would be, and it goes on from the next close.
+- The daily pipeline is not part of this and runs its one configuration as before.
+
 **What the desk does not do yet.** Its meetings are held by the same figures as the daily pipeline, plus two seats that are code: the news desk and, at the close meeting, the quant engineer. The forecast is recorded and reconciled and bears on no order yet. Plans with triggers, and the analysts who look at people instead of prices, are later stages of `docs/UPGRADE_PLAN.md` (section 11). The headlines are titles only, and filings are not fetched yet.
 
 ## The Forecast Engine (plain code; it places and changes no order)
@@ -666,6 +675,7 @@ Set these in `.env` (see `.env.example`):
 | `PIPELINE_USE_LESSONS` | `false` | Show lessons to the ticker analyst. Changes what the pipeline decides |
 | `PIPELINE_LESSONS_PER_TICKER` | `3` | Most lessons shown for one ticker |
 | `LEDGER_PATH` | `data_store/ledger.sqlite3` | The desk's ledger: headlines and prices with the moment each was first seen |
+| `DESK_ARMS` | — | Desks to run side by side, each on its own paper account: `PROVIDER:MODEL`, with commas between. Empty: one desk, on the configured model |
 | `DESK_PREMARKET` | `08:30` | The check-in before the open, New York time |
 | `DESK_MIDDAY` / `DESK_AFTERNOON` | `12:00` / `15:00` | The check-ins during the session. One timed at or after the day's close is skipped that day |
 | `DESK_WATCH_MINUTES` | `15` | How often the desk's job is scheduled (read by `scripts/schedule.sh install desk`) |

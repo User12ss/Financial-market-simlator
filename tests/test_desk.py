@@ -1091,7 +1091,7 @@ def cli(tmp_path, monkeypatch):
     def build(arm, universe=None, on_event=None):
         desk._on_event = on_event
         return desk
-    monkeypatch.setattr(desk_module, "desk_arm", lambda spec=None: desk.arm)
+    monkeypatch.setattr(desk_module, "desk_arms", lambda spec=None: [desk.arm])
     monkeypatch.setattr(desk_module, "Desk", build)
     monkeypatch.setattr(desk_module.universe_rules, "load_universe", lambda path=None: desk.universe)
     return desk
@@ -1204,10 +1204,185 @@ def test_status_shows_the_days_meetings_the_last_round_and_what_is_due(cli, caps
 def test_a_setting_that_cannot_be_read_stops_the_command_with_a_reason(monkeypatch, capsys):
     def broken(spec=None):
         raise ValueError("Unknown provider 'nowhere'.")
+    monkeypatch.setattr(desk_module.config, "DESK_ARMS", "")
     monkeypatch.setattr(desk_module, "desk_arm", broken)
     assert desk_module.main(["due"]) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err == "Cannot start: Unknown provider 'nowhere'.\n"
+
+
+# ── Several desks side by side ───────────────────────────────────────────────
+
+OTHER = "desk/fake/b"
+
+
+def test_the_desks_are_the_one_asked_for_else_those_listed_else_the_configured_models(monkeypatch):
+    monkeypatch.setattr(desk_module.config, "DESK_ARMS", "")
+    monkeypatch.setattr(desk_module.config, "LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(desk_module.config, "LLM_MODEL", "main-model")
+    assert [arm.name for arm in desk_module.desk_arms()] == ["desk/ollama/main-model"]      # as shipped: one desk
+    monkeypatch.setattr(desk_module.config, "DESK_ARMS", " ollama:first , ollama:second:7b ,, ")
+    listed = desk_module.desk_arms()
+    assert [arm.name for arm in listed] == ["desk/ollama/first", "desk/ollama/second:7b"]
+    assert [arm.llm.model for arm in listed] == ["first", "second:7b"]
+    # One asked for on the command line is the only one, whatever is listed.
+    assert [arm.name for arm in desk_module.desk_arms("ollama:third")] == ["desk/ollama/third"]
+    # Two desks on one account would each decide the same book.
+    monkeypatch.setattr(desk_module.config, "DESK_ARMS", "ollama:first,ollama:second,ollama:first")
+    with pytest.raises(ValueError, match="DESK_ARMS names desk/ollama/first more than once"):
+        desk_module.desk_arms()
+
+
+@pytest.fixture
+def side_by_side(tmp_path, monkeypatch):
+    """`python -m pipeline.desk` over two desks on one set of records, late on Monday 16 November: the one that
+    holds UPA and UPB, and one that has only just been listed and has held no meeting yet."""
+    first = held_book(tmp_path)
+    second = make_desk(tmp_path, market=first.builder.market, news=first.news, clock=first.clock, arm=OTHER)
+    desks = {ARM: first, OTHER: second}
+
+    def build(arm, universe=None, on_event=None):
+        desks[arm.name]._on_event = on_event
+        return desks[arm.name]
+    monkeypatch.setattr(desk_module, "desk_arms", lambda spec=None: [first.arm, second.arm])
+    monkeypatch.setattr(desk_module, "Desk", build)
+    monkeypatch.setattr(desk_module.universe_rules, "load_universe", lambda path=None: first.universe)
+    return first, second
+
+
+def result_lines(out: str) -> list[str]:
+    """The lines that say how each desk's meeting ended: the only ones that begin with a desk's name."""
+    return [line for line in out.splitlines() if line.startswith("desk/")]
+
+
+def test_a_desk_that_has_only_just_been_listed_starts_with_a_close_meeting_of_its_own(side_by_side, capsys):
+    first, second = side_by_side
+    # Monday evening. The first desk has held its close meeting; the new one has held none.
+    assert desk_module.main(["due"]) == 0
+    assert capsys.readouterr().out == "close\n"
+    assert desk_module.main(["meet", "--quiet"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"Paper trading: simulated orders only. Desk meeting: close for 2026-11-16. Arm: {OTHER}\n")
+    assert result_lines(out) == [f"{OTHER}: ok"] and ARM not in out
+    # Its own account, from nothing: the first desk's book is as it was.
+    assert sorted(PaperBroker(first.journal, ARM).positions()) == ["UPA", "UPB"]
+    assert PaperBroker(first.journal, OTHER).positions() == {}
+    assert sorted(order.ticker for order in PaperBroker(first.journal, OTHER).orders() if order.side == "buy") == ["UPA", "UPB"]
+    assert desk_module.main(["meet"]) == 0
+    assert capsys.readouterr().out == "Desk: no meeting is due.\n"
+    # Until it has a close meeting to build on, a new desk holds no check-in, and the first one's go on.
+    assert desk_module.main(["due"]) == 0 and capsys.readouterr().out == ""
+
+
+def started(side_by_side):
+    """Both desks with Monday's close meeting behind them."""
+    first, second = side_by_side
+    assert hold(second, ny(16, 18, 30)).status == "ok"
+    return first, second
+
+
+def test_the_watch_goes_round_every_desk_and_says_so_in_one_line(side_by_side, capsys):
+    first, _ = started(side_by_side)
+    first.clock.now = ny(17, 7, 0)
+    assert desk_module.main(["watch"]) == 0
+    assert capsys.readouterr().out == "Watch: outside its hours, nothing fetched.\n"
+    first.news.add("UPA", "UPA opens a new plant", ny(17, 9, 0))
+    first.clock.now = ny(17, 10, 0)
+    assert desk_module.main(["watch"]) == 0
+    # One line, as the round's script expects. The second desk holds the same names: the headline is not new twice.
+    assert capsys.readouterr().out == (
+        f"Watch: {ARM}: 2 name(s) in the book, 1 new headline(s), 4 price(s) | "
+        f"{OTHER}: 2 name(s) in the book, 0 new headline(s), 4 price(s)\n")
+    # Each desk's round is on record under its own name.
+    assert len(first.ledger.watches(ARM, TUESDAY)) == 1 and len(first.ledger.watches(OTHER, TUESDAY)) == 1
+
+
+def test_each_desk_holds_its_own_meeting_one_after_the_other(side_by_side, capsys):
+    first, second = started(side_by_side)
+    first.news.add("UPA", "UPA opens a new plant", ny(17, 11, 0))
+    first.clock.now = ny(17, 12, 0)
+    assert desk_module.main(["due"]) == 0 and capsys.readouterr().out == "midday\n"
+    assert desk_module.main(["tick", "--quiet"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"Watch: {ARM}: 2 name(s) in the book, 1 new headline(s), 4 price(s) | {OTHER}: ")
+    headings = [line for line in out.splitlines() if line.startswith("Paper trading")]
+    assert headings == [
+        f"Paper trading: simulated orders only. Desk meeting: midday for 2026-11-17. Arm: {ARM}",
+        f"Paper trading: simulated orders only. Desk meeting: midday for 2026-11-17. Arm: {OTHER}"]
+    assert result_lines(out) == [f"{ARM}: ok", f"{OTHER}: ok"]
+    assert kinds(first, TUESDAY) == [("midday", "ok")]
+    assert [(row["kind"], row["status"]) for row in first.journal.meetings(OTHER, TUESDAY)] == [("midday", "ok")]
+    # And the evening's close meetings, each on its own account.
+    first.clock.now = ny(17, 18, 30)
+    assert desk_module.main(["meet", "--quiet"]) == 0
+    out = capsys.readouterr().out
+    assert result_lines(out) == [f"{ARM}: ok", f"{OTHER}: ok"]
+    assert out.count("order(s) placed") == 2
+    assert first.journal.completed_run(ARM, TUESDAY) and first.journal.completed_run(OTHER, TUESDAY)
+    assert desk_module.main(["meet"]) == 0 and capsys.readouterr().out == "Desk: no meeting is due.\n"
+
+
+def test_one_desk_that_cannot_meet_does_not_keep_the_other_from_meeting(side_by_side, capsys):
+    first, second = started(side_by_side)
+    first.news.add("UPA", "UPA opens a new plant", ny(17, 11, 0))
+    round_at(first, ny(17, 11, 30))
+    round_at(second, ny(17, 11, 30))
+    first.llm._problems = ["Ollama has no model 'gone'."]
+    first.clock.now = ny(17, 12, 0)
+    assert desk_module.main(["meet", "--quiet"]) == 1               # the round's script says a meeting did not finish
+    out = capsys.readouterr().out
+    assert result_lines(out) == [
+        f"{ARM}: failed. The model is not available: Ollama has no model 'gone'.", f"{OTHER}: ok"]
+    # The other way round too: the first goes ahead, and the failure is still what the command ends with.
+    first.llm._problems, second.llm._problems = [], ["Ollama does not answer."]
+    first.clock.now = ny(17, 18, 30)
+    assert desk_module.main(["meet", "--quiet"]) == 1
+    assert [line.split(".")[0] for line in result_lines(capsys.readouterr().out)] == [f"{ARM}: ok", f"{OTHER}: failed"]
+
+
+def test_before_the_next_desks_model_is_loaded_the_one_just_used_is_let_go_of(side_by_side, capsys):
+    """Two local models at once is more than a small machine holds."""
+    first, second = started(side_by_side)
+    released: list[str] = []
+    first.llm.release = lambda: released.append(ARM)
+    second.llm.release = lambda: released.append(OTHER)
+    # Only one of them meets: nothing is loaded after it, so nothing is let go of.
+    first.news.add("UPA", "UPA opens a new plant", ny(17, 11, 0))
+    round_at(first, ny(17, 11, 30))
+    hold(second, ny(17, 12, 0))
+    assert desk_module.main(["meet", "--quiet"]) == 0 and released == []
+    # Both meet: the first desk's model goes before the second's is called, and the last one used is left.
+    first.clock.now = ny(17, 18, 30)
+    assert desk_module.main(["meet", "--quiet"]) == 0
+    assert released == [ARM]
+    capsys.readouterr()
+
+
+def test_two_desks_on_one_model_keep_it_loaded_and_a_release_that_fails_stops_nothing(side_by_side, capsys):
+    first, second = started(side_by_side)
+    released: list[str] = []
+    first.llm.model = second.llm.model = "the-same:7b"
+    first.llm.release = lambda: released.append(ARM)
+    first.clock.now = ny(17, 18, 30)
+    assert desk_module.main(["meet", "--quiet"]) == 0 and released == []
+
+    def broken():
+        raise RuntimeError("the server went away")
+    first.llm.model, first.llm.release = "another:9b", broken
+    first.clock.now = ny(18, 18, 30)
+    assert desk_module.main(["meet", "--quiet"]) == 0
+    assert result_lines(capsys.readouterr().out)[-2:] == [f"{ARM}: ok", f"{OTHER}: ok"]
+
+
+def test_status_shows_every_desk(side_by_side, capsys):
+    first, _ = started(side_by_side)
+    first.clock.now = ny(17, 10, 0)
+    assert desk_module.main(["status"]) == 0
+    assert capsys.readouterr().out == (
+        f"{ARM}, 2026-11-17 10:00 New York time\n  Meetings on 2026-11-17: none\n"
+        "  The watch has not run yet.\n  Due now: nothing.\n\n"
+        f"{OTHER}, 2026-11-17 10:00 New York time\n  Meetings on 2026-11-17: none\n"
+        "  The watch has not run yet.\n  Due now: nothing.\n")
 
 
 def test_a_whole_day_at_the_desk(tmp_path):

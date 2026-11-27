@@ -138,6 +138,46 @@ def test_a_meeting_that_failed_passes_on_the_exit_code_and_says_why(box):
     )]
 
 
+# Two desks listed side by side (DESK_ARMS): the watch still says one line, and `meet` holds each desk's meeting.
+TWO_WATCHED = ("Watch: desk/fake/a: 2 name(s) in the book, 1 new headline(s), 4 price(s) | "
+               "desk/fake/b:9b-q4_K_M: 0 name(s) in the book, 0 new headline(s), 2 price(s)\n")
+TWO_CLOSE = """Paper trading: simulated orders only. Desk meeting: close for 2026-11-17. Arm: desk/fake/a
+
+desk/fake/a: ok
+  3 views, 3 debates, 2 accepted proposal(s), 1 order(s) placed
+  35 model calls, 550s of model time
+Paper trading: simulated orders only. Desk meeting: close for 2026-11-17. Arm: desk/fake/b:9b-q4_K_M
+
+desk/fake/b:9b-q4_K_M: ok
+  5 views, 2 debates, 2 accepted proposal(s), 2 order(s) placed
+  35 model calls, 800s of model time
+"""
+
+
+def test_two_desks_side_by_side_are_one_line_of_the_watch_and_one_announcement(box):
+    (box.fake / "watch.txt").write_text(TWO_WATCHED)
+    (box.fake / "due.txt").write_text("close\n")
+    box.pipeline_prints(TWO_CLOSE)
+    assert box.run("desk_tick.sh").returncode == 0
+    log = desk_log(box)
+    assert TWO_WATCHED.strip() in log and log.count("Watch:") == 1
+    assert runs(box) == ["-m pipeline.desk watch", "-m pipeline.desk due", "-m pipeline.desk meet"]
+    assert box.notifications() == [(
+        "Desk meeting finished", "desk/fake/a: ok; desk/fake/b:9b-q4_K_M: ok, 3 order(s) placed")]
+
+
+def test_of_two_desks_the_one_that_failed_is_the_one_named(box):
+    box.pipeline_prints(
+        "\ndesk/fake/a: ok\n  3 views, 3 debates, 2 accepted proposal(s), 1 order(s) placed\n"
+        "\ndesk/fake/b:9b-q4_K_M: failed. The model is not available: Ollama has no model 'b:9b-q4_K_M'.\n", exit_code=1)
+    (box.fake / "due.txt").write_text("close\n")
+    assert box.run("desk_tick.sh").returncode == 1
+    assert box.notifications() == [(
+        "Desk meeting did not finish",
+        "desk/fake/b:9b-q4_K_M: failed. The model is not available: Ollama has no model 'b:9b-q4_K_M'. "
+        "The next scheduled run tries again.")]
+
+
 @pytest.mark.parametrize("answer", ["", "Cannot start: no model\n", "lunch\n", "close meeting\n", "calledx\n",
                                     "called meeting\n", "Called\n"])
 def test_only_one_of_the_five_kinds_of_meeting_starts_one(box, answer):

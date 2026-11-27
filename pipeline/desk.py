@@ -101,6 +101,38 @@ def desk_arm(spec: str | None = None) -> Arm:
     return Arm(f"desk/{llm.provider_name}/{llm.model}", llm)
 
 
+def desk_arms(spec: str | None = None) -> list[Arm]:
+    """The desks to run: the one asked for, else those DESK_ARMS lists, else the configured model's.
+
+    Each desk has its own paper account, under its own name. Listed side by side they read the same market and
+    the same ledger and decide apart: that is how one model is set against another.
+    """
+    if spec:
+        return [desk_arm(spec)]
+    arms = [desk_arm(one) for one in (part.strip() for part in config.DESK_ARMS.split(",")) if one] or [desk_arm()]
+    names = [arm.name for arm in arms]
+    twice = sorted({name for name in names if names.count(name) > 1})
+    if twice:
+        raise ValueError(f"DESK_ARMS names {', '.join(twice)} more than once: two desks cannot share an account.")
+    return arms
+
+
+def _let_go(done: Arm, coming: Arm) -> None:
+    """Before the next desk's model is called, the one just used is let go of.
+
+    A local model stays in memory for minutes after its last call, and a small machine holds one at a time: with
+    two loaded it swaps, and both meetings crawl. Two desks on one model keep it. Best effort: a model that
+    could not be let go of costs time and nothing else.
+    """
+    release = getattr(done.llm, "release", None)
+    if release is None or getattr(done.llm, "model", done) == getattr(coming.llm, "model", coming):
+        return
+    try:
+        release()
+    except Exception:                    # noqa: BLE001  (whatever it is, the next desk still meets)
+        pass
+
+
 def _time_of(text: str, name: str) -> time:
     try:
         hour, minute = text.split(":")
@@ -1022,70 +1054,95 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        arm = desk_arm(args.arm)
+        arms = desk_arms(args.arm)
         tickers = universe_rules.load_universe(args.universe)
-        desk = Desk(arm, universe=tickers, on_event=None if args.quiet else _print_event)
+        desks = [Desk(arm, universe=tickers, on_event=None if args.quiet else _print_event) for arm in arms]
     except (LLMError, OSError, ValueError) as e:
         print(f"Cannot start: {e}", file=sys.stderr)
         return 1
 
     if args.command == "status":
-        print("\n".join(status_lines(desk)))
+        print("\n\n".join("\n".join(status_lines(desk)) for desk in desks))
         return 0
     if args.command == "due":
-        # One word, or nothing: scripts/desk_tick.sh starts the model only when this prints a kind.
-        due = desk.due()
-        if due:
-            print(due.kind)
+        # One word, or nothing: scripts/desk_tick.sh starts the model only when this prints a kind. With
+        # several desks it is the first of them that has a meeting due: `meet` then holds every desk's.
+        for desk in desks:
+            due = desk.due()
+            if due:
+                print(due.kind)
+                break
         return 0
     if args.command in ("watch", "tick"):
-        summary = desk.watch()
-        if summary is None:
+        # One line whatever the number of desks: the round's script logs the last line this prints.
+        rounds = [desk.watch() for desk in desks]
+        if all(summary is None for summary in rounds):
             print("Watch: outside its hours, nothing fetched.", flush=True)
+        elif len(desks) == 1:
+            print(f"Watch: {_watched(rounds[0])}", flush=True)
         else:
-            gaps = summary["headlines"]["failed"] + (["prices"] if summary["quotes"]["error"] else [])
-            held = summary["plans"]["held"]
-            print(
-                f"Watch: {summary['tickers']} name(s) in the book, {summary['headlines']['added']} new headline(s), "
-                f"{summary['quotes']['count']} price(s)" + (f"; could not fetch: {', '.join(gaps)}" if gaps else "")
-                + (f"; {len(held)} condition(s) of the desk's plans held: "
-                   + ", ".join(f"{item['ticker']} [{item['key']}]" for item in held) if held else "")
-                + (f"; the plans could not be checked: {summary['plans']['error']}" if summary["plans"]["error"] else ""),
-                flush=True,
-            )
+            print("Watch: " + " | ".join(
+                f"{desk.arm.name}: {_watched(summary)}" for desk, summary in zip(desks, rounds)), flush=True)
         if args.command == "watch":
             return 0
 
-    due = desk.due()
-    if due is None:
+    # Every desk that has a meeting due holds it, one after the other. One that cannot (its model is missing,
+    # say) is said to have failed and the next still meets.
+    met: list[Arm] = []
+    failed = False
+    for desk in desks:
+        due = desk.due()
+        if due is None:
+            continue
+        if met:
+            _let_go(met[-1], desk.arm)
+        print(f"Paper trading: simulated orders only. Desk meeting: {due.kind} for {due.day}. Arm: {desk.arm.name}",
+              flush=True)
+        result = desk.meet()
+        if result is None:
+            continue
+        met.append(desk.arm)
+        failed = failed or result.status in ("failed", "blocked")
+        # One line, like every event: scripts/desk_tick.sh reads how the meeting ended from it.
+        message = " ".join(result.message.split())
+        print(f"\n{result.arm}: {result.status}" + (f". {message}" if message else ""))
+        if isinstance(result, CheckinResult) and result.record:
+            record = result.record
+            acted = len(record.orders) + len(record.withdrawn)
+            print(f"  {due.kind} check-in: {len(record.updates)} update(s), "
+                  + (f"{acted} order(s) placed or taken back" if record.can_act
+                     else f"{len(record.noted)} noted for the close"))
+            for warning in record.warnings:
+                print(f"  warning: {warning}")
+            print(f"  {record.usage.calls} model calls, {record.usage.model_seconds:.0f}s of model time")
+        elif isinstance(result, RunResult) and result.table:
+            table = result.table
+            # The same line the daily pipeline prints: scripts/daily_run.sh counts the orders from it.
+            accepted = [p for p in table.proposals if p.status == "accepted" and p.source == "portfolio_manager"]
+            print(f"  {len(table.views)} views, {len(table.debates)} debates, {len(accepted)} accepted proposal(s), "
+                  f"{len(table.orders)} order(s) placed")
+            for warning in table.warnings:
+                print(f"  warning: {warning}")
+            print(f"  {table.usage.calls} model calls, {table.usage.model_seconds:.0f}s of model time", flush=True)
+    if not met:
         print("Desk: no meeting is due.", flush=True)
         return 0
-    print(f"Paper trading: simulated orders only. Desk meeting: {due.kind} for {due.day}. Arm: {arm.name}", flush=True)
-    result = desk.meet()
-    if result is None:
-        print("Desk: no meeting is due.", flush=True)
-        return 0
-    # One line, like every event: scripts/desk_tick.sh reads how the meeting ended from it.
-    message = " ".join(result.message.split())
-    print(f"\n{result.arm}: {result.status}" + (f". {message}" if message else ""))
-    if isinstance(result, CheckinResult) and result.record:
-        record = result.record
-        acted = len(record.orders) + len(record.withdrawn)
-        print(f"  {due.kind} check-in: {len(record.updates)} update(s), "
-              + (f"{acted} order(s) placed or taken back" if record.can_act else f"{len(record.noted)} noted for the close"))
-        for warning in record.warnings:
-            print(f"  warning: {warning}")
-        print(f"  {record.usage.calls} model calls, {record.usage.model_seconds:.0f}s of model time")
-    elif isinstance(result, RunResult) and result.table:
-        table = result.table
-        # The same line the daily pipeline prints: scripts/daily_run.sh counts the orders from it.
-        accepted = [p for p in table.proposals if p.status == "accepted" and p.source == "portfolio_manager"]
-        print(f"  {len(table.views)} views, {len(table.debates)} debates, {len(accepted)} accepted proposal(s), "
-              f"{len(table.orders)} order(s) placed")
-        for warning in table.warnings:
-            print(f"  warning: {warning}")
-        print(f"  {table.usage.calls} model calls, {table.usage.model_seconds:.0f}s of model time")
-    return 1 if result.status in ("failed", "blocked") else 0
+    return 1 if failed else 0
+
+
+def _watched(summary: dict | None) -> str:
+    """What one desk's round of the watch did, in the words that follow "Watch:"."""
+    if summary is None:
+        return "outside its hours, nothing fetched."
+    gaps = summary["headlines"]["failed"] + (["prices"] if summary["quotes"]["error"] else [])
+    held = summary["plans"]["held"]
+    return (
+        f"{summary['tickers']} name(s) in the book, {summary['headlines']['added']} new headline(s), "
+        f"{summary['quotes']['count']} price(s)" + (f"; could not fetch: {', '.join(gaps)}" if gaps else "")
+        + (f"; {len(held)} condition(s) of the desk's plans held: "
+           + ", ".join(f"{item['ticker']} [{item['key']}]" for item in held) if held else "")
+        + (f"; the plans could not be checked: {summary['plans']['error']}" if summary["plans"]["error"] else "")
+    )
 
 
 if __name__ == "__main__":

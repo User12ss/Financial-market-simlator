@@ -252,6 +252,75 @@ def test_ollama_cut_off_does_not_point_at_a_setting_that_is_already_off(monkeypa
     assert "OLLAMA_THINK=false" not in str(caught.value)
 
 
+def test_ollama_lets_go_of_a_model_that_is_loaded_and_asks_nothing_about_one_that_is_not():
+    """A local model stays in memory for minutes after its last call. Asked to, Ollama unloads it at once."""
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": "m:7b"}, {"name": "tagless:latest"}]})
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"done": True})
+
+    provider = ollama_with(handler)
+    provider.unload("m:7b")
+    assert seen == [("/api/generate", {"model": "m:7b", "keep_alive": 0})]
+    provider.unload("other:7b")
+    assert len(seen) == 1, "asked to let go of a model that is not loaded, Ollama would load it first"
+    provider.unload("tagless")                          # Ollama lists it under its full name
+    assert seen[-1] == ("/api/generate", {"model": "tagless", "keep_alive": 0})
+
+
+def test_letting_go_of_a_model_never_fails_the_caller():
+    def refuses(request):
+        return httpx.Response(500, json={"error": "boom"})
+
+    def down(request):
+        raise httpx.ConnectError("refused")
+
+    def loaded_but_will_not_go(request):
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": "m"}]})
+        return httpx.Response(500, json={"error": "boom"})
+
+    for handler in (refuses, down, loaded_but_will_not_go, lambda request: httpx.Response(200, text="not json")):
+        ollama_with(handler).unload("m")
+
+
+def test_a_client_lets_go_of_the_local_models_it_called_and_of_no_other():
+    client = LLMClient(provider="ollama", model="main-model", fast_model="fast-model")
+    unloaded: list[str] = []
+    client._providers["ollama"].unload = unloaded.append
+    client.release()
+    assert unloaded == [], "a model that was never called was never loaded: asking for it now would load it"
+    client.usage.add(Usage("ollama", "main-model", 100, 50, 2.0))
+    client.usage.add(Usage("ollama", "main-model", 100, 50, 2.0))
+    client.release()
+    assert unloaded == ["main-model"]
+    client.usage.add(Usage("ollama", "fast-model", 10, 5, 0.2))
+    client.release()
+    assert unloaded == ["main-model", "fast-model", "main-model"]
+
+
+def test_a_client_on_two_providers_lets_go_of_the_local_models_only(monkeypatch):
+    """A hosted model called through the same client is not a model Ollama has: asking Ollama about it is noise."""
+    monkeypatch.setattr(config, "OPENAI_COMPAT_BASE_URL", "http://hosted.test/v1")
+    client = LLMClient(provider="ollama", model="local:7b", fast_provider="openai_compat", fast_model="hosted-small")
+    unloaded: list[str] = []
+    client._providers["ollama"].unload = unloaded.append
+    client.usage.add(Usage("ollama", "local:7b", 100, 50, 2.0))
+    client.usage.add(Usage("openai_compat", "hosted-small", 10, 5, 0.2))
+    client.release()
+    assert unloaded == ["local:7b"]
+
+
+def test_a_client_of_a_hosted_model_has_nothing_to_let_go_of(monkeypatch):
+    monkeypatch.setattr(config, "OPENAI_COMPAT_BASE_URL", "http://hosted.test/v1")
+    client = LLMClient(provider="openai_compat", model="big")
+    client.usage.add(Usage("openai_compat", "big", 100, 50, 2.0))
+    client.release()                                    # nothing to do, and nothing raised
+
+
 def test_ollama_missing_model_says_how_to_get_it():
     def handler(request):
         return httpx.Response(404, json={"error": "model 'm' not found"})
