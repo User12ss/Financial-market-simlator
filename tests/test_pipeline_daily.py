@@ -1384,5 +1384,14 @@ def test_command_line_reports_a_bad_arm_or_universe_file(offline_cli, capsys, tm
 def test_arm_spec_keeps_colons_that_belong_to_the_model_name():
     arm = daily.parse_arm("ollama:qwen2.5-coder:7b")
     assert arm.name == "ollama/qwen2.5-coder:7b" and arm.llm.model == "qwen2.5-coder:7b"
-    assert daily.parse_arm("ollama").llm.model == config.provider_default("ollama", "model")
     assert daily._slug(arm.name) == "ollama-qwen2.5-coder-7b"
+
+
+def test_a_provider_named_alone_runs_the_configured_model_or_its_own_default(monkeypatch):
+    # Both settings are given here, so what the machine's .env sets does not matter (config reads it in tests too).
+    monkeypatch.setattr(config, "LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(config, "LLM_MODEL", "some-model:1b")
+    assert daily.parse_arm("ollama").llm.model == "some-model:1b"
+    assert daily.parse_arm("ollama").name == "ollama/some-model:1b"
+    monkeypatch.setattr(config, "LLM_PROVIDER", "anthropic")
+    assert daily.parse_arm("ollama").llm.model == config.provider_default("ollama", "model")
