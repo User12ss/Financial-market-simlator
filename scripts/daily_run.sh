@@ -11,6 +11,10 @@
 # Everything the pipeline reads from the environment is passed through, so
 # JOURNAL_PATH, RUNS_DIR and the rest work here as they do on the command line.
 # DAILY_LOG_DIR moves the logs; DAILY_NOTIFY=0 turns the notification off.
+#
+# A daily pipeline that ended well is followed by the evaluation, so that the
+# report the dashboard reads is written without anyone remembering to. See the
+# end of this file. DAILY_EVALUATION=0 leaves it out.
 
 set -u
 # launchd starts jobs in the C locale, where text is cut by byte, not by character.
@@ -171,5 +175,56 @@ elif [ -n "$(ended 'ok|degraded')" ]; then
     notify "$TITLE" "$(cut_to 160 "$SUMMARY")${ORDERS:+, $ORDERS order(s) placed}"
 fi
 # Skipped (the session already has signals, or there is no new session): nothing to say.
+
+# The evaluation: what the views and the trades turned out to be worth, written
+# where the dashboard reads it (python -m evaluation). It follows the daily
+# pipeline, not a desk meeting, and only a pipeline that ended well: one that
+# could not finish is tried again by the next call, and then so is this. It
+# uses no model and decides nothing, and it does nothing at all unless a run or
+# a meeting has ended, or a session has closed, since its last report.
+#
+# It runs under this run's lock, so that its scores are never written beside a
+# run or a meeting, and for that it is given only so long: a price source that
+# never answers must not keep the next run, or the desk, from starting. However
+# it ends, this run has ended as the pipeline did. DAILY_EVALUATION=0 leaves it
+# out; DAILY_EVALUATION_SECONDS is how long it may take (ten minutes).
+if [ "$STATUS" -eq 0 ] && [ "$MODULE" = "pipeline.daily" ] && [ "${DAILY_EVALUATION:-1}" != "0" ]; then
+    LIMIT="${DAILY_EVALUATION_SECONDS:-600}"
+    # Anything that is not a whole number of seconds above nothing is the ten minutes.
+    [ "$LIMIT" -gt 0 ] 2>/dev/null || LIMIT=600
+    say "=== $(now) evaluation starts"
+    SAID="$(wc -c < "$LOG" | tr -d ' ')"       # what the evaluation itself prints starts here
+    "$PYTHON" -m evaluation --if-changed >> "$LOG" 2>&1 &
+    PIPELINE_PID=$!                            # so that a signal to this script ends it too
+    caffeinate -i -w "$PIPELINE_PID" &
+    LEFT=$((10#$LIMIT * 5))                    # it is looked at five times a second ("08" is eight, not bad octal)
+    OVERRAN=0
+    while kill -0 "$PIPELINE_PID" 2>/dev/null; do
+        if [ "$LEFT" -le 0 ]; then
+            OVERRAN=1
+            stop "$PIPELINE_PID"
+            break
+        fi
+        sleep 0.2
+        LEFT=$((LEFT - 1))
+    done
+    wait "$PIPELINE_PID" 2>/dev/null
+    EVALUATED=$?
+    PIPELINE_PID=""
+    if [ "$OVERRAN" = "1" ]; then
+        say "=== $(now) evaluation stopped: not finished after $LIMIT seconds"
+        notify "Evaluation did not finish" "Stopped after $LIMIT seconds. The next scheduled run tries again."
+    else
+        say "=== $(now) evaluation ends, exit $EVALUATED"
+        if [ "$EVALUATED" -ne 0 ]; then
+            WHY="$(tail -c +"$((SAID + 1))" "$LOG" | grep -v '^===' | tail -n 1)"
+            if [ -n "$WHY" ]; then
+                notify "Evaluation did not finish" "$(cut_to 220 "$WHY") The next scheduled run tries again."
+            else
+                notify "Evaluation did not finish" "It ended with exit $EVALUATED and no message. See $LOG"
+            fi
+        fi
+    fi
+fi
 
 exit "$STATUS"

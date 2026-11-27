@@ -344,7 +344,7 @@ Whenever a session is decided again, for whatever reason, the orders that stand 
 
 **Checked citations.** The analyst names the data points it relied on (`rsi14`, `sma50`, `trailing_pe`, ...) with their values. Code compares each with the snapshot and records mismatches on the view, along with any figure in the text that appears nowhere in the data shown. The portfolio manager and the judge see these warnings.
 
-**Running it every day (macOS).** `scripts/daily_run.sh` is one unattended run: it starts Ollama when the configured model needs it and it is not already up (and stops it again afterwards), keeps the Mac awake while the run goes, writes a log under `data_store/logs/`, and shows a notification saying how the run ended. Only one copy runs at a time, and stopping it stops the pipeline and the Ollama it started. `scripts/schedule.sh` puts it on a schedule through launchd:
+**Running it every day (macOS).** `scripts/daily_run.sh` is one unattended run: it starts Ollama when the configured model needs it and it is not already up (and stops it again afterwards), keeps the Mac awake while the run goes, writes a log under `data_store/logs/`, and shows a notification saying how the run ended. Only one copy runs at a time, and stopping it stops the pipeline and the Ollama it started. When the pipeline has ended well, the same run goes on to the evaluation (`python -m evaluation --if-changed`, see [Evaluation](#evaluation)), so that the report the dashboard reads is written without anyone remembering to. That step is taken under the run's own lock, is stopped if it has not finished after `DAILY_EVALUATION_SECONDS` (600), and never changes how the run ended: a failure is logged and notified, and the next call tries again. `DAILY_EVALUATION=0` leaves it out. `scripts/schedule.sh` puts the run on a schedule through launchd:
 
 ```bash
 scripts/schedule.sh install     # run every day at 18:00, 20:00, 22:00, 23:45 and 07:00, local time
@@ -480,7 +480,10 @@ The chance of an event given an ending is counted on the paths, and a test holds
 ```bash
 python -m evaluation                # every model configuration in the journal
 python -m evaluation --lessons      # also have each model review a few of its own views
+python -m evaluation --if-changed   # only when something has been recorded since the last report
 ```
+
+**On the schedule.** Every scheduled run of the daily pipeline that ends well is followed by `python -m evaluation --if-changed` (see "Running it every day" above), several times a day. Asked that way, the evaluation measures only when there is something new to measure: when there is no report yet for the last completed session (a session has closed since the last one), when a run or a desk meeting has ended after the report was written, or when the report does not hold every model configuration, or cannot be read. Otherwise it says the report is up to date and fetches nothing. On an ordinary evening that is two evaluations: one after the daily pipeline, and one at the next call, which takes in the desk's close meeting held in between. A desk meeting is not itself followed by the evaluation. Lessons are never written on the schedule: they use the model, and are asked for by hand.
 
 The evaluation measures what the pipeline's views and trades turned out to be worth, from prices that came after each decision. It reads the journal and writes a report to `data_store/evaluation/<date>/` (`evaluation.md` and `evaluation.json`). It decides nothing: it places no order and changes nothing the pipeline has recorded. What it adds to the journal are the scores, for the dashboard to read, and lessons when they are asked for. If the price source returns nothing for the benchmark, it stops with an error and leaves the scores on record as they were.
 

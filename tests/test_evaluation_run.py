@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -815,3 +815,182 @@ def test_lessons_are_written_when_asked_for_and_a_model_that_cannot_be_reached_i
     assert evaluation_run.main(["--lessons", "--simulations", "5"]) == 0
     assert "3 lesson(s) written" in capsys.readouterr().out
     assert len(Journal().lessons("fake/a")) == 3
+
+
+# ── The command, asked only when something has changed ───────────────────────
+#
+# The scheduled run asks for the evaluation several times a day. It is worth doing again only when a run or a
+# meeting has ended since the last report, or a session has closed since: otherwise the report on disk already
+# says everything there is to say, and fetching every price again would say it once more.
+
+def ended(tmp_path, table: str, moment) -> None:
+    """Set when everything in one of the journal's tables ended: a moment, or text as another writer left it."""
+    text = moment.isoformat() if isinstance(moment, datetime) else moment
+    with sqlite3.connect(tmp_path / "journal.sqlite3") as db:
+        db.execute(f"UPDATE {table} SET finished_at = ?", (text,))
+
+
+def an_hour(sign: int) -> datetime:
+    return datetime.now(timezone.utc) + sign * timedelta(hours=1)
+
+
+def measured_again(capsys) -> bool:
+    """Whether the last call measured, as against finding the report up to date. It did one or the other."""
+    out = capsys.readouterr().out
+    measured, left = "Evaluation as of the close of" in out, "is up to date: nothing has been recorded since" in out
+    assert measured != left, out
+    return measured
+
+
+@pytest.fixture
+def reported(offline, tmp_path, capsys):
+    """One run that ended an hour ago, and the report the command wrote for it just now."""
+    one_run(tmp_path, offline)
+    ended(tmp_path, "runs", an_hour(-1))
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys), "there was no report yet"
+    [report] = (tmp_path / "evaluation").glob("*/evaluation.json")
+    return report
+
+
+def test_asked_only_when_something_changed_the_command_leaves_a_report_that_says_it_all(reported, offline, capsys):
+    before = reported.read_bytes(), reported.with_suffix(".md").read_bytes()
+    offline.fail = True                                     # measuring again would now fail, and say so
+
+    assert evaluation_run.main(["--if-changed"]) == 0
+    assert not measured_again(capsys)
+    assert (reported.read_bytes(), reported.with_suffix(".md").read_bytes()) == before
+
+    # It is the asking that makes the difference: the plain command measures every time.
+    assert evaluation_run.main([]) == 1
+    assert "Cannot evaluate" in capsys.readouterr().err
+
+
+def test_a_run_that_ended_after_the_report_was_written_brings_a_new_one(reported, tmp_path, capsys):
+    ended(tmp_path, "runs", an_hour(+1))
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+    ended(tmp_path, "runs", an_hour(-1))                    # and once the new report is the later of the two
+    assert evaluation_run.main(["--if-changed"]) == 0
+    assert not measured_again(capsys)
+
+
+def test_a_meeting_that_ended_after_the_report_was_written_brings_a_new_one(reported, tmp_path, capsys):
+    journal = Journal()
+    journal.start_meeting("m1", "desk/fake/a", date.today(), "midday", date.today(), an_hour(-2), an_hour(-2))
+    journal.close()
+
+    # Still going: it has recorded nothing to measure yet.
+    assert evaluation_run.main(["--if-changed"]) == 0
+    assert not measured_again(capsys)
+
+    ended(tmp_path, "meetings", an_hour(+1))
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_a_report_for_an_earlier_session_is_not_the_report_for_this_one(reported, capsys):
+    # A session has closed since: new prices, and views that may have come due, though nothing new was recorded.
+    folder = reported.parent
+    folder.rename(folder.with_name("2020-01-02"))
+
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+    assert sorted(item.name for item in folder.parent.iterdir()) == ["2020-01-02", folder.name]
+
+
+@pytest.mark.parametrize("damage", [
+    lambda held: held.pop("created_at"),
+    lambda held: held.update(created_at="yesterday evening"),
+    lambda held: held.update(created_at=None),
+    lambda held: held.update(arms=None),
+    lambda held: held["arms"][0].update(arm="fake/another"),       # written for another configuration only
+    lambda held: held["arms"].clear(),
+])
+def test_a_report_that_does_not_hold_what_is_asked_for_is_written_again(reported, capsys, damage):
+    held = json.loads(reported.read_text())
+    damage(held)
+    reported.write_text(json.dumps(held))
+
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+    assert Evaluation.model_validate_json(reported.read_text()).arms[0].arm == "fake/a"
+
+
+@pytest.mark.parametrize("text", ["{", "[]", "", '"a report"'])
+def test_a_report_that_cannot_be_read_is_no_report(reported, capsys, text):
+    reported.write_text(text)
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_a_report_that_holds_more_than_is_asked_for_is_enough(reported, capsys):
+    held = json.loads(reported.read_text())
+    held["arms"].append({**held["arms"][0], "arm": "fake/b"})
+    reported.write_text(json.dumps(held))
+
+    assert evaluation_run.main(["--if-changed", "--arm", "fake/a"]) == 0
+    assert not measured_again(capsys)
+
+
+def test_when_things_ended_is_compared_as_moments_not_as_text(reported, tmp_path, capsys):
+    # An hour before the report, written by a clock five hours ahead of it: later as text, earlier in fact.
+    ahead = an_hour(-1).astimezone(timezone(timedelta(hours=5)))
+    assert ahead.isoformat() > json.loads(reported.read_text())["created_at"]
+    ended(tmp_path, "runs", ahead)
+    assert evaluation_run.main(["--if-changed"]) == 0
+    assert not measured_again(capsys)
+
+    # A time with no zone written beside it is the journal's own, which keeps UTC.
+    ended(tmp_path, "runs", an_hour(-1).replace(tzinfo=None).isoformat())
+    assert evaluation_run.main(["--if-changed"]) == 0
+    assert not measured_again(capsys)
+    ended(tmp_path, "runs", an_hour(+1).replace(tzinfo=None).isoformat())
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_an_ending_that_cannot_be_read_as_a_time_is_measured_rather_than_guessed_at(reported, tmp_path, capsys):
+    ended(tmp_path, "runs", "some time on Tuesday")
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_a_run_that_ended_at_the_very_moment_the_report_was_written_is_not_before_it(reported, tmp_path, capsys):
+    ended(tmp_path, "runs", json.loads(reported.read_text())["created_at"])
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_a_journal_that_cannot_say_when_things_ended_is_measured_too(reported, capsys, monkeypatch):
+    plain = Journal.rows
+
+    def locked(self, sql, params=()):
+        if "finished_at" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return plain(self, sql, params)
+
+    monkeypatch.setattr(Journal, "rows", locked)
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert measured_again(capsys)
+
+
+def test_what_is_looked_for_and_what_is_measured_come_from_one_reading_of_the_clock(offline, tmp_path, monkeypatch):
+    # Read twice, either side of the moment a session completes, the command would look for one session's
+    # report and then write another's.
+    one_run(tmp_path, offline)
+    read, plain = [], evaluation_run.last_completed_session
+    monkeypatch.setattr(evaluation_run, "last_completed_session", lambda now: read.append(now) or plain(now))
+
+    assert evaluation_run.main(["--if-changed", "--simulations", "5"]) == 0
+    assert len(read) >= 2 and all(now is read[0] for now in read)
+
+
+def test_the_report_is_looked_for_where_it_would_be_written(reported, tmp_path, capsys):
+    # Asked to write somewhere else, the report in the usual place says nothing about that place.
+    elsewhere = tmp_path / "elsewhere"
+    assert evaluation_run.main(["--if-changed", "--simulations", "5", "--out", str(elsewhere)]) == 0
+    assert measured_again(capsys)
+    assert evaluation_run.main(["--if-changed", "--out", str(elsewhere)]) == 0
+    assert not measured_again(capsys)

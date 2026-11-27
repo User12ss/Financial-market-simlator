@@ -2,6 +2,7 @@
 
     python -m evaluation                every model configuration in the journal
     python -m evaluation --lessons      also have each model review a few of its own views
+    python -m evaluation --if-changed   only when something has been recorded since the last report
 
 It reads the journal and prices that came after each decision, and writes a
 report. It decides nothing: the only things it adds to the journal are the
@@ -13,9 +14,10 @@ pipeline does only if the pipeline is told to show lessons to the analyst
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import config
@@ -185,6 +187,34 @@ def save(evaluation: Evaluation, directory: str | Path | None = None) -> tuple[P
     return markdown, data
 
 
+def _moment(text: str) -> datetime:
+    """A recorded time as a moment. The journal keeps UTC, and a time with no zone beside it is the journal's."""
+    moment = datetime.fromisoformat(text)
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def up_to_date(journal: Journal, arms: list[str], as_of: date, directory: str | Path | None = None) -> bool:
+    """Whether the report on disk for this session already says everything there is to say.
+
+    It does when it holds every arm asked for and was written after the last run and the last meeting on
+    record ended: nothing has been recorded since that it could have left out. A session that has closed
+    since has no report of its own yet, so the answer for it is no without looking further. A report that
+    cannot be read is no report, and an ending that cannot be read as a time is not guessed at: both mean
+    measuring again, which costs a minute and can do no harm.
+    """
+    report = Path(directory or config.EVALUATION_DIR) / as_of.isoformat() / "evaluation.json"
+    try:
+        held = json.loads(report.read_text(encoding="utf-8"))
+        written = _moment(held["created_at"])
+        if not set(arms) <= {arm["arm"] for arm in held["arms"]}:
+            return False
+        endings = [row[0] for table in ("runs", "meetings")
+                   for row in journal.rows(f"SELECT finished_at FROM {table} WHERE finished_at IS NOT NULL")]
+        return all(_moment(text) < written for text in endings)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        return False
+
+
 def reviewer_for(arm: str) -> LLMClient:
     """The model behind an arm's name, which is `provider/model`."""
     provider, _, model = arm.partition("/")
@@ -210,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Have each model review a few of its own views against the real outcome. Uses the model.")
     parser.add_argument("--rescore", action="store_true", help="Score every view again, the already scored ones included")
     parser.add_argument("--out", default=None, help="Where to write the report (EVALUATION_DIR)")
+    parser.add_argument("--if-changed", action="store_true",
+                        help="Do nothing when the report on disk was written after the last run and the last meeting "
+                             "on record ended, and no session has closed since. What the scheduled run asks for.")
     args = parser.parse_args(argv)
 
     # Opening a journal creates it. A mistyped path should not leave an empty one behind.
@@ -231,6 +264,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     arms = args.arm or known
 
+    # One reading of the clock for both: what is found up to date and what is measured are the same session.
+    now = datetime.now(timezone.utc)
+    if args.if_changed and up_to_date(journal, arms, last_completed_session(now), args.out):
+        print(f"The evaluation of {last_completed_session(now)} is up to date: nothing has been recorded since "
+              "it was written.")
+        return 0
+
     reviewers = {}
     if args.lessons:
         for arm in arms:
@@ -242,8 +282,8 @@ def main(argv: list[str] | None = None) -> int:
     # The ledger is the desk's. An evaluation of journals that never had a desk has none, and needs none.
     ledger = Ledger(read_only=True) if Path(config.LEDGER_PATH).is_file() else None
     try:
-        evaluation = evaluate(journal, YFinanceProvider(), arms=arms, simulations=args.simulations, seed=args.seed,
-                              reviewers=reviewers, rescore=args.rescore, ledger=ledger)
+        evaluation = evaluate(journal, YFinanceProvider(), now=now, arms=arms, simulations=args.simulations,
+                              seed=args.seed, reviewers=reviewers, rescore=args.rescore, ledger=ledger)
     except DataError as e:
         print(f"Cannot evaluate: {e}", file=sys.stderr)
         return 1

@@ -28,6 +28,13 @@ if [ "$1" = "-c" ]; then
     exit 0
 fi
 echo "$*" >> "$FAKE_DIR/python_runs"
+if [ "${2:-}" = "evaluation" ]; then        # the evaluation, which follows the daily pipeline
+    echo $$ > "$FAKE_DIR/evaluation_pid"
+    cat "$FAKE_DIR/evaluation.txt" 2>/dev/null
+    [ ! -f "$FAKE_DIR/evaluation_stubborn" ] || trap '' TERM
+    [ ! -f "$FAKE_DIR/evaluation_hangs" ] || exec sleep 300
+    exit "$(cat "$FAKE_DIR/evaluation_exit" 2>/dev/null || echo 0)"
+fi
 case "${3:-}" in        # the desk's two quick questions, asked by scripts/desk_tick.sh
     watch) cat "$FAKE_DIR/watch.txt" 2>/dev/null; exit "$(cat "$FAKE_DIR/watch_exit" 2>/dev/null || echo 0)" ;;
     due) cat "$FAKE_DIR/due.txt" 2>/dev/null; exit 0 ;;
@@ -139,9 +146,15 @@ def test_a_finished_run_is_logged_and_announced(box):
     assert box.notifications() == [("Daily pipeline finished", "fake/a: ok, 2 order(s) placed")]
     log = box.log()
     assert "daily run starts" in log and "fake/a: ok" in log and "daily run ends, exit 0" in log
-    assert (box.fake / "python_runs").read_text() == "-m pipeline.daily\n"
-    # The Mac is kept awake for as long as the pipeline's own process lives.
-    assert (box.fake / "caffeinate_calls").read_text() == f"-i -w {(box.fake / 'python_pid').read_text().strip()}\n"
+    assert (box.fake / "python_runs").read_text() == "-m pipeline.daily\n-m evaluation --if-changed\n"
+    # The Mac is kept awake for as long as the pipeline's own process lives, and then the evaluation's.
+    for _ in range(50):                                # the script does not wait for the stand-in to write this down
+        if len((box.fake / "caffeinate_calls").read_text().splitlines()) == 2:
+            break
+        time.sleep(0.1)
+    assert (box.fake / "caffeinate_calls").read_text() == (
+        f"-i -w {(box.fake / 'python_pid').read_text().strip()}\n"
+        f"-i -w {(box.fake / 'evaluation_pid').read_text().strip()}\n")
     # Nothing is left behind that would stop or confuse the next run.
     assert sorted(path.name for path in box.logs.iterdir()) == [path.name for path in box.logs.glob("daily_*.log")]
 
@@ -379,6 +392,206 @@ def test_anything_printed_before_the_settings_does_not_shift_them(box):
     # A notice some library prints while the settings are imported.
     box.run("daily_run.sh", FAKE_SETTINGS="a notice about something\nollama ollama http://localhost:11434")
     assert (box.fake / "ollama_pid").exists()
+
+
+# ── The evaluation that follows the daily pipeline ───────────────────────────
+
+SKIPPED = "Paper trading: simulated orders only. Arms: fake/a\n\nfake/a: skipped. Signals for 2026-11-16 already exist.\n"
+MEASURED = """Evaluation as of the close of 2026-11-16, against SPY.
+
+fake/a: 1 session(s) run
+  views: 3 scored, 0 not yet due, 0 without a price
+"""
+
+
+def python_runs(box) -> list[str]:
+    path = box.fake / "python_runs"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_the_evaluation_follows_a_finished_pipeline_and_is_logged(box):
+    (box.fake / "evaluation.txt").write_text(MEASURED)
+    done = box.run("daily_run.sh")
+
+    assert done.returncode == 0
+    assert python_runs(box) == ["-m pipeline.daily", "-m evaluation --if-changed"]
+    log = box.log()
+    # In the day's log, after the pipeline, between its own two lines.
+    order = [log.index(text) for text in (
+        "daily run ends, exit 0", "evaluation starts", "views: 3 scored, 0 not yet due", "evaluation ends, exit 0")]
+    assert order == sorted(order)
+    # A good evaluation is not announced: the pipeline's own notification is the day's news.
+    assert box.notifications() == [("Daily pipeline finished", "fake/a: ok, 2 order(s) placed")]
+    assert not (box.logs / "run.lock").exists()
+
+
+def test_a_session_that_was_skipped_is_still_followed_by_the_evaluation(box):
+    # The later calls of a day find the session done. The evaluation is asked all the same: it is the one
+    # that knows whether anything has been recorded since its last report, a desk meeting for instance.
+    box.pipeline_prints(SKIPPED)
+    assert box.run("daily_run.sh").returncode == 0
+    assert python_runs(box) == ["-m pipeline.daily", "-m evaluation --if-changed"]
+    assert box.notifications() == []
+
+
+def test_a_pipeline_that_did_not_finish_is_not_followed_by_the_evaluation(box):
+    box.pipeline_prints("fake/a: failed. Closing prices for 2026-11-16 are not published yet. Run again later.\n", exit_code=1)
+    assert box.run("daily_run.sh").returncode == 1
+    assert python_runs(box) == ["-m pipeline.daily"] and "evaluation" not in box.log()
+
+
+def test_a_desk_meeting_is_not_followed_by_the_evaluation(box):
+    done = box.run("daily_run.sh", RUN_MODULE="pipeline.desk", RUN_ARGS="meet", RUN_NAME="Desk meeting",
+                   RUN_LABEL="desk close meeting", RUN_LOG="desk")
+    assert done.returncode == 0
+    assert python_runs(box) == ["-m pipeline.desk meet"]
+    assert "evaluation" not in "".join(path.read_text() for path in box.logs.glob("*.log"))
+
+
+def test_the_evaluation_can_be_left_out(box):
+    assert box.run("daily_run.sh", DAILY_EVALUATION="0").returncode == 0
+    assert python_runs(box) == ["-m pipeline.daily"] and "evaluation" not in box.log()
+    # Anything but a plain "0" leaves it in: a setting misread must not quietly turn the measuring off.
+    for value in ("", "no", "1"):
+        (box.fake / "python_runs").unlink()
+        box.run("daily_run.sh", DAILY_EVALUATION=value)
+        assert python_runs(box) == ["-m pipeline.daily", "-m evaluation --if-changed"], value
+
+
+def test_an_evaluation_that_failed_is_said_and_the_run_still_ended_as_the_pipeline_did(box):
+    (box.fake / "evaluation.txt").write_text("Cannot evaluate: Yahoo Finance price download failed: timed out\n")
+    (box.fake / "evaluation_exit").write_text("1")
+    done = box.run("daily_run.sh")
+
+    assert done.returncode == 0, "the pipeline ended well, and that is what the run reports"
+    assert "evaluation ends, exit 1" in box.log()
+    assert box.notifications() == [
+        ("Daily pipeline finished", "fake/a: ok, 2 order(s) placed"),
+        ("Evaluation did not finish",
+         "Cannot evaluate: Yahoo Finance price download failed: timed out The next scheduled run tries again."),
+    ]
+    assert not (box.logs / "run.lock").exists()
+
+
+def test_the_reason_an_evaluation_failed_is_its_own_last_line_cut_by_character(box):
+    # Not a line of the pipeline before it, and not the script's own marker lines.
+    (box.fake / "evaluation.txt").write_text(f"Evaluation as of the close of 2026-11-16.\nCannot evaluate: {'é' * 400}\n")
+    (box.fake / "evaluation_exit").write_text("1")
+    box.run("daily_run.sh")
+    assert box.notifications()[1] == (
+        "Evaluation did not finish", f"Cannot evaluate: {'é' * 203} The next scheduled run tries again.")
+
+    # An evaluation that failed without a word says where to look, not a line of the pipeline's.
+    (box.fake / "notifications").unlink()
+    (box.fake / "evaluation.txt").write_text("")
+    box.run("daily_run.sh")
+    title, text = box.notifications()[1]
+    assert title == "Evaluation did not finish"
+    assert text == f"It ended with exit 1 and no message. See {next(box.logs.glob('daily_*.log'))}"
+
+
+def test_what_the_evaluation_prints_never_changes_what_is_said_about_the_pipeline(box):
+    # Lines shaped like the pipeline's own results, and its order count: they are the evaluation's, not the run's.
+    (box.fake / "evaluation.txt").write_text(
+        "fake/a: failed. Said by the evaluation.\nfake/b: ok\n  9 views, 9 debates, 9 accepted proposal(s), 9 order(s) placed\n")
+    assert box.run("daily_run.sh").returncode == 0
+    assert box.notifications() == [("Daily pipeline finished", "fake/a: ok, 2 order(s) placed")]
+
+    (box.fake / "notifications").unlink()
+    box.pipeline_prints(SKIPPED)
+    box.run("daily_run.sh")
+    assert box.notifications() == [], "a skipped session stays unannounced, whatever the evaluation printed"
+
+
+def test_notifications_turned_off_silence_the_evaluation_too(box):
+    (box.fake / "evaluation_exit").write_text("1")
+    assert box.run("daily_run.sh", DAILY_NOTIFY="0").returncode == 0
+    assert box.notifications() == [] and "evaluation ends, exit 1" in box.log()
+
+
+def test_an_evaluation_that_never_ends_is_stopped_so_that_the_lock_is_given_back(box):
+    # A price source that never answers must not keep the next run, or the desk's meetings, from starting.
+    (box.fake / "evaluation_hangs").touch()
+    started = time.monotonic()
+    done = box.run("daily_run.sh", DAILY_EVALUATION_SECONDS="2")
+
+    assert done.returncode == 0 and 2 <= time.monotonic() - started < 10       # the two seconds, not none and not twenty
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((box.fake / "evaluation_pid").read_text()), 0)
+    assert "evaluation stopped: not finished after 2 seconds" in box.log() and "evaluation ends" not in box.log()
+    assert box.notifications()[1] == (
+        "Evaluation did not finish", "Stopped after 2 seconds. The next scheduled run tries again.")
+    assert not (box.logs / "run.lock").exists()
+
+
+def test_an_evaluation_that_does_not_end_when_asked_is_ended_for_good(box):
+    # Stuck somewhere that does not listen: the script waits a little for it, then ends it, and goes on.
+    for name in ("evaluation_hangs", "evaluation_stubborn"):
+        (box.fake / name).touch()
+    started = time.monotonic()
+    done = box.run("daily_run.sh", DAILY_EVALUATION_SECONDS="1")
+
+    assert done.returncode == 0 and time.monotonic() - started < 30
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((box.fake / "evaluation_pid").read_text()), 0)
+    assert "evaluation stopped: not finished after 1 seconds" in box.log()
+    assert not (box.logs / "run.lock").exists()
+
+
+@pytest.mark.parametrize("limit", ["", "soon", "-5", "1.5", "0", "000", "08", "99999999999999999999999"])
+def test_a_limit_that_is_not_a_plain_number_of_seconds_never_stops_a_good_evaluation(box, limit):
+    # Read as "no time at all", it would stop every evaluation before it began; read as bad arithmetic
+    # ("08" is not octal), it would end the script on the spot, and not with the pipeline's own result.
+    (box.fake / "evaluation.txt").write_text(MEASURED)
+    done = box.run("daily_run.sh", DAILY_EVALUATION_SECONDS=limit)
+    assert done.returncode == 0 and done.stderr == ""
+    assert "evaluation ends, exit 0" in box.log() and "evaluation stopped" not in box.log()
+    assert not (box.logs / "run.lock").exists()
+
+
+@pytest.mark.parametrize("limit", ["soon", "0"])
+def test_a_limit_that_cannot_be_read_is_a_long_one_not_a_short_one(box, limit):
+    (box.fake / "evaluation_hangs").touch()
+    script = subprocess.Popen(["/bin/bash", str(box.project / "scripts" / "daily_run.sh")],
+                              env={**box.env, "DAILY_EVALUATION_SECONDS": limit})
+    try:
+        for _ in range(100):
+            if (box.fake / "evaluation_pid").exists() and (box.fake / "evaluation_pid").read_text().strip():
+                break
+            time.sleep(0.1)
+        time.sleep(4)
+        assert script.poll() is None, "still waiting for it, four seconds on"
+        os.kill(int((box.fake / "evaluation_pid").read_text()), 0)
+        assert "evaluation stopped" not in box.log()
+        script.send_signal(signal.SIGTERM)
+        assert script.wait(timeout=30) == 143
+    finally:
+        script.kill()
+
+
+def test_the_evaluation_runs_under_the_runs_own_lock(box):
+    # A desk meeting that comes due meanwhile waits for the next round, as it does beside the pipeline.
+    (box.fake / "evaluation_hangs").touch()
+    script = subprocess.Popen(["/bin/bash", str(box.project / "scripts" / "daily_run.sh")], env=box.env)
+    try:
+        for _ in range(100):
+            if (box.fake / "evaluation_pid").exists() and (box.fake / "evaluation_pid").read_text().strip():
+                break
+            time.sleep(0.1)
+        evaluation = int((box.fake / "evaluation_pid").read_text())
+        assert (box.logs / "run.lock" / "pid").read_text().strip() == str(script.pid)
+        second = box.run("daily_run.sh")
+        assert second.returncode == 0 and f"not started: another run (process {script.pid}) is still going" in box.log()
+        assert python_runs(box) == ["-m pipeline.daily", "-m evaluation --if-changed"]
+
+        # Stopping the script stops the evaluation with it, and the lock is given back.
+        script.send_signal(signal.SIGTERM)
+        assert script.wait(timeout=30) == 143
+    finally:
+        script.kill()
+    with pytest.raises(ProcessLookupError):
+        os.kill(evaluation, 0)
+    assert not (box.logs / "run.lock").exists() and "stopped by a signal" in box.log()
 
 
 # ── schedule.sh ──────────────────────────────────────────────────────────────
