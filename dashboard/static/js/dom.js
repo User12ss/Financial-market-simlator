@@ -171,7 +171,9 @@ export function word(group, value) {
 /** A change with its direction said twice: by an arrow and by colour. */
 export function delta(value, text) {
   if (missing(value)) return el("span", { class: "muted", text: DASH });
-  if (value === 0) return el("span", { text });
+  // The figure is given as a child, never as the span's text: it may be a node of its own (a counting figure),
+  // and a node set as text shows as its type's name. An account on its first day has made exactly nothing.
+  if (value === 0) return el("span", {}, text);
   return el("span", { class: value > 0 ? "up" : "down" }, value > 0 ? "▲ " : "▼ ", text);
 }
 

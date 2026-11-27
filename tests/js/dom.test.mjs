@@ -38,9 +38,24 @@ globalThis.document = {
   createTextNode: (text) => new FakeText(text),
 };
 
-const { el, svg, table } = await import("../../dashboard/static/js/dom.js");
+const { delta, el, svg, table } = await import("../../dashboard/static/js/dom.js");
 
 const HOSTILE = '<img src=x onerror="alert(1)"><script>alert(2)</script> & "quotes"';
+
+/** What a reader sees of a node: its own text and its children's, in order. */
+const seen = (node) => node.textContent + node.children.map(seen).join("");
+
+test("a change is shown with its direction, and one of exactly nothing as the figure alone", () => {
+  // The figure may be given as words or as a node of its own (the overview's counting figures are nodes).
+  for (const figure of ["0.00%", el("span", { text: "0.00%" })]) {
+    const flat = delta(0, figure);
+    assert.equal(seen(flat), "0.00%", "an account on its first day has made exactly nothing: that is the figure, not a node's name");
+    assert.equal(flat.attributes.class, undefined, "neither a gain nor a loss");
+  }
+  assert.deepEqual([seen(delta(1.5, "+1.50%")), delta(1.5, "+1.50%").attributes.class], ["▲ +1.50%", "up"]);
+  assert.deepEqual([seen(delta(-2, el("span", { text: "−2.00%" }))), delta(-2, "x").attributes.class], ["▼ −2.00%", "down"]);
+  assert.deepEqual([seen(delta(null, "anything")), delta(undefined, "x").attributes.class], ["—", "muted"]);
+});
 
 test("words given as text are kept as text, markup characters and all", () => {
   const node = el("div", { text: HOSTILE });
