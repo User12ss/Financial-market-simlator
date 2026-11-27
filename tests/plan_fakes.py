@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import date
 
 import pandas as pd
@@ -11,7 +10,9 @@ from data.market_calendar import _calendar
 from data.providers import BAR_COLUMNS
 from models.planning import PlanDraft
 from tests.desk_fakes import ARM, desk_llm, make_desk
-from tests.pipeline_fakes import ORIGIN, SyntheticMarket, condition, plan_draft
+from tests.pipeline_fakes import (  # noqa: F401  (between and shown are used by the tests that import them from here)
+    ORIGIN, SyntheticMarket, between, condition, plan_draft, shown, usual_plan,
+)
 
 FRIDAY, MONDAY, TUESDAY, WEDNESDAY, THURSDAY = (date(2026, 11, day) for day in (13, 16, 17, 18, 19))
 
@@ -61,23 +62,11 @@ class MovingMarket(SyntheticMarket):
         return report if report is not None and report > after else None
 
 
-def shown(user_message: str) -> tuple[str, float, float]:
-    """The name a plan was asked for, with the last close and the stop the manager was shown for it."""
-    ticker = re.search(r"Write the plan for (\S+)\.", user_message).group(1)
-    close, stop = re.search(r"- Last close ([\d,.]+)\. Stop ([\d,.]+)\.", user_message).groups()
-    return ticker, float(close.replace(",", "")), float(stop.rstrip(".").replace(",", ""))
-
-
-def between(share: float, close: float, stop: float) -> float:
-    """A price that share of the way from the close down to the stop, to the cent."""
-    return round(close - share * (close - stop), 2)
-
-
 def plans_by(make):
     """A scripted manager: `make(ticker, close, stop)` returns the plan for that name, or None for the usual one."""
     def reply(system_prompt: str, user_message: str):
         ticker, close, stop = shown(user_message)
-        return make(ticker, close, stop) or plan_draft()
+        return make(ticker, close, stop) or usual_plan(system_prompt, user_message)
     return reply
 
 

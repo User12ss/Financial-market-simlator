@@ -147,6 +147,7 @@ test("in English the desk's plans speak English, and what was recorded is word f
     ["Not triggered yet", "Triggered, to be handled", "Carried out", "Not carried out", "Heard at a meeting"]);
   assert.deepEqual([whoText({ automatic: true }), whoText({ automatic: false }), sourceText("manager"), sourceText("default")],
     ["Carried out by code", "Decided at a meeting", "Drafted by the Portfolio Manager", "Desk default"]);
+  assert.equal(whoText({ automatic: true, unless_ahead: true }), "Carried out by code; put to a meeting when the position is ahead");
   assert.equal(foundText(CONDITIONS[1].trigger), "Found by the intraday watch on 2026-11-17 at 10:00 New York time");
   assert.equal(foundText(CONDITIONS[6].trigger), "Found by the close meeting on 2026-11-17 at 18:30 New York time");
   assert.equal(word("meeting", "called"), "Called check-in");

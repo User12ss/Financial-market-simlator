@@ -30,6 +30,9 @@ test("each kind of condition is put into words from its own figures", () => {
 test("each action, who carries it out, and who wrote the plan", () => {
   assert.deepEqual(CONDITIONS.map(actionText), ["卖出全部", "卖出全部", "止损上调到 403.56", "卖出一半", "召集会议", "召集会议", "撤回未成交的买单", "卖出一半"]);
   assert.deepEqual([whoText({ automatic: true }), whoText({ automatic: false })], ["代码自动执行", "开会决定"]);
+  // A sale on a day is a time stop: code carries it out only for a trade that is not ahead, and the page says so.
+  assert.equal(whoText({ automatic: true, unless_ahead: true }), "代码自动执行，赚钱时改为上会");
+  assert.equal(whoText({ automatic: false, unless_ahead: true }), "开会决定");
   assert.deepEqual([sourceText("manager"), sourceText("default")], ["组合经理起草", "系统默认"]);
 });
 
@@ -70,7 +73,7 @@ test("a plan that stands: its header, its chances, its conditions and its versio
   assert.equal(rows[5], "[5] 新闻标题出现 subpoena / recall召集会议开会决定已上会Reason for 5.2026-11-16 10:00（纽约时间）由盘中巡检发现"
     + "A headline has 'subpoena': UPA Corp receives a subpoena over its accounts"
     + "Heard at the called check-in of 2026-11-16 10:05 New York time.");
-  assert.equal(rows[7], "[1] 到 2026-11-17 收盘第 1 版之后已去掉卖出一半代码自动执行已执行Half off after two sessions."
+  assert.equal(rows[7], "[1] 到 2026-11-17 收盘第 1 版之后已去掉卖出一半代码自动执行，赚钱时改为上会已执行Half off after two sessions."
     + "2026-11-17 18:30（纽约时间）由收盘会发现The session of 2026-11-17 has closed.A sale of 12 share(s) is placed for the next open.");
 
   // The thesis, and every version newest first, with its basis, its changes and what was refused, as recorded.

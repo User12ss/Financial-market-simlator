@@ -87,6 +87,8 @@ def trimmed(tmp_path_factory):
 
     desk, _ = week(folder, plans_by(manager))
     assert hold(desk, ny(16, 18, 30)).status == "ok"
+    # Bought at 406.49 and a little behind on the day: a day that sells leaves alone a trade that is ahead.
+    desk.market.set_close("UPA", TUESDAY, 406.0)
     tuesday = hold(desk, ny(17, 18, 30))
     assert tuesday.status == "ok"
     desk.journal.close()
@@ -134,12 +136,22 @@ def test_a_plan_made_at_fridays_meeting_is_shown_with_every_field_the_page_needs
         {"key": "time", "condition": {"kind": "date", "level": None, "average": None, "on": "2026-11-30", "ending": None,
                                       "keywords": []},
          "action": "exit", "new_stop": None, "reason": TIME_REASON, "source": "rule", "automatic": True,
-         "in_version": 1, "dropped": False, "state": "waiting", "trigger": None},
+         # A sale on a day is carried out only for a trade that is not ahead, and the page is told so.
+         "unless_ahead": True, "in_version": 1, "dropped": False, "state": "waiting", "trigger": None},
         {"key": "wrong", "condition": {"kind": "price_below", "level": 403.01, "average": None, "on": None, "ending": None,
                                        "keywords": []},
          "action": "exit", "new_stop": None, "reason": WRONG_REASON, "source": "manager", "automatic": True,
-         "in_version": 1, "dropped": False, "state": "waiting", "trigger": None},
+         "unless_ahead": False, "in_version": 1, "dropped": False, "state": "waiting", "trigger": None},
     ]
+
+
+def test_whether_a_day_sells_a_trade_that_is_ahead_is_told_by_the_setting_as_it_stands(sold, trimmed, monkeypatch):
+    folder, _ = trimmed
+    def told():
+        return {row["key"]: row["unless_ahead"] for row in plan_of(Reader(folder / "journal.sqlite3").plans(ARM))["conditions"]}
+    assert told() == {"time": True, "wrong": False, "1": True}      # the manager's "half off after two sessions" too
+    monkeypatch.setattr(plans.config, "PLAN_TIME_STOP", "exit")
+    assert told() == {"time": False, "wrong": False, "1": False}
 
 
 def test_a_condition_the_watch_found_is_fired_with_when_and_what_was_seen(sold):

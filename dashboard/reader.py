@@ -31,7 +31,7 @@ from models.evaluation import Evaluation
 from models.forecast import ForecastScore, ForecastSet
 from models.planning import Contingency, Plan, Trigger
 from models.signals import SignalTable
-from pipeline.plans import acts, identity
+from pipeline.plans import acts, identity, unless_ahead
 from risk.gate import halted
 
 STAGE_TITLES = dict(STAGES)
@@ -963,7 +963,10 @@ def _conditions(versions: list[Plan], triggers: dict[str, Trigger]) -> list[dict
         trigger = triggers.get(identity(item))
         return {
             # Whether code carries it out is asked of the same rule the desk asks, not read off the record alone.
-            **item.model_dump(mode="json"), "automatic": acts(item), "in_version": version, "dropped": dropped,
+            **item.model_dump(mode="json"), "automatic": acts(item),
+            # A sale on a day is carried out only for a trade that is not ahead. Said by the setting as it stands
+            # now, which is what the desk will go by when the day comes: not a record of what was done.
+            "unless_ahead": acts(item) and unless_ahead(item), "in_version": version, "dropped": dropped,
             "state": "waiting" if trigger is None else trigger.status,
             "trigger": None if trigger is None else trigger.model_dump(mode="json", include={
                 "version", "fired_at", "session_date", "found_by", "evidence", "result", "handled_by", "handled_on"}),

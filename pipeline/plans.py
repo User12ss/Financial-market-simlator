@@ -250,6 +250,18 @@ def _why_not(
         if close < value:
             return (f"a close below the {whole}-day average holds already: the last close is {close:,.2f}, "
                     f"the average {value:,.2f}.")
+        # An average is held to what a price is held to, where it stands today. A stronger local model's first
+        # plans were out on a close below an average half a usual day's range under the last close, which an
+        # ordinary down day gets to, or on one far under the stop, which passed and could never come to anything.
+        # An average has more places than a price: one that rounds onto the stop is at the stop. So a name whose
+        # stop is as near the close as a price may be has no average that passes, which is what its manager is told.
+        if stop is not None and value <= stop + _CENT:
+            return (f"the stop at {stop:,.2f} sells before a close gets under the {whole}-day average, which "
+                    f"stands at {value:,.2f}.")
+        if value > below + _CENT:
+            return (f"the {whole}-day average stands at {value:,.2f}, {(1 - value / close) * 100:.2f}% from the last "
+                    f"close of {close:,.2f}, inside one usual daily range ({usual:.2f}%): an ordinary day closes "
+                    f"under it. It may stand at {below:,.2f} at most.")
     elif kind == "date":
         if whole is None or not 1 <= whole <= left:
             return (f"its day ({level:g}) is not one of the {left} session(s) the plan has left."
@@ -339,22 +351,37 @@ def time_stop(ends_on: date) -> Contingency | None:
     )
 
 
+def sells_on_a_day(item: Contingency) -> bool:
+    """Whether a condition is a sale that the mere arrival of a day sets off: a time stop, whoever wrote it."""
+    return item.condition.kind == "date" and item.action in ("exit", "trim")
+
+
+def unless_ahead(item: Contingency) -> bool:
+    """Whether a condition sells only a trade that is not ahead of its cost, by the setting as it stands."""
+    return config.PLAN_TIME_STOP == "exit_unless_ahead" and sells_on_a_day(item)
+
+
 def spared_by_the_clock(trigger: Trigger, unrealized_pct: float | None) -> str:
-    """Why the clock does not sell this position although its time has run out, or nothing.
+    """Why a day that has come does not sell this position, or nothing.
 
     A time stop is for a trade that has not worked. With the shipped setting
     (PLAN_TIME_STOP=exit_unless_ahead) a position that is ahead of its cost
     when its time runs out is not sold by the clock: it is put before the
-    meeting, and the plan is looked at again. Judged when the condition is
-    acted on, by the setting as it stands then. A position with no usable
-    price is not known to be ahead, and is sold.
+    meeting, and the plan is looked at again. A day the manager names for a
+    sale, or for half of one, is held to the same. Its reason for such a day
+    was "if it is not profitable by then", and code that sold on the day
+    whatever the position had made did not do what the plan said. Judged
+    when the condition is acted on, by the setting as it stands then. A
+    position with no usable price is not known to be ahead, and is sold.
     """
     item = trigger.contingency
-    if (config.PLAN_TIME_STOP != "exit_unless_ahead" or item.source != "rule" or item.key != "time"
-            or item.action != "exit" or unrealized_pct is None or not unrealized_pct > 0):
+    if not unless_ahead(item) or unrealized_pct is None or not unrealized_pct > 0:
         return ""
-    return (f"Its time has run out with the position {unrealized_pct:+.2f}% against its cost. The clock sells only a "
-            "trade that is not ahead, so this one is not sold by it and is put before the meeting.")
+    if item.source == "rule":
+        return (f"Its time has run out with the position {unrealized_pct:+.2f}% against its cost. The clock sells "
+                "only a trade that is not ahead, so this one is not sold by it and is put before the meeting.")
+    return (f"The day its plan named has come with the position {unrealized_pct:+.2f}% against its cost. A day sells "
+            "only a trade that is not ahead, so this one is not sold on it and is put before the meeting.")
 
 
 def sessions_left(session: date, ends_on: date) -> list[date]:

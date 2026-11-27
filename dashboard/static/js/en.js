@@ -937,6 +937,7 @@ export const EN = {
   "止损上调到 {}": "Raise the stop to {0}",
   "召集会议": "Call a meeting",
   "代码自动执行": "Carried out by code",
+  "代码自动执行，赚钱时改为上会": "Carried out by code; put to a meeting when the position is ahead",
   "开会决定": "Decided at a meeting",
   "系统默认": "Desk default",
   "组合经理起草": "Drafted by the Portfolio Manager",

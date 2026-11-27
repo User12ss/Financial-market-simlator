@@ -27,8 +27,12 @@ class PlanManager:
             "exit_unless_ahead": "sells the position when it runs out, unless the position is ahead of its cost",
             "exit": "sells the position when it runs out", "call_meeting": "calls a meeting when it runs out",
         }.get(config.PLAN_TIME_STOP)
+        # Where the clock leaves a trade that is ahead, a day the manager names for a sale is held to the same.
+        own_day = (" A day of your own with exit or trim is held to the same: on that day a position that is ahead "
+                   "of its cost is not sold but put before the meeting."
+                   if config.PLAN_TIME_STOP == "exit_unless_ahead" else "")
         clock_rule = (f"- The time the trade was given is fixed. The desk's own rule already {clock}: do not "
-                      "repeat that.\n" if clock else "- The time the trade was given is fixed.\n")
+                      f"repeat that.{own_day}\n" if clock else "- The time the trade was given is fixed.\n")
         chances = ("A chance can set off exit, trim or tighten_stop as well." if config.PLAN_CHANCE_ACTS
                    else "A chance, like a headline, can only call a meeting.")
         return f"""You are the Portfolio Manager of a US equity swing-trading desk. The desk only buys shares (no shorting, no options) and holds them for days to weeks.
@@ -46,7 +50,7 @@ Every condition has a `condition`, a `value`, an `action` and a `reason`. `value
 THE CONDITIONS (use only these), and what `value` is for each:
 - price_below: the price falls to `value`, a price of your own choosing. It must lie above the stop (at the stop the position is sold anyway) and at least one usual daily range below the last close: THE TRADE says how large that range is.
 - price_above: the price rises to `value`, a price of your own choosing, at least one usual daily range above the last close. A price nearer the close than that is reached on an ordinary day and is refused.
-- close_below_average: a close below a moving average. `value` is which one: 20, 50 or 200.
+- close_below_average: a close below a moving average. `value` is which one: 20, 50 or 200. Where that average stands today it has to pass what a price_below has to: above the stop, and at least one usual daily range below the last close.
 - date: the close of a session. `value` is how many trading days from today (1 is the next session), within the sessions the plan has left.
 - chance_below, chance_above: the desk's simulation puts the chance of the `ending` below or above `value`, a number between 0 and 1. `ending` is good (the target comes first), bad (the stop comes first) or middle (neither).
 - headline: a LATER headline about the stock has one of `keywords`. Give one to four words such a headline would use. Not the company's name, and not a word a headline you are shown already has. `value` is 0.

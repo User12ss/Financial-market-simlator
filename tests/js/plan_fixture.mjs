@@ -32,7 +32,7 @@ export const CONDITIONS = [
     trigger: trigger({ found_by: "close", fired_at: "2026-11-17T23:30:00Z", evidence: "The chance of ending at the target is 15%.",
       result: "The buy had filled.", handled_by: "run-17", handled_on: "2026-11-17" }) }),
   row("1", condition("date", { on: "2026-11-17" }), "trim", { in_version: 1, dropped: true, state: "done",
-    reason: "Half off after two sessions.",
+    reason: "Half off after two sessions.", unless_ahead: true,
     trigger: trigger({ found_by: "close", fired_at: "2026-11-17T23:30:00Z", evidence: "The session of 2026-11-17 has closed.",
       result: "A sale of 12 share(s) is placed for the next open.", handled_by: "run-17", handled_on: "2026-11-17" }) }),
 ];

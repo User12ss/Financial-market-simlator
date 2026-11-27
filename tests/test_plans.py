@@ -44,12 +44,13 @@ def draft(wrong=None, *others, thesis="The trend is intact.", change="") -> Plan
 
 
 def made(given=None, before=None, held=True, stop=95.0, close=100.0, horizon=5, reasons=(), session=MONDAY, tab="yes",
-         direction="bullish", shown=(), titles=(), name="Acme Corp", atr_pct=1.0):
+         direction="bullish", shown=(), titles=(), name="Acme Corp", atr_pct=1.0, averages=None):
     """A plan for ACME: last close 100, stop 95, and a usual daily range of 1% of the price."""
     return plans.assemble(
         arm="desk/fake/a", ticker="ACME", run_id="run-1", session=session, now=NOW, held=held, direction=direction,
         thesis="The analyst's thesis.", close=close, stop=stop, stop_from="position" if held else "analyst",
-        table=table() if tab == "yes" else None, horizon=horizon, averages=AVERAGES, before=before, draft=given,
+        table=table() if tab == "yes" else None, horizon=horizon,
+        averages=AVERAGES if averages is None else averages, before=before, draft=given,
         reasons=list(reasons), shown=list(shown), name=name, titles=list(titles), atr_pct=atr_pct,
     )
 
@@ -237,6 +238,10 @@ def test_fields_that_do_not_belong_to_a_conditions_kind_are_not_kept():
     (item("price_below", "exit", level=101.0),
      "what would show it wrong cannot be kept, a price at or below 101.00 holds already: the last close is 100.00."),
     (item("price_below", "exit", reason="  "), "what would show it wrong cannot be kept, it gives no reason."),
+    # An average the stop is above cannot show anything: the position is gone before a close gets under it.
+    (item("close_below_average", "exit", average=200),
+     "what would show it wrong cannot be kept, the stop at 95.00 sells before a close gets under the 200-day average, "
+     "which stands at 90.00."),
 ])
 def test_a_draft_that_does_not_say_what_would_show_it_wrong_is_refused_whole(wrong, why):
     plan = made(draft(wrong, item("price_above", "trim"), thesis="Mine."))
@@ -256,6 +261,10 @@ def test_a_draft_that_does_not_say_what_would_show_it_wrong_is_refused_whole(wro
     (item("close_below_average", "trim", average=None), "a plan may name the 20-, 50- or 200-day average, not the 0-day one."),
     (item("close_below_average", "trim", average=50.5), "a plan may name the 20-, 50- or 200-day average, not the 50.5-day one."),
     (item("close_below_average", "trim", average=96.0), "a plan may name the 20-, 50- or 200-day average, not the 96-day one."),
+    (item("close_below_average", "trim", average=200),
+     "the stop at 95.00 sells before a close gets under the 200-day average, which stands at 90.00."),
+    (item("close_below_average", "call_meeting", average=200),
+     "the stop at 95.00 sells before a close gets under the 200-day average, which stands at 90.00."),
     (item("date", "trim", on_session=0), "its day (0) is not one of the 5 session(s) the plan has left."),
     (item("date", "trim", on_session=6), "its day (6) is not one of the 5 session(s) the plan has left."),
     (item("date", "trim", on_session=2.5), "its day (2.5) is not one of the 5 session(s) the plan has left."),
@@ -292,12 +301,71 @@ def test_a_condition_that_fails_a_check_is_refused_and_the_rest_of_the_plan_stan
     assert plan.refused == [f"Condition 1 ({bad.condition}, {bad.action}): {why}"]
 
 
-def test_a_close_below_an_average_that_holds_already_is_refused_and_one_on_the_average_is_not():
+def average_at(value, action="trim", **options):
+    """A plan for ACME (close 100, stop 95, usual range 1%) with a condition on its 20-day average, standing at `value`."""
+    return made(draft(item(), item("close_below_average", action, average=20)),
+                averages={20: value, 50: 96.0, 200: 90.0}, **options)
+
+
+def test_an_average_is_held_to_what_a_price_is_held_to():
+    """A close under an average sells as a price does, so the average has to stand where a price would have to.
+
+    The first plans a stronger local model wrote were out on "a close below the 20-day average" with that average
+    one percent under the last close, half a usual day's range: an ordinary down day would have sold the whole
+    position. Others named an average far under the stop, which passed and could never come to anything.
+    """
+    kept = [("time", "date", "exit", True), ("wrong", "price_below", "exit", True)]
+    # Nearer the close than a usual day's range: 99.00 is the nearest an average may stand, as it is for a price.
+    assert average_at(99.0).refused == [] and kinds(average_at(99.0))[2:] == [("1", "close_below_average", "trim", True)]
+    near = average_at(99.01)
+    assert kinds(near) == kept and near.refused == [
+        "Condition 1 (close_below_average, trim): the 20-day average stands at 99.01, 0.99% from the last close of "
+        "100.00, inside one usual daily range (1.00%): an ordinary day closes under it. It may stand at 99.00 at most."]
+    # On the close itself it does not hold yet, and is nearer still.
+    assert average_at(100.0).refused == [
+        "Condition 1 (close_below_average, trim): the 20-day average stands at 100.00, 0.00% from the last close of "
+        "100.00, inside one usual daily range (1.00%): an ordinary day closes under it. It may stand at 99.00 at most."]
+    # The range is the name's own: with days twice as wide, 98.00 is the nearest.
+    assert average_at(98.0, atr_pct=2.0).refused == [] and "It may stand at 98.00 at most." in average_at(
+        98.5, atr_pct=2.0).refused[0]
+    # At the stop or under it: the stop sells first, as it does before a price under it.
+    assert average_at(95.01).refused == []
+    for value in (95.0, 94.0):
+        assert average_at(value).refused == [
+            f"Condition 1 (close_below_average, trim): the stop at 95.00 sells before a close gets under the 20-day "
+            f"average, which stands at {value:,.2f}."]
+    # An average has more places than a price has: one that rounds onto the stop is at the stop.
+    assert average_at(95.004).refused == [
+        "Condition 1 (close_below_average, trim): the stop at 95.00 sells before a close gets under the 20-day "
+        "average, which stands at 95.00."]
+    assert average_at(95.006).refused == []
+    # So where the stop is as near the close as a price may be, no average passes, as the manager is told.
+    squeezed = made(draft(item("close_below_average", "exit", average=20)), averages={20: 99.003}, stop=99.0)
+    assert squeezed.refused == [
+        "The plan is refused whole: what would show it wrong cannot be kept, the stop at 99.00 sells before a close "
+        "gets under the 20-day average, which stands at 99.00."]
+    # It is so whatever the condition is to do, a meeting as much as a sale.
+    assert "inside one usual daily range" in average_at(99.5, "call_meeting").refused[0]
+    assert "the stop at 95.00 sells before" in average_at(94.0, "tighten_stop").refused[0]
+    # A position with no stop has nothing that sells first.
+    assert average_at(90.0, stop=None).refused == []
+
+
+def test_an_average_that_cannot_be_kept_cannot_be_what_shows_the_plan_wrong():
+    hair_trigger = made(draft(item("close_below_average", "exit", average=20)), averages={20: 99.5})
+    assert hair_trigger.source == "default" and kinds(hair_trigger) == [("time", "date", "exit", True)]
+    assert hair_trigger.refused == [
+        "The plan is refused whole: what would show it wrong cannot be kept, the 20-day average stands at 99.50, "
+        "0.50% from the last close of 100.00, inside one usual daily range (1.00%): an ordinary day closes under it. "
+        "It may stand at 99.00 at most."]
+    sound = made(draft(item("close_below_average", "exit", average=20)), averages={20: 98.0})
+    assert sound.source == "manager" and sound.refused == []
+
+
+def test_a_close_below_an_average_that_holds_already_is_refused():
     below = made(draft(item(level=96.5), item("close_below_average", "trim", average=20)), close=97.5)
     assert below.refused == ["Condition 1 (close_below_average, trim): a close below the 20-day average holds "
                              "already: the last close is 97.50, the average 98.00."]
-    on_it = made(draft(item(level=96.5), item("close_below_average", "trim", average=20)), close=98.0)
-    assert on_it.refused == [] and kinds(on_it)[-1] == ("1", "close_below_average", "trim", True)
     missing = plans.assemble(
         arm="a", ticker="ACME", run_id="r", session=MONDAY, now=NOW, held=True, direction="bullish", thesis="T.",
         close=100.0, stop=95.0, stop_from="position", table=None, horizon=5, averages={20: 98.0, 50: None},

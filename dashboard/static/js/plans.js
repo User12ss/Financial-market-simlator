@@ -42,7 +42,10 @@ export function actionText(item) {
   }
 }
 
-export const whoText = (item) => (item.automatic ? t("代码自动执行") : t("开会决定"));
+// A sale on a day is a time stop: code carries it out only for a trade that is not ahead of its cost, and a
+// trade that is ahead is put before the meeting. The server says which conditions that holds for.
+export const whoText = (item) => (!item.automatic ? t("开会决定")
+  : item.unless_ahead ? t("代码自动执行，赚钱时改为上会") : t("代码自动执行"));
 export const sourceText = (source) => (source === "default" ? t("系统默认") : t("组合经理起草"));
 
 /** Where a condition stands, as a mark and a label: never colour alone. */

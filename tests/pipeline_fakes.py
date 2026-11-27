@@ -187,7 +187,7 @@ def scenario(*events: ProposedEventDraft, remark="Nothing particular to add."):
 
 def condition(kind="close_below_average", action="exit", reason="The trend would be broken.", level=None, average=None,
               on_session=None, value=None, **fields):
-    """One condition of a drafted plan. By default the one a rising name's plan can always keep.
+    """One condition of a drafted plan. By default a close below the 200-day average.
 
     A draft gives one number, `value`. Here it may be given under the name it has for the kind: a `level` for a
     price or a chance, an `average`, or the session a day falls `on_session`.
@@ -199,9 +199,33 @@ def condition(kind="close_below_average", action="exit", reason="The trend would
 
 
 def plan_draft(wrong=None, *others, thesis="The trend carries it.", change="", remark="That is the plan."):
-    """The portfolio manager's plan for one name: by default, out on a close below the 200-day average."""
+    """The portfolio manager's plan for one name. Given no condition it is out on a close below the 200-day
+    average, which a rising name's plan cannot keep (that average is under its stop): see `usual_plan`."""
     return PlanDraft(thesis=thesis, wrong_if=wrong or condition(), contingencies=list(others), change=change,
                      remark=remark)
+
+
+def shown(user_message: str) -> tuple[str, float, float]:
+    """The name a plan was asked for, with the last close and the stop the manager was shown for it."""
+    ticker = re.search(r"Write the plan for (\S+)\.", user_message).group(1)
+    close, stop = re.search(r"- Last close ([\d,.]+)\. Stop ([\d,.]+)\.", user_message).groups()
+    return ticker, float(close.replace(",", "")), float(stop.rstrip(".").replace(",", ""))
+
+
+def between(share: float, close: float, stop: float) -> float:
+    """A price that share of the way from the close down to the stop, to the cent."""
+    return round(close - share * (close - stop), 2)
+
+
+def usual_plan(system_prompt: str, user_message: str, *others, change="") -> PlanDraft:
+    """The plan a scripted manager writes when a test gives it none: out on a price six tenths of the way from the
+    last close down to the stop it was shown.
+
+    A name bought at the meeting can keep that: its stop is two usual daily ranges under the close, and a plan's
+    price has to lie at least one range under it and above the stop.
+    """
+    _, close, stop = shown(user_message)
+    return plan_draft(condition("price_below", "exit", level=between(0.6, close, stop)), *others, change=change)
 
 
 class ScriptedLLM:
@@ -216,7 +240,7 @@ class ScriptedLLM:
             DebateRulingDraft: ruling(),
             ProposalSetDraft: proposals(),
             ScenarioDraft: scenario(),
-            PlanDraft: plan_draft(),
+            PlanDraft: usual_plan,
         }
         self.calls: list[tuple[str, str, str]] = []     # schema name, system prompt, user message
         self.usage = UsageLog()

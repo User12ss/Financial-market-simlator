@@ -468,12 +468,16 @@ class _DeskClose(DailyPipeline):
         below, _ = plans.price_window(item.price.close, usual)
         trade.append(f"- One usual daily range is {usual:.2f}% of the price. A price in a condition has to lie at "
                      "least that far from the last close: nearer than that, an ordinary day reaches it.")
-        if stop is not None and stop + 0.01 <= below:
+        if stop is None:
+            trade.append("- An average in a condition has to stand at least that far under the last close as well.")
+        elif stop + 0.01 <= below:
             trade.append("- A price that would show the plan wrong has to lie above the stop as well: at the stop "
                          "the position is sold anyway.")
-        elif stop is not None:
-            trade.append("- No price can show this plan wrong: the stop is within one usual daily range of the last "
-                         "close. Use an average or a day.")
+            trade.append("- An average in a condition is held to both, where it stands today: above the stop, and at "
+                         "least one usual daily range under the last close.")
+        else:
+            trade.append("- No price and no average can show this plan wrong: the stop is within one usual daily "
+                         "range of the last close. Use a day.")
         ends = before.ends_on if before else left[-1] if left else None
         trade.append(f"- Time: {len(left)} session(s) left, to the close of {ends}.")
         # What the simulation gave the trade's endings is not said here. No model is shown the forecast: the
