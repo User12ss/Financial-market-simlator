@@ -184,8 +184,72 @@ def test_ollama_accepts_a_normal_token_count():
 
 
 def test_ollama_reports_cut_off_output():
-    with pytest.raises(LLMError, match="cut off"):
+    with pytest.raises(LLMError, match="cut off") as caught:
         ollama_with(lambda r: ollama_reply(done_reason="length")).generate("m", "sys", "q", None)
+    assert "OLLAMA_THINK" not in str(caught.value)       # nothing was being thought: the setting is not the cure
+
+
+def sent_to_ollama(schema=None) -> dict:
+    """What one call puts on the wire."""
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return ollama_reply()
+
+    ollama_with(handler).generate("m", "sys", "q", schema)
+    return seen
+
+
+def test_ollama_leaves_thinking_to_the_model_unless_told(monkeypatch):
+    monkeypatch.setattr(config, "OLLAMA_THINK", None)
+    assert "think" not in sent_to_ollama(Verdict)
+
+
+def test_the_shipped_setting_says_nothing_about_thinking():
+    """A model that does not think is asked exactly as it was before the setting existed."""
+    assert config.ollama_think("") is None
+
+
+@pytest.mark.parametrize("setting", [False, True, "low"])
+def test_ollama_sends_the_thinking_setting_with_and_without_a_schema(monkeypatch, setting):
+    monkeypatch.setattr(config, "OLLAMA_THINK", setting)
+    for schema in (Verdict, None):
+        seen = sent_to_ollama(schema)
+        assert seen["think"] == setting and type(seen["think"]) is type(setting)
+
+
+@pytest.mark.parametrize("text, setting", [
+    ("", None), ("   ", None),
+    ("false", False), ("False", False), (" off ", False), ("0", False), ("no", False),
+    ("true", True), ("ON", True), ("1", True), ("yes", True),
+    ("low", "low"), (" High ", "High"),                  # a level goes as it is written: Ollama matches it exactly
+])
+def test_the_thinking_setting_is_read_from_text(text, setting):
+    read = config.ollama_think(text)
+    assert read == setting and type(read) is type(setting)
+
+
+def cut_off_while_thinking():
+    return ollama_reply(done_reason="length", message={"content": "", "thinking": "Let me see. " * 40})
+
+
+@pytest.mark.parametrize("setting", [None, True, "low"])
+def test_ollama_cut_off_while_thinking_points_at_the_setting(monkeypatch, setting):
+    """A model that thinks can spend the whole allowance on it and never answer: raising the allowance is not the cure.
+
+    Left to itself, asked to think, or asked to think a little: in each the way out is to turn it off.
+    """
+    monkeypatch.setattr(config, "OLLAMA_THINK", setting)
+    with pytest.raises(LLMError, match="cut off.*still thinking.*OLLAMA_THINK=false"):
+        ollama_with(lambda r: cut_off_while_thinking()).generate("m", "sys", "q", None)
+
+
+def test_ollama_cut_off_does_not_point_at_a_setting_that_is_already_off(monkeypatch):
+    monkeypatch.setattr(config, "OLLAMA_THINK", False)
+    with pytest.raises(LLMError, match="cut off") as caught:
+        ollama_with(lambda r: cut_off_while_thinking()).generate("m", "sys", "q", None)
+    assert "OLLAMA_THINK=false" not in str(caught.value)
 
 
 def test_ollama_missing_model_says_how_to_get_it():

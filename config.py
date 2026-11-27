@@ -54,6 +54,26 @@ LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # so the client refuses prompts that would not fit in OLLAMA_NUM_CTX.
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
+
+
+def ollama_think(text: str) -> bool | str | None:
+    """What OLLAMA_THINK asks for: nothing (the model's own default), off, on, or a level by its name."""
+    word = text.strip()
+    if not word:
+        return None
+    if word.lower() in ("false", "off", "no", "0"):
+        return False
+    if word.lower() in ("true", "on", "yes", "1"):
+        return True
+    return word
+
+
+# Some models think before they answer (qwen3.5, gemma4 and others), and do so unless told not to. The
+# thinking is written first and counts against OLLAMA_NUM_PREDICT, so such a model can spend the whole
+# allowance on it and never answer. "false" turns thinking off, "true" asks for it, a level's name (as
+# `ollama show <model>` lists them) picks a level, and nothing leaves it to the model. Whatever is set
+# goes to every Ollama model, the fast tier too.
+OLLAMA_THINK: bool | str | None = ollama_think(os.getenv("OLLAMA_THINK", ""))
 # A local machine runs one generation at a time; extra requests wait their turn.
 OLLAMA_MAX_PARALLEL: int = int(os.getenv("OLLAMA_MAX_PARALLEL", "1"))
 

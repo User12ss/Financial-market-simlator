@@ -611,6 +611,7 @@ Set these in `.env` (see `.env.example`):
 | `LLM_PROVIDER_FAST` | same as `LLM_PROVIDER` | Provider for the fast tier |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is running |
 | `OLLAMA_NUM_CTX` | `8192` | Context window; prompts that would not fit are refused |
+| `OLLAMA_THINK` | — | For models that think before they answer (qwen3.5, gemma4 and others): `false` turns thinking off, `true` asks for it, a level's name (as `ollama show <model>` lists it) picks a level, and empty leaves it to the model. Thinking counts against the reply's token allowance, so a model left to think can use all of it and never answer; set `false` for such a model. Sent to every Ollama model, the fast tier too |
 | `OPENAI_COMPAT_BASE_URL` | — | Base URL of an OpenAI-compatible service |
 | `OPENAI_COMPAT_API_KEY` | — | Key for that service |
 | `ANTHROPIC_API_KEY` | — | Required only for `LLM_PROVIDER=anthropic` |

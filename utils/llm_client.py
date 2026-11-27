@@ -213,6 +213,8 @@ class OllamaProvider(_HttpProvider):
         }
         if schema is not None:
             payload["format"] = schema.model_json_schema()
+        if config.OLLAMA_THINK is not None:
+            payload["think"] = config.OLLAMA_THINK
 
         with self._slots:
             started = time.time()
@@ -236,8 +238,12 @@ class OllamaProvider(_HttpProvider):
                 f"truncated to fit OLLAMA_NUM_CTX={config.OLLAMA_NUM_CTX}. Raise OLLAMA_NUM_CTX."
             )
         if data.get("done_reason") == "length":
+            # A model that thinks first writes its thinking against the same allowance as its answer.
+            thinking = bool((data.get("message") or {}).get("thinking")) and config.OLLAMA_THINK is not False
             raise LLMError(
-                f"Reply from '{model}' was cut off at OLLAMA_NUM_PREDICT={config.OLLAMA_NUM_PREDICT}. Raise it."
+                f"Reply from '{model}' was cut off at OLLAMA_NUM_PREDICT={config.OLLAMA_NUM_PREDICT}. "
+                + ("The model was still thinking, and its thinking counts against that allowance: "
+                   "set OLLAMA_THINK=false to have it answer without." if thinking else "Raise it.")
             )
         text = (data.get("message") or {}).get("content") or ""
         usage = Usage(self.name, model, prompt_tokens, int(data.get("eval_count") or 0), elapsed)
