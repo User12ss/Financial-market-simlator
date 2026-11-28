@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?><edgarSubmission xmlns="http://www.sec.gov/edgar/schedule13D" xmlns:com="http://www.sec.gov/edgar/common">
+  <headerData>
+    <submissionType>SCHEDULE 13D</submissionType>
+    <filerInfo><filer><filerCredentials><cik>0000888000</cik><ccc>XXXXXXXX</ccc></filerCredentials></filer><liveTestFlag>LIVE</liveTestFlag></filerInfo>
+  </headerData>
+  <formData>
+    <coverPageHeader>
+      <securitiesClassTitle>Common Stock, par value $0.01 per share</securitiesClassTitle>
+      <dateOfEvent>11/16/2026</dateOfEvent>
+      <previouslyFiledFlag>false</previouslyFiledFlag>
+      <issuerInfo>
+        <issuerCIK>0000999001</issuerCIK>
+        <issuerCusips><issuerCusipNumber>000000000</issuerCusipNumber></issuerCusips>
+        <issuerName>Acme Robotics Inc.</issuerName>
+        <address><com:street1>1 Test Way</com:street1><com:city>Testville</com:city><com:stateOrCountry>DE</com:stateOrCountry><com:zipCode>00000</com:zipCode></address>
+      </issuerInfo>
+      <authorizedPersons><notificationInfo><personName>A Lawyer</personName><personPhoneNum>(000) 000-0000</personPhoneNum></notificationInfo></authorizedPersons>
+    </coverPageHeader>
+    <reportingPersons>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0000888000</reportingPersonCIK>
+        <reportingPersonName>Example Capital LP</reportingPersonName>
+        <memberOfGroup>b</memberOfGroup>
+        <fundType>WC</fundType>
+        <aggregateAmountOwned>12400000</aggregateAmountOwned>
+        <isAggregateExcludeShares>N</isAggregateExcludeShares>
+        <percentOfClass>6.2</percentOfClass>
+        <typeOfReportingPerson>PN</typeOfReportingPerson>
+      </reportingPersonInfo>
+      <reportingPersonInfo>
+        <reportingPersonNoCIK>Y</reportingPersonNoCIK>
+        <reportingPersonName>Example Capital GP LLC</reportingPersonName>
+        <memberOfGroup>b</memberOfGroup>
+        <aggregateAmountOwned>12400000</aggregateAmountOwned>
+        <percentOfClass>6.2</percentOfClass>
+        <typeOfReportingPerson>OO</typeOfReportingPerson>
+      </reportingPersonInfo>
+    </reportingPersons>
+    <items1To7>
+      <item4><transactionPurpose>The Reporting Persons acquired the shares because they believe the shares are undervalued. The Reporting Persons intend to engage with the Issuer's board regarding the composition of the board and a review of strategic alternatives, at an average cost of $41.07 per share.</transactionPurpose></item4>
+    </items1To7>
+  </formData>
+</edgarSubmission>

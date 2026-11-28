@@ -1090,10 +1090,16 @@ def today(events: list[dict]) -> dict[str, str]:
 
     # The seats the desk adds to its meetings. Each of these kinds is one line on the record per name (or per
     # thing that could not be fetched, or per condition of a plan found to hold), so the lines are what is counted.
-    if of("news_desk"):
+    if of("news_desk", "briefing"):
         lines["news_desk"] = (
             f"{len(of('news_desk', 'news'))} 只股票有新情况，数据缺口 {len(of('news_desk', 'data_gap'))} 处，"
             f"计划条件成立 {len(of('news_desk', 'plan_call'))} 条"
+        )
+    elif of("news_desk"):
+        # A close meeting: the news desk does not open with the book there. It speaks of filings with the SEC,
+        # one line a name, and of those it could not read.
+        lines["news_desk"] = (
+            f"{len(of('news_desk', 'filings'))} 只股票有新公告，数据缺口 {len(of('news_desk', 'data_gap'))} 处"
         )
     if of("quant_engineer"):
         lines["quant_engineer"] = (

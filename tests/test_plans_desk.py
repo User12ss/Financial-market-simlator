@@ -1246,7 +1246,7 @@ def test_a_round_of_the_watch_that_cannot_check_the_plans_still_fetches_and_says
 
 def as_cli(desk, monkeypatch) -> None:
     """Make `python -m pipeline.desk` run over this desk."""
-    def build(arm, universe=None, on_event=None):
+    def build(arm, universe=None, on_event=None, filings=None):
         desk._on_event = on_event
         return desk
     # The list of desks itself is stood in for, not the making of one: the machine's own settings (a DESK_ARMS

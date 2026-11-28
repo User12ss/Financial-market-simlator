@@ -332,12 +332,17 @@ export function standings(events, index) {
   const checks = { accepted: 0, rejected: 0 }, gate = { approved: 0, reduced: 0, rejected: 0 };
   const desk = { fills: 0, orders: 0, noted: 0, withdrawn: 0 };
   const quant = { forecast: 0, backward: 0, rehearsal: 0 };
+  let filed = 0;
   const checkin = events.some((event) => event.kind === "briefing");
   events.slice(0, index + 1).forEach((event) => {
     const said = event.payload || {};
     if (event.speaker === "news_desk" && event.kind === "briefing") {
       // What the news desk said of the book when the check-in opened: how many names have something new.
       signs.news_desk = { text: t`${(said.affected || []).length} 只有新情况`, lean: "flat" };
+    } else if (event.speaker === "news_desk" && event.kind === "filings") {
+      // At a close meeting it speaks of filings with the SEC, one line a name: how many names have a new one so far.
+      filed += 1;
+      signs.news_desk = { text: t`${filed} 只有新公告`, lean: "flat" };
     } else if (event.speaker === "quant_engineer" && Object.hasOwn(quant, event.kind)) {
       // One line of the quant engineer's per name: forecast, worked back, and rehearsed with the proposed events in.
       quant[event.kind] += 1;

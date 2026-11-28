@@ -1088,7 +1088,7 @@ def cli(tmp_path, monkeypatch):
     """`python -m pipeline.desk` over a desk that holds UPA and UPB, late on Monday 16 November."""
     desk = held_book(tmp_path)
 
-    def build(arm, universe=None, on_event=None):
+    def build(arm, universe=None, on_event=None, filings=None):
         desk._on_event = on_event
         return desk
     monkeypatch.setattr(desk_module, "desk_arms", lambda spec=None: [desk.arm])
@@ -1241,7 +1241,7 @@ def side_by_side(tmp_path, monkeypatch):
     second = make_desk(tmp_path, market=first.builder.market, news=first.news, clock=first.clock, arm=OTHER)
     desks = {ARM: first, OTHER: second}
 
-    def build(arm, universe=None, on_event=None):
+    def build(arm, universe=None, on_event=None, filings=None):
         desks[arm.name]._on_event = on_event
         return desks[arm.name]
     monkeypatch.setattr(desk_module, "desk_arms", lambda spec=None: [first.arm, second.arm])

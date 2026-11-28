@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?><edgarSubmission xmlns="http://www.sec.gov/edgar/schedule13D" xmlns:com="http://www.sec.gov/edgar/common">
+  <schemaVersion>X0202</schemaVersion>
+  <headerData>
+    <submissionType>SCHEDULE 13D/A</submissionType>
+    <filerInfo><filer><filerCredentials><cik>0000999001</cik><ccc>XXXXXXXX</ccc></filerCredentials></filer><liveTestFlag>LIVE</liveTestFlag></filerInfo>
+  </headerData>
+  <formData>
+    <coverPageHeader>
+      <amendmentNo>1</amendmentNo>
+      <securitiesClassTitle>Class A common stock</securitiesClassTitle>
+      <dateOfEvent>11/06/2026</dateOfEvent>
+      <issuerInfo>
+        <issuerCIK>0000999002</issuerCIK>
+        <issuerName>Bolt Media Co</issuerName>
+      </issuerInfo>
+    </coverPageHeader>
+    <reportingPersons>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0000999001</reportingPersonCIK>
+        <reportingPersonName>Acme Robotics Inc.</reportingPersonName>
+        <aggregateAmountOwned>9500000</aggregateAmountOwned>
+        <percentOfClass>72.9</percentOfClass>
+        <typeOfReportingPerson>CO</typeOfReportingPerson>
+      </reportingPersonInfo>
+    </reportingPersons>
+  </formData>
+</edgarSubmission>

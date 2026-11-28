@@ -56,6 +56,9 @@ const FIELDS = {
   since: t("上一场会议的截止时刻"), as_of: t("这一场的截止时刻"), book: t("账上的股票"), affected: t("有新情况"),
   waiting: t("等待成交的订单"), at_open: t("今天开盘应已成交、尚未入账的订单"), sold_at_open: t("今天开盘应已卖出，不再复盘"),
   new_items: t("新消息"), not_shown: t("没有列出的新消息条数"), trading: t("当天盘中报价"),
+  // Filings with the SEC, as the news desk puts them on record.
+  new_filings: t("新公告"), filings_not_shown: t("没有列出的新公告条数"), accession: t("证监会的公告编号"), form: t("表格"),
+  accepted_at: t("证监会收到的时间"), link: t("链接"),
   number: t("编号"), item_id: t("台账里的编号"), title: t("标题"), publisher: t("来源"), published_at: t("来源标注的时间"),
   first_seen: t("本系统首次取得的时间"), session: t("交易日"), seen_at: t("取得的时间"), last: t("最新价"),
   previous_close: t("前一个收盘价"), change_pct: t("当日涨跌（%）"), usual_range_pct: t("日常波幅（%）"),

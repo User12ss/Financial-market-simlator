@@ -67,6 +67,7 @@ const SENTENCES = [
   [/^留给收盘会 (\d+) 条，撤回买单 (\d+) 张，下单 (\d+) 张$/, (m) => `${m[1]} noted for the close, ${m[2]} buy(s) withdrawn, ${m[3]} order(s) placed`],
   [/^(\d+) 只股票有新情况，数据缺口 (\d+) 处，计划条件成立 (\d+) 条$/,
     (m) => `${m[1]} name(s) with something new, ${m[2]} gap(s) in the data, ${m[3]} condition(s) of a plan found to hold`],
+  [/^(\d+) 只股票有新公告，数据缺口 (\d+) 处$/, (m) => `${m[1]} name(s) with a new SEC filing, ${m[2]} gap(s) in the data`],
   [/^预测 (\d+) 只，倒推 (\d+) 只，推演 (\d+) 只$/, (m) => `${m[1]} forecast, ${m[2]} worked back, ${m[3]} rehearsed with events`],
   [/^看了 (\d+) 只股票，提出事件 (\d+) 个，另有 (\d+) 个被退回$/,
     (m) => `Asked about ${m[1]} name(s): ${m[2]} event(s) proposed, ${m[3]} more turned back`],

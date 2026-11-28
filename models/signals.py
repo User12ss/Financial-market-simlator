@@ -232,6 +232,8 @@ class ViewUpdateDraft(Draft):
         "has been met, or the thesis no longer holds"
     )
     reason: str = Field(description="What changed and why it matters, naming the headline or the move (1-2 sentences)")
+    # The wording is as it was before filings were read: a check-in with none to show asks exactly what it asked
+    # then. Where filings are shown, the text that shows them says they are cited by number in the same way.
     cited: list[int] = Field(
         description="The numbers of the NEW HEADLINES you relied on. An empty list when you relied on none"
     )
@@ -274,6 +276,12 @@ class TickerBriefing(BaseModel):
     )
     new_items: list[ShownItem] = Field(default_factory=list, description="First seen since the last meeting")
     not_shown: int = Field(default=0, description="New headlines beyond the number a prompt has room for")
+    new_filings: list[ShownItem] = Field(
+        default_factory=list,
+        description="Filings with the SEC first seen since the last meeting, numbered on after the headlines. "
+        "`item_id` is the SEC's number for the filing",
+    )
+    filings_not_shown: int = Field(default=0, description="New filings beyond the number a prompt has room for")
     trading: PriceNow | None = Field(default=None, description="Where it is trading on the day of the meeting")
     affected: bool = Field(description="Whether there was anything to ask the analyst about")
 

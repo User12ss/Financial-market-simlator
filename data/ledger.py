@@ -1,11 +1,11 @@
 """The information ledger: what the desk has seen, and when it first saw it.
 
 One SQLite file, apart from the decision journal, that is only ever added to.
-Headlines and prices go in as they are fetched, each with the moment this
-system first had it. A meeting is then shown only what the ledger held at the
-meeting's cut-off: something fetched later cannot reach it, whatever date its
-source put on it. "First seen" is the rule, not "published", because a story
-is not known here before it has been fetched.
+Headlines, filings with the SEC and prices go in as they are fetched, each
+with the moment this system first had it. A meeting is then shown only what
+the ledger held at the meeting's cut-off: something fetched later cannot
+reach it, whatever date its source put on it. "First seen" is the rule, not
+"published", because a story is not known here before it has been fetched.
 
 The ledger also keeps a line for every fetch, the failed ones included, and a
 line for every round of the watch. A fetch that failed is recorded as failed:
@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 import config
 from data.market_calendar import previous_trading_day, session_close
-from data.models import NewsItem
+from data.models import Filing, NewsItem
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -40,6 +40,21 @@ CREATE TABLE IF NOT EXISTS items (
     PRIMARY KEY (item_id, ticker)
 );
 CREATE INDEX IF NOT EXISTS items_by_ticker ON items (ticker, first_seen);
+
+CREATE TABLE IF NOT EXISTS filings (
+    accession   TEXT NOT NULL,            -- the SEC's own number for the filing
+    ticker      TEXT NOT NULL,            -- the company it is about
+    form        TEXT NOT NULL,
+    kind        TEXT NOT NULL,            -- event, insider, holder
+    accepted_at TEXT NOT NULL,            -- when the SEC accepted it: public from then on
+    first_seen  TEXT NOT NULL,            -- when this system first had it
+    title       TEXT NOT NULL,
+    excerpt     TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    link        TEXT NOT NULL,
+    PRIMARY KEY (accession, ticker)
+);
+CREATE INDEX IF NOT EXISTS filings_by_ticker ON filings (ticker, first_seen);
 
 CREATE TABLE IF NOT EXISTS quotes (
     ticker         TEXT NOT NULL,
@@ -106,6 +121,21 @@ class LedgerItem(BaseModel):
     first_seen: datetime
     title: str
     publisher: str = ""
+    link: str = ""
+
+
+class LedgerFiling(BaseModel):
+    """A filing with the SEC as the ledger holds it: what was kept of it, and when this system first had it."""
+
+    accession: str
+    ticker: str
+    form: str
+    kind: str
+    accepted_at: datetime
+    first_seen: datetime
+    title: str
+    excerpt: str = ""
+    detail: dict = Field(default_factory=dict)
     link: str = ""
 
 
@@ -199,6 +229,74 @@ class Ledger:
             published_at=_moment(row["published_at"]), first_seen=_moment(row["first_seen"]), title=row["title"],
             publisher=row["publisher"], link=row["link"],
         )
+
+    # ── Filings with the SEC ─────────────────────────────────────────────
+
+    def add_filings(self, ticker: str, filings: list[Filing], seen_at: datetime) -> int:
+        """Keep the filings not already held for this ticker. Returns how many were new.
+
+        One already held keeps the moment it was first seen, as a headline does.
+        """
+        added = 0
+        with self._db:
+            for filing in filings:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO filings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (filing.accession, ticker, filing.form, filing.kind, stamp(filing.accepted), stamp(seen_at),
+                     filing.title, filing.excerpt, json.dumps(filing.detail, sort_keys=True), filing.link),
+                )
+                added += cursor.rowcount
+        return added
+
+    def filings(
+        self, ticker: str, as_of: datetime, days: dict[str, int], since: datetime | None = None,
+        fresh_days: int | None = None,
+    ) -> list[LedgerFiling]:
+        """The filings about a ticker that were known at `as_of`, the latest accepted first.
+
+        Only what this system had first seen by `as_of` and the SEC had
+        accepted by then. `days` is how far back to look, by kind of filing.
+        With `since`, only what was first seen after that moment. With
+        `fresh_days` as well, only what the SEC had accepted no longer than
+        that before it was first seen: a first reading goes months back, and
+        what was on file all that time is not news.
+
+        A ledger made before filings were read has no table of them. For a
+        reader that cannot add one (the dashboard), it holds none.
+        """
+        sql = "SELECT * FROM filings WHERE ticker = ? AND first_seen <= ? AND accepted_at <= ?"
+        params: list = [ticker, stamp(as_of), stamp(as_of)]
+        if since is not None:
+            sql += " AND first_seen > ?"
+            params.append(stamp(since))
+        try:
+            rows = self._db.execute(sql + " ORDER BY accepted_at DESC, accession", params).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
+        found = []
+        for row in rows:
+            accepted, first_seen = _moment(row["accepted_at"]), _moment(row["first_seen"])
+            if accepted < as_of - timedelta(days=days.get(row["kind"], 0)):
+                continue
+            if fresh_days is not None and first_seen - accepted > timedelta(days=fresh_days):
+                continue
+            found.append(LedgerFiling(
+                accession=row["accession"], ticker=row["ticker"], form=row["form"], kind=row["kind"], accepted_at=accepted,
+                first_seen=first_seen, title=row["title"], excerpt=row["excerpt"], detail=json.loads(row["detail_json"]),
+                link=row["link"],
+            ))
+        return found
+
+    def filing_accessions(self, ticker: str) -> set[str]:
+        """The filings held for a ticker, by the SEC's number: a reading does not open these again."""
+        try:
+            return {row["accession"] for row in self._db.execute("SELECT accession FROM filings WHERE ticker = ?", (ticker,))}
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return set()
+            raise
 
     # ── Prices during the session ────────────────────────────────────────
 
@@ -316,7 +414,8 @@ class Ledger:
         A fetch that failed and then worked is not listed: only what is still missing.
         """
         failed = []
-        for what, ticker in [("quotes", "")] + [("headlines", ticker) for ticker in tickers]:
+        wanted = [("quotes", "")] + [("headlines", ticker) for ticker in tickers] + [("filings", ticker) for ticker in tickers]
+        for what, ticker in wanted:
             row = self._db.execute(
                 "SELECT * FROM fetches WHERE what = ? AND ticker = ? AND at <= ? ORDER BY at DESC, id DESC LIMIT 1",
                 (what, ticker, stamp(as_of)),

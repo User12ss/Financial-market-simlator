@@ -99,6 +99,31 @@ class NewsItem(BaseModel):
     link: str = ""
 
 
+class Filing(BaseModel):
+    """A filing with the SEC about a company, as far as this system keeps it.
+
+    It is the company's own statement, or an insider's or a large holder's,
+    made under the securities laws: far harder to fake than a headline. It is
+    still text from outside, and is shown to models only as data.
+
+    `kind` is what it tells: "event" (an 8-K: something the company had to
+    report at once), "insider" (a Form 4: an officer or director traded the
+    company's shares) or "holder" (a Schedule 13D: someone holds more than
+    five per cent and may seek to influence the company). `title` is one
+    line composed by code from the filing's own fields. No price an insider
+    traded at is kept anywhere in it.
+    """
+
+    accession: str = Field(description="The SEC's own number for the filing")
+    form: str
+    kind: Literal["event", "insider", "holder"]
+    accepted: datetime = Field(description="When the SEC accepted it. It was public from then on")
+    title: str
+    excerpt: str = Field(default="", description="The start of what it says, where it says something in words")
+    detail: dict = Field(default_factory=dict, description="Its own fields, by kind")
+    link: str = ""
+
+
 class TickerSnapshot(BaseModel):
     ticker: str
     price: PriceSummary | None = None

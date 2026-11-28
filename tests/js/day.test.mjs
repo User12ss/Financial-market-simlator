@@ -65,6 +65,14 @@ test("the watch's last round is said in one line, with what it could not fetch",
   assert.equal(watchText(up, ms("14:45")),
     "最近一次巡检 14:45（刚刚） · 盯着 6 只股票，新消息 2 条，报价 8 个 · 当天波动最大 DIS ▲ +2.00%");
   assert.match(watchText({ ...DAY.watch, moves: [{ ticker: "PG", change_pct: 0 }] }, ms("14:45")), /当天波动最大 PG 0\.00%/);
+  // A desk that reads filings with the SEC says how many it took in, and whose it could not read.
+  const filed = { ...DAY.watch, filings: { off: false, added: 3, failed: ["KO"], waiting: 0, new: [] } };
+  assert.equal(watchText(filed, ms("14:52")),
+    "最近一次巡检 14:45（7 分钟前） · 盯着 6 只股票，新消息 2 条，新公告 3 条，报价 8 个 · 当天波动最大 KO ▼ −1.74% · 没取到：KO 的公告 · 下一场 15:00 尾盘碰头");
+  assert.match(watchText({ ...filed, filings: { off: false, added: 0, failed: [] } }, ms("14:52")), /新消息 2 条，新公告 0 条，报价 8 个/);
+  // One that does not read them (no contact set) says what it always said, and so does a round from before they were read.
+  const off = { ...DAY.watch, filings: { off: true, added: 0, failed: [], waiting: 0, new: [] } };
+  assert.equal(watchText(off, ms("14:52")), watchText(DAY.watch, ms("14:52")));
 });
 
 test("a meeting on the timetable is named only while it is still ahead, and no watch means no line", () => {

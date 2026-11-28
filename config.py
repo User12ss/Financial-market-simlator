@@ -311,6 +311,31 @@ PLAN_NO_ENTRY_BEFORE_REPORT: int = int(os.getenv("PLAN_NO_ENTRY_BEFORE_REPORT", 
 # Meetings the watch may call on one day because a plan's condition held. Each is a check-in, with model calls.
 DESK_CALLED_MAX: int = int(os.getenv("DESK_CALLED_MAX", "2"))
 
+# --- Company filings (the SEC's EDGAR system) ---
+# The desk reads three kinds of filing about each name in its book: 8-K (something the company had to
+# report at once), Form 4 (an officer or director traded its shares) and Schedule 13D (a holder of more than
+# five per cent). The SEC asks every program that reads EDGAR to say who it is, with an address it can write
+# to, as "name address". It is sent to sec.gov with each request and to nobody else. Empty: no filing is read.
+EDGAR_CONTACT: str = os.getenv("EDGAR_CONTACT", "").strip()
+# How far back a reading looks, in calendar days, by kind of filing.
+EDGAR_EVENT_DAYS: int = int(os.getenv("EDGAR_EVENT_DAYS", "90"))
+EDGAR_HOLDER_DAYS: int = int(os.getenv("EDGAR_HOLDER_DAYS", "90"))
+EDGAR_INSIDER_DAYS: int = int(os.getenv("EDGAR_INSIDER_DAYS", "180"))
+# A filing first seen more than this many days after the SEC accepted it was already on file before the
+# desk began reading (a first reading goes months back): it is kept, and is not announced as new.
+EDGAR_FRESH_DAYS: int = int(os.getenv("EDGAR_FRESH_DAYS", "7"))
+# How much of what a filing says is kept, in characters.
+EDGAR_EXCERPT_CHARS: int = int(os.getenv("EDGAR_EXCERPT_CHARS", "1500"))
+# The pause between two requests. The SEC allows ten a second; this keeps well under it.
+EDGAR_PAUSE_SECONDS: float = float(os.getenv("EDGAR_PAUSE_SECONDS", "0.15"))
+# Documents one reading may open, over all names: a first reading has months of filings to open, and takes
+# several readings to get through them, the newest first.
+EDGAR_DOCUMENTS_PER_READING: int = int(os.getenv("EDGAR_DOCUMENTS_PER_READING", "120"))
+# Filings of one name that a model is shown at a meeting.
+EDGAR_FILINGS_SHOWN: int = int(os.getenv("EDGAR_FILINGS_SHOWN", "5"))
+# Where each ticker's SEC number is kept between runs, with the filings found to be about another company.
+EDGAR_MEMORY_PATH: str = os.getenv("EDGAR_MEMORY_PATH", "").strip() or str(PROJECT_ROOT / "data_store" / "edgar.json")
+
 # --- Dashboard ---
 # A read-only web page over the journal: python -m dashboard. By default it
 # listens on this machine only. It has no login, so do not point it at a

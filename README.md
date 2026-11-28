@@ -381,6 +381,16 @@ A short job runs `tick` every few minutes. A round does two things.
 
 **The watch** is plain code and takes a few seconds: no model is called. On a trading day, from half an hour before the first check-in until the close, it fetches headlines for every name in the desk's book (holdings and orders waiting to fill) and the day's prices so far for the book, the S&P 500 and the VIX. Outside those hours it does nothing. What it fetches goes into the **ledger** (`data_store/ledger.sqlite3`), a file that is only ever added to: each story with the moment this system first had it, each price with the moment it was fetched, and a line for every fetch, the failed ones included. A fetch that failed is recorded as failed and nothing is put in its place. The prices come from the same source as the daily bars (Yahoo Finance, the day's bar while it is still forming) and may run behind the market.
 
+**Filings with the SEC** (`data/edgar.py`, `pipeline/filings.py`). With a contact set (`EDGAR_CONTACT`), the watch also reads three kinds of official filing about each name in the book from the SEC's EDGAR system, and each close meeting reads them for every name it looks at: 8-K (something the company had to report at once: an officer leaving, results, a restatement), Form 4 (an officer or director traded the company's shares) and Schedule 13D (someone holds more than five per cent of it). They go into the ledger like headlines, with the moment this system first had them, and a meeting is shown only those the ledger held at its cut-off. The news desk says what is new: with the headlines at a check-in, and name by name before the analyst's view at a close meeting. The analyst is shown them as one line each, the new ones first, marked as official filings that are still outside text and never instructions; at a check-in they are numbered on after the headlines and can be cited the same way.
+
+- The SEC asks every program that reads EDGAR to say who it is, with an address it can write to, and to make no more than ten requests a second. `EDGAR_CONTACT` is that name and address (`research-desk someone@example.com`); it is sent to sec.gov with each request and to nobody else, and is never written into a record or an error. Without it no filing is read, and the desk says nothing about filings. Requests are spaced well under the limit (`EDGAR_PAUSE_SECONDS`).
+- The price an insider traded at is not kept, nor are a Form 4's footnotes: one seat of the desk is to read these filings and must see no price (stage 11). The words of an 8-K are kept as written, cut to a length, and may state amounts.
+- A company's list of filings also holds what the company filed about other companies (a Form 4 or a 13D in which it is the holder). Those are opened once, found to be about someone else, and left out.
+- A first reading goes months back. A filing first seen more than a week after the SEC accepted it was on file before the desk began reading, and is not announced as new (`EDGAR_FRESH_DAYS`). One reading opens a limited number of documents, shared evenly over its names, the newest first (`EDGAR_DOCUMENTS_PER_READING`); the rest wait for later readings, which is not a failure.
+- A name whose filings could not be read is a gap: the news desk says so and the meeting counts as incomplete, as with a headline fetch that failed. A fund is not a gap: the SEC lists no company under its ticker, and there is nothing to read. Once EDGAR turns a reading away (too many requests, forbidden, a server error, no connection) nothing more is asked at that reading; the names not tried are gaps, and the next reading tries them all.
+- What comes back is not trusted to be well made. A form that declares a document type is refused unread (the SEC's forms never do, and one that does could be made to swell without end as it is read), no answer over 20 MB is taken in, only the start of a very long page is gone through, and a filing whose time carries no zone fails that name's reading rather than being guessed at.
+- Only what was filed is known: a filing appears after the event, sometimes days after, and most sales by officers are made under a plan set up months before (the line says so when the form does).
+
 **A meeting**, when one is due:
 
 | Meeting | When (New York) | What it does |
@@ -674,7 +684,7 @@ Set these in `.env` (see `.env.example`):
 | `EVALUATION_MAX_LESSONS` | `5` | Most lessons written by one evaluation run with `--lessons` |
 | `PIPELINE_USE_LESSONS` | `false` | Show lessons to the ticker analyst. Changes what the pipeline decides |
 | `PIPELINE_LESSONS_PER_TICKER` | `3` | Most lessons shown for one ticker |
-| `LEDGER_PATH` | `data_store/ledger.sqlite3` | The desk's ledger: headlines and prices with the moment each was first seen |
+| `LEDGER_PATH` | `data_store/ledger.sqlite3` | The desk's ledger: headlines, filings and prices with the moment each was first seen |
 | `DESK_ARMS` | — | Desks to run side by side, each on its own paper account: `PROVIDER:MODEL`, with commas between. Empty: one desk, on the configured model |
 | `DESK_PREMARKET` | `08:30` | The check-in before the open, New York time |
 | `DESK_MIDDAY` / `DESK_AFTERNOON` | `12:00` / `15:00` | The check-ins during the session. One timed at or after the day's close is skipped that day |
@@ -685,6 +695,12 @@ Set these in `.env` (see `.env.example`):
 | `DESK_CHECKIN_TRIES` | `2` | Tries at one check-in |
 | `DESK_HEADLINE_DAYS` / `DESK_HEADLINES_SHOWN` | `7` / `8` | How long a headline is shown, and how many per ticker fit in a prompt |
 | `DESK_MOVE_ATR` / `DESK_MOVE_PCT` | `1.0` / `3.0` | A move worth a look: this many usual daily ranges, or this many percent where the range is unknown |
+| `EDGAR_CONTACT` | — | A name and an address for the SEC, as `research-desk someone@example.com`. Sent to sec.gov with each request, as it asks. Empty: the desk reads no filings |
+| `EDGAR_EVENT_DAYS` / `EDGAR_HOLDER_DAYS` / `EDGAR_INSIDER_DAYS` | `90` / `90` / `180` | How far back 8-Ks, Schedules 13D and Forms 4 are read and shown, in days |
+| `EDGAR_FRESH_DAYS` | `7` | A filing first seen longer than this after the SEC accepted it is not announced as new |
+| `EDGAR_FILINGS_SHOWN` / `EDGAR_EXCERPT_CHARS` | `5` / `1500` | Filings of one name a model is shown, and how much of what a filing says is kept |
+| `EDGAR_DOCUMENTS_PER_READING` / `EDGAR_PAUSE_SECONDS` | `120` / `0.15` | Documents one reading may open over all its names, and the pause between two requests |
+| `EDGAR_MEMORY_PATH` | `data_store/edgar.json` | Each ticker's SEC number, and the filings found to be about another company |
 | `FORECAST_ENABLED` | `true` | The quant engineer's seat at the desk's close meeting. It decides nothing either way |
 | `FORECAST_DIR` | `data_store/forecast` | Where each week's parameters are kept, one numbered file per estimate |
 | `FORECAST_PATHS` | `10000` | Paths simulated for every name at every meeting |

@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
+from data.edgar import FilingsRead, NotListed, Unavailable
 from data.ledger import Ledger
-from data.models import NewsItem
+from data.models import Filing, NewsItem
 from data.providers import DataError
 from data.snapshot import SnapshotBuilder
 from journal.store import Journal
@@ -49,6 +50,52 @@ class ScriptedNews:
         ][:limit]
 
 
+class ScriptedFilings:
+    """Filings with the SEC per ticker, as a reader of EDGAR would hand them back.
+
+    A filing is returned from the moment it is added, unless the caller says it holds it already. `broken` holds
+    tickers whose list cannot be read; `unreadable` maps a ticker to problems with single filings.
+    """
+
+    def __init__(self) -> None:
+        self.on_file: dict[str, list[Filing]] = {}
+        self.broken: set[str] = set()
+        self.funds: set[str] = set()                     # tickers the SEC lists no company under
+        self.down: set[str] = set()                      # tickers at which EDGAR turns the reader away
+        self.stops: dict[str, str] = {}                  # tickers part-way through whose filings it does
+        self.unreadable: dict[str, list[str]] = {}
+        self.asked: list[tuple[str, dict, frozenset]] = []
+
+    def add(self, ticker: str, accession: str, title: str, accepted: datetime, kind: str = "event", **more) -> Filing:
+        form = {"event": "8-K", "insider": "4", "holder": "SCHEDULE 13D"}[kind]
+        filing = Filing(accession=accession, form=form, kind=kind, accepted=accepted, title=title,
+                        link=f"https://example.test/{accession}", **more)
+        self.on_file.setdefault(ticker, []).append(filing)
+        return filing
+
+    def filings(self, ticker, since, known=frozenset(), budget=None) -> FilingsRead:
+        self.asked.append((ticker, dict(since), frozenset(known)))
+        if ticker in self.funds:
+            raise NotListed(f"{ticker} is not in the SEC's list of tickers, so its filings cannot be looked up.")
+        if ticker in self.down:
+            raise Unavailable(f"EDGAR answered 429 for the list of {ticker}'s filings.")
+        if ticker in self.broken:
+            raise DataError(f"EDGAR answered 503 for the list of {ticker}'s filings.")
+        read = FilingsRead(problems=list(self.unreadable.get(ticker, [])))
+        if ticker in self.stops:
+            read.problems.append(f"4 X-1: {self.stops[ticker]}")
+            read.unavailable = self.stops[ticker]
+        wanted = [f for f in self.on_file.get(ticker, []) if f.accession not in known and f.accepted.date() >= since[f.kind]]
+        for filing in sorted(wanted, key=lambda f: f.accepted, reverse=True):
+            if budget is not None and budget.left <= 0:
+                read.waiting += 1
+                continue
+            if budget is not None:
+                budget.left -= 1
+            read.filings.append(filing)
+        return read
+
+
 def update(effect="unchanged", reason="Nothing here bears on the thesis.", cited=()):
     return ViewUpdateDraft(effect=effect, reason=reason, cited=list(cited), remark="That is where I stand.")
 
@@ -76,8 +123,11 @@ def desk_llm() -> ScriptedLLM:
     return llm
 
 
-def make_desk(tmp_path, llm=None, market=None, news=None, clock=None, arm=ARM) -> Desk:
-    """A desk on the synthetic market. The clock starts after Friday 13 November's close, when its meeting is due."""
+def make_desk(tmp_path, llm=None, market=None, news=None, clock=None, arm=ARM, filings=None) -> Desk:
+    """A desk on the synthetic market. The clock starts after Friday 13 November's close, when its meeting is due.
+
+    It reads no filings unless it is given a scripted source of them: like a desk with no contact set.
+    """
     clock = clock or Clock(ny(13, 18, 30))
     news = news or ScriptedNews()
     builder = SnapshotBuilder(market=market or SyntheticMarket(), macro=SteadyMacro(), news=news, now=clock)
@@ -85,7 +135,7 @@ def make_desk(tmp_path, llm=None, market=None, news=None, clock=None, arm=ARM) -
         Arm(arm, llm or desk_llm()), journal=Journal(tmp_path / "journal.sqlite3"),
         ledger=Ledger(tmp_path / "ledger.sqlite3"), builder=builder, universe=UNIVERSE,
         runs_dir=tmp_path / "runs", snapshot_dir=tmp_path / "snapshots", now=clock,
-        forecast_dir=tmp_path / "forecast",
+        forecast_dir=tmp_path / "forecast", filings=filings,
     )
     desk.clock, desk.news, desk.llm = clock, news, desk.arm.llm
     return desk

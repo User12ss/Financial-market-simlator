@@ -445,6 +445,18 @@ test("the seats the desk adds wear a sign too, counted from what they put on rec
   assert.deepEqual(standings(checkin, 0).signs.news_desk, { text: "2 只有新情况", lean: "flat" });
   assert.deepEqual(standings(checkin, 2).signs.news_desk, { text: "2 只有新情况", lean: "flat" });   // what it said of the book stands
   assert.deepEqual(standings([line("news_desk", "briefing", null, {})], 0).signs.news_desk, { text: "0 只有新情况", lean: "flat" });
+  // At a close meeting it speaks of filings with the SEC, a name at a time: its sign counts the names so far.
+  // A filing it could not read is said, and is not a name with a new one.
+  const filed = [
+    /* 0 */ line("news_desk", "filings", "KO", { new_filings: [{}], filings_not_shown: 0 }),
+    /* 1 */ line("ticker_analyst", "view", "KO", { direction: "bullish", confidence: 0.6 }),
+    /* 2 */ line("news_desk", "data_gap", "DIS"),
+    /* 3 */ line("news_desk", "filings", "MA", { new_filings: [{}, {}], filings_not_shown: 1 }),
+  ];
+  assert.deepEqual(standings(filed, 0).signs.news_desk, { text: "1 只有新公告", lean: "flat" });
+  assert.deepEqual(standings(filed, 2).signs.news_desk, { text: "1 只有新公告", lean: "flat" });
+  assert.deepEqual(standings(filed, 3).signs.news_desk, { text: "2 只有新公告", lean: "flat" });
+  assert.equal(standings([line("news_desk", "data_gap", "DIS")], 0).signs.news_desk, undefined);
 
   const close = [
     /* 0 */ line("quant_engineer", "market_state"),

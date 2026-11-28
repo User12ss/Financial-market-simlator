@@ -373,6 +373,11 @@ def test_each_figures_line_at_a_checkin_is_counted_from_its_own_lines():
     assert today([said("news_desk", "briefing"), said("news_desk", "data_gap"), said("news_desk", "news"),
                   said("news_desk", "news"), said("news_desk", "plan_call"), said("news_desk", "no_view")]) == {
         "news_desk": "2 只股票有新情况，数据缺口 1 处，计划条件成立 1 条"}
+    # At a close meeting the news desk does not open with the book: it speaks of filings with the SEC, a name
+    # at a time, and of those it could not read. Its line there counts those.
+    assert today([said("news_desk", "filings"), said("news_desk", "filings"), said("news_desk", "data_gap")]) == {
+        "news_desk": "2 只股票有新公告，数据缺口 1 处"}
+    assert today([said("news_desk", "data_gap")]) == {"news_desk": "0 只股票有新公告，数据缺口 1 处"}
     # At a close meeting an order taken back is counted as it always was: the trader's line is not the check-in's.
     assert today([said("trader", "order_withdrawn"), said("trader", "order_placed")]) == {"trader": "成交 0 笔，下单 1 张"}
 

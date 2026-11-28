@@ -43,7 +43,7 @@ from pydantic import BaseModel, ValidationError
 
 import config
 from agents.ticker import CheckinAnalyst, CheckinManager
-from data.ledger import Ledger, LedgerItem, LiveQuote
+from data.ledger import Ledger, LedgerFiling, LedgerItem, LiveQuote
 from data.market_calendar import last_completed_session, session_open
 from data.models import Snapshot, TickerSnapshot
 from data.snapshot import load_snapshot
@@ -56,6 +56,7 @@ from models.signals import (
     TickerView, TradeProposal, ViewUpdate, ViewUpdateDraft,
 )
 from models.trading import Order, OrderRequest, Position, RiskDecision
+from pipeline import filings as filing_rules
 from pipeline import plans
 from pipeline.checks import figure_warning
 from pipeline.daily import RISK_OFFICER, TRADER, Arm, BudgetExceeded, _slug, usage_since
@@ -175,10 +176,17 @@ def left_at_open(
 
 def brief(
     ticker: str, held: bool, waiting: str | None, new: list[LedgerItem], quote: LiveQuote | None,
-    item: TickerSnapshot | None, at_open: str | None = None,
+    item: TickerSnapshot | None, at_open: str | None = None, filed: list[LedgerFiling] | None = None,
 ) -> TickerBriefing:
-    """What the news desk has on one ticker. `new` is newest first; only the first few fit in a prompt."""
+    """What the news desk has on one ticker. `new` is newest first; only the first few fit in a prompt.
+
+    `filed` are the filings with the SEC that are new since the last meeting.
+    They are numbered on after the headlines, so that one number names one
+    thing the analyst was shown.
+    """
     shown = new[:config.DESK_HEADLINES_SHOWN]
+    filed = filed or []
+    filings = filing_rules.in_order(filed)[:config.EDGAR_FILINGS_SHOWN]
     price = price_now(quote, item) if quote else None
     return TickerBriefing(
         ticker=ticker, held=held, waiting=waiting, at_open=at_open,
@@ -188,14 +196,22 @@ def brief(
             for number, entry in enumerate(shown, start=1)
         ],
         not_shown=len(new) - len(shown), trading=price,
-        affected=bool(new) or bool(price and price.beyond_usual),
+        new_filings=[
+            ShownItem(number=number, item_id=entry.accession, title=entry.title, publisher=f"SEC filing ({entry.form})",
+                      published_at=entry.accepted_at, first_seen=entry.first_seen)
+            for number, entry in enumerate(filings, start=len(shown) + 1)
+        ],
+        filings_not_shown=len(filed) - len(filings),
+        affected=bool(new) or bool(filed) or bool(price and price.beyond_usual),
     )
 
 
 def describe(briefing: TickerBriefing) -> str:
     """The news desk's one line about a ticker."""
     count = len(briefing.new_items) + briefing.not_shown
-    parts = [f"{count} new headline{'s' if count != 1 else ''}." if count else "No new headline."]
+    filed = len(briefing.new_filings) + briefing.filings_not_shown
+    parts = [f"{filed} new filing{'s' if filed != 1 else ''} with the SEC."] if filed else []
+    parts.append(f"{count} new headline{'s' if count != 1 else ''}." if count else "No new headline.")
     price = briefing.trading
     if price:
         usual = (
@@ -260,6 +276,14 @@ def render_checkin(
               for entry in briefing.new_items] or ["None."]
     if briefing.not_shown:
         lines.append(f"({briefing.not_shown} more, older than these, are not shown.)")
+    # Said only when there are any: a check-in with no new filing asks exactly what it asked before they were read.
+    if briefing.new_filings:
+        lines += ["", f"NEW FILINGS WITH THE SEC since the last meeting ({filing_rules.CAUTION}):"]
+        lines += [f"[{entry.number}] {entry.published_at.astimezone(NEW_YORK):%Y-%m-%d} {entry.title}"
+                  for entry in briefing.new_filings]
+        if briefing.filings_not_shown:
+            lines.append(f"({briefing.filings_not_shown} more are not shown.)")
+        lines.append("A filing you relied on is named in `cited` by its number, as a headline is.")
     if earlier:
         lines += ["", "EARLIER HEADLINES, already known at the last meeting:"]
         lines += [f"- {_headline(entry.published_at, entry.publisher, entry.title)}" for entry in earlier]
@@ -278,7 +302,7 @@ def check_update(
     before the analyst. That is something to change a view on, as a new
     headline or a large move is.
     """
-    by_number = {entry.number: entry.item_id for entry in briefing.new_items}
+    by_number = {entry.number: entry.item_id for entry in briefing.new_items + briefing.new_filings}
     cited, unknown = [], []
     for number in draft.cited:
         if number in by_number:
@@ -286,16 +310,18 @@ def check_update(
                 cited.append(by_number[number])
         elif number not in unknown:
             unknown.append(number)
+    # The wording is as it was while only headlines were shown, and wider only where a filing was shown too.
+    filed = bool(briefing.new_filings)
     warnings = []
     if unknown:
         warnings.append(
-            f"Cites headline number(s) {', '.join(str(n) for n in unknown)}, which it was not shown."
+            f"Cites {'' if filed else 'headline '}number(s) {', '.join(str(n) for n in unknown)}, which it was not shown."
         )
     moved = bool(briefing.trading and briefing.trading.beyond_usual)
     if draft.effect != "unchanged" and not cited and not moved and not called:
         warnings.append(
-            f"Says the view is {draft.effect} without naming a new headline, and the price has not moved "
-            "beyond its usual range."
+            f"Says the view is {draft.effect} without naming a new headline{' or filing' if filed else ''}, and the "
+            "price has not moved beyond its usual range."
         )
     warnings += figure_warning(draft.reason, shown)
     return ViewUpdate(
@@ -552,6 +578,7 @@ class Checkin:
                 self.ledger.items(ticker, as_of, config.DESK_HEADLINE_DAYS, since=since),
                 self.ledger.quote(ticker, as_of, meeting.day), snapshot.tickers.get(ticker),
                 at_open=at_open[ticker].side if ticker in at_open else None,
+                filed=filing_rules.known(self.ledger, ticker, as_of, since)[0],
             )
             for ticker in tickers
         ]
@@ -571,6 +598,8 @@ class Checkin:
             what = (f"{failure.ticker}: headlines" if failure.what == "headlines" else "Today's prices")
             message = (f"{what} could not be fetched at the last try ({clock(failure.at)}): {failure.error} "
                        "Nothing is shown in their place.")
+            if failure.what == "filings":
+                message = filing_rules.gap(failure.ticker, clock(failure.at), failure.error)
             meeting.problem(message)
             self._say(meeting, "briefing", NEWS_DESK, "all", "data_gap", remark=message,
                       ticker=failure.ticker or None, payload=failure.model_dump(mode="json"))
@@ -676,6 +705,10 @@ class Checkin:
         with_news = sum(1 for b in briefings if b.new_items)
         text = (f"Since the last meeting ({clock(since)}): {headlines} new headline{'s' if headlines != 1 else ''} "
                 f"on {with_news} of the {len(briefings)} name{'s' if len(briefings) != 1 else ''} in the book")
+        filed = sum(len(b.new_filings) + b.filings_not_shown for b in briefings)
+        if filed:                           # said only when there are any, as the rest of this line was before them
+            with_filed = sum(1 for b in briefings if b.new_filings)
+            text += f"; {filed} new filing{'s' if filed != 1 else ''} with the SEC on {with_filed} of them"
         if not meeting.can_act:
             priced = [b for b in briefings if b.trading]
             moved = sum(1 for b in priced if b.trading.beyond_usual)

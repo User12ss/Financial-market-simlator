@@ -54,13 +54,21 @@ export function dayChips(meetings, shown) {
 export function watchText(watch, now) {
   if (!watch) return null;
   const headlines = watch.headlines || {}, quotes = watch.quotes || {};
+  // Filings with the SEC are counted only by a desk that reads them. A round made before they were read, or by
+  // a desk with no contact set, has none to count, and says what it always said.
+  const filed = watch.filings && !watch.filings.off ? watch.filings : null;
   const parts = [
     t`最近一次巡检 ${minute(watch.at)}（${ago(watch.at, now)}）`,
-    t`盯着 ${watch.tickers} 只股票，新消息 ${headlines.added || 0} 条，报价 ${quotes.count || 0} 个`,
+    filed
+      ? t`盯着 ${watch.tickers} 只股票，新消息 ${headlines.added || 0} 条，新公告 ${filed.added || 0} 条，报价 ${quotes.count || 0} 个`
+      : t`盯着 ${watch.tickers} 只股票，新消息 ${headlines.added || 0} 条，报价 ${quotes.count || 0} 个`,
   ];
   const biggest = (watch.moves || [])[0];
   if (biggest) parts.push(t`当天波动最大 ${biggest.ticker} ${moved(biggest.change_pct)}`);
-  const missing = [...(headlines.failed || []).map((ticker) => t`${ticker} 的新闻`), ...(quotes.error ? [t("报价")] : [])];
+  const missing = [
+    ...(headlines.failed || []).map((ticker) => t`${ticker} 的新闻`),
+    ...((filed && filed.failed) || []).map((ticker) => t`${ticker} 的公告`), ...(quotes.error ? [t("报价")] : []),
+  ];
   if (missing.length) parts.push(t`没取到：${missing.join("、")}`);
   const next = watch.next_meeting;
   if (next && new Date(next.at).getTime() > now) parts.push(t`下一场 ${minute(next.at)} ${word("meeting", next.kind)}`);

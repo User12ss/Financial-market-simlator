@@ -56,9 +56,11 @@ from pathlib import Path
 from typing import Callable
 
 import config
+from agents.ticker.analyst import TickerAnalyst
 from agents.ticker.planner import PlanManager
 from agents.ticker.scenario import ScenarioAnalyst
-from data.ledger import Ledger, LedgerItem, LiveQuote
+from data.edgar import FilingsProvider
+from data.ledger import Ledger, LedgerFiling, LedgerItem, LiveQuote
 from data.market_calendar import (
     is_trading_day, last_completed_session, next_trading_day, session_close, session_open, trading_day_after,
 )
@@ -71,9 +73,10 @@ from models.planning import Plan, PlanDraft, ScenarioDraft, Trigger
 from models.signals import CheckinRecord, Event, UsageSummary
 from models.trading import Order, RiskDecision
 from forecast.params import ParamStore
+from pipeline import filings as filing_rules
 from pipeline import plans, quant, scenario
 from pipeline import universe as universe_rules
-from pipeline.checkin import NEW_YORK, Checkin, CheckinResult, clock
+from pipeline.checkin import NEW_YORK, NEWS_DESK, Checkin, CheckinResult, clock
 from pipeline.daily import (
     PIPELINE, RISK_OFFICER, TRADER, Arm, BudgetExceeded, DailyPipeline, RunResult, _alive_elsewhere, _print_event,
 )
@@ -226,9 +229,14 @@ class _DeskClose(DailyPipeline):
     name today, and no position is opened just before an earnings report.
     """
 
-    def __init__(self, *args, ledger: Ledger, forecast_dir: str | Path | None = None, **kwargs) -> None:
+    def __init__(
+        self, *args, ledger: Ledger, forecast_dir: str | Path | None = None, filings: FilingsProvider | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.ledger = ledger
+        self.filings = filings                       # where filings with the SEC are read from; None: they are not read
+        self._filed_said: set[str] = set()           # names whose filings the news desk has spoken of at this meeting
         self.params = ParamStore(forecast_dir)
         self._forecasts: dict[str, tuple] = {}       # by run: the forecast and its waiting rows, kept when the run finishes
         self._turns: dict[str, quant.Turn] = {}      # by run: the quant engineer's turn, for the seat that speaks after the risk gate
@@ -250,6 +258,9 @@ class _DeskClose(DailyPipeline):
                 # it is what says, later, whether a proposed event's headline could have been seen. A fetch that
                 # brought nothing back may have failed, so it is not counted as a reading.
                 self.ledger.note_read(ticker, data.snapshot.created_at, found=len(item.news), added=added)
+        # Filings with the SEC, of every name this meeting looks at: the watch reads the book only, and a
+        # candidate's filings would otherwise never be read. They are known from this moment, before the cut-off.
+        filing_rules.read(self.ledger, self.filings, sorted(data.snapshot.tickers), self._now())
         self.as_of = self._now()
         arm = self.arms[0].name
         rows = self.journal.meetings(arm)
@@ -269,6 +280,9 @@ class _DeskClose(DailyPipeline):
         new = [entry for entry in known if self._since is not None and entry.first_seen > self._since]
         fresh = {entry.item_id for entry in new}
         lines += headline_block(new, [entry for entry in known if entry.item_id not in fresh])
+        filed, filed_earlier = filing_rules.known(self.ledger, item.ticker, self.as_of, self._since)
+        self._say_filings(run, item.ticker, filed)
+        lines += filing_rules.block(filed, filed_earlier)
         notes = [
             f"  * {clock(record.as_of)}, {record.kind} check-in: {update.effect}. {update.reason}"
             for record in self._checkins for update in record.updates if update.ticker == item.ticker
@@ -276,6 +290,31 @@ class _DeskClose(DailyPipeline):
         if notes:
             lines += ["- Earlier today at the desk (your own updates at the day's check-ins):"] + notes
         return "\n".join(lines)
+
+    def _say_filings(self, run, ticker: str, new: list[LedgerFiling]) -> None:
+        """The news desk on a name's filings, once at a meeting, as the name's data is first put together: what
+        is new since the last meeting, and before that a reading of them that failed, which is a gap in what the
+        analyst is about to be shown."""
+        if ticker in self._filed_said:
+            return
+        self._filed_said.add(ticker)
+        for failure in self.ledger.failures(self.as_of, [ticker]):
+            if failure.what != "filings":
+                continue
+            message = filing_rules.gap(ticker, clock(failure.at), failure.error)
+            run.problem(message)
+            self._say(run, "views", NEWS_DESK, TickerAnalyst.id, "data_gap", remark=message, ticker=ticker,
+                      payload=failure.model_dump(mode="json"))
+        if not new:
+            return
+        shown = filing_rules.in_order(new)[:config.EDGAR_FILINGS_SHOWN]
+        count = len(new)
+        more = f" And {count - 1} more." if count > 1 else ""
+        self._say(run, "views", NEWS_DESK, TickerAnalyst.id, "filings", ticker=ticker,
+                  remark=f"{count} new filing{'s' if count != 1 else ''} with the SEC since the last meeting. "
+                         f"{shown[0].title}{more}",
+                  payload={"new_filings": [filing_rules.said(entry) for entry in shown],
+                           "filings_not_shown": count - len(shown)})
 
     def _after_views(self, run, account, positions, views) -> None:
         """The quant engineer's turn, and then the plans: which have ended, and which conditions hold today."""
@@ -783,10 +822,14 @@ class Desk:
         now: Callable[[], datetime] | None = None,
         on_event: Callable[[Event], None] | None = None,
         forecast_dir: str | Path | None = None,
+        filings: FilingsProvider | None = None,
     ) -> None:
         self.arm = arm
         self.journal = journal or Journal()
         self.ledger = ledger or Ledger()
+        # Where filings with the SEC are read from. None: they are not read. The command line gives the desk
+        # EDGAR when a contact is set (pipeline.filings.provider); nothing else reaches for the network.
+        self.filings = filings
         self.builder = builder or SnapshotBuilder()
         self.universe = universe if universe is not None else universe_rules.load_universe()
         self.runs_dir, self.snapshot_dir, self.forecast_dir = runs_dir, snapshot_dir, forecast_dir
@@ -832,6 +875,7 @@ class Desk:
                 for entry in self.ledger.items(ticker, now, config.DESK_HEADLINE_DAYS)
                 if entry.item_id not in before
             ]
+        filed = filing_rules.read(self.ledger, self.filings, tickers, now)
 
         quotes, quote_error = self._quotes(tickers + WATCH_MARKET, today, now)
         moves = sorted(
@@ -844,6 +888,7 @@ class Desk:
         summary = {
             "tickers": len(tickers),
             "headlines": {"added": len(added), "failed": failed, "new": added[:10]},
+            "filings": filed.summary(),
             "quotes": {"count": len(quotes), "error": quote_error},
             "plans": {
                 "held": [{"ticker": trigger.ticker, "key": trigger.contingency.key,
@@ -1012,7 +1057,7 @@ class Desk:
         pipeline = _DeskClose(
             [self.arm], builder=self.builder, journal=self.journal, universe=self.universe,
             runs_dir=self.runs_dir, snapshot_dir=self.snapshot_dir, now=self._now, on_event=self._on_event,
-            ledger=self.ledger, forecast_dir=self.forecast_dir,
+            ledger=self.ledger, forecast_dir=self.forecast_dir, filings=self.filings,
         )
         result = pipeline.run()[0]
         if result.run_id and result.status != "skipped" and pipeline.as_of is not None:
@@ -1056,7 +1101,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arms = desk_arms(args.arm)
         tickers = universe_rules.load_universe(args.universe)
-        desks = [Desk(arm, universe=tickers, on_event=None if args.quiet else _print_event) for arm in arms]
+        # Filings with the SEC are read when a contact is set (EDGAR_CONTACT), by one reader for all the desks.
+        filed = filing_rules.provider()
+        desks = [Desk(arm, universe=tickers, on_event=None if args.quiet else _print_event, filings=filed)
+                 for arm in arms]
     except (LLMError, OSError, ValueError) as e:
         print(f"Cannot start: {e}", file=sys.stderr)
         return 1
@@ -1134,10 +1182,14 @@ def _watched(summary: dict | None) -> str:
     """What one desk's round of the watch did, in the words that follow "Watch:"."""
     if summary is None:
         return "outside its hours, nothing fetched."
-    gaps = summary["headlines"]["failed"] + (["prices"] if summary["quotes"]["error"] else [])
+    filed = summary.get("filings") or {"off": True, "added": 0, "failed": []}
+    gaps = (summary["headlines"]["failed"] + [f"filings of {ticker}" for ticker in filed["failed"]]
+            + (["prices"] if summary["quotes"]["error"] else []))
     held = summary["plans"]["held"]
+    # Filings are counted only by a desk that reads them: one with no contact set says what it always said.
+    filings = "" if filed["off"] else f"{filed['added']} new filing(s), "
     return (
-        f"{summary['tickers']} name(s) in the book, {summary['headlines']['added']} new headline(s), "
+        f"{summary['tickers']} name(s) in the book, {summary['headlines']['added']} new headline(s), {filings}"
         f"{summary['quotes']['count']} price(s)" + (f"; could not fetch: {', '.join(gaps)}" if gaps else "")
         + (f"; {len(held)} condition(s) of the desk's plans held: "
            + ", ".join(f"{item['ticker']} [{item['key']}]" for item in held) if held else "")
