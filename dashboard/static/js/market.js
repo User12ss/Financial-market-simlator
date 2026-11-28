@@ -7,7 +7,7 @@
 
 import { num, pct, signedPct, usd, word } from "./dom.js";
 import { reached, tickerOf } from "./decisions.js";
-import { t } from "./i18n.js";
+import { english, t } from "./i18n.js";
 
 export const BARS_ON_SCREEN = 60;           // about three months of sessions
 const SPARK = 30;
@@ -219,6 +219,58 @@ export function gauges(item) {
     band: given(tech.bollinger_lower) && given(tech.bollinger_upper) ? { low: tech.bollinger_lower, high: tech.bollinger_upper } : null,
     swing: given(price.close) && given(tech.atr14) ? { low: price.close - tech.atr14, high: price.close + tech.atr14 } : null,
   };
+}
+
+/** A company's size in the units a reader counts it in: 亿美元 in Chinese, billions of dollars in English. */
+function worth(dollars) {
+  if (!given(dollars)) return "—";
+  if (english) return dollars >= 1e9 ? `$${num(dollars / 1e9, 1)}B` : `$${num(dollars / 1e6, 0)}M`;
+  return t`${num(dollars / 1e8, dollars >= 1e10 ? 0 : 1)} 亿美元`;
+}
+
+/**
+ * Everything the snapshot holds of a ticker that goes under its chart when the chart is enlarged, in groups:
+ * its price and recent moves, its indicators (named as on the chart), and the company's own figures. The first
+ * two always stand, with a dash where the snapshot has nothing; the company's only where the snapshot recorded
+ * any. `hint` says in full what a short name stands for.
+ */
+export function facts(item) {
+  const price = item.price || {}, tech = item.technicals || {}, firm = item.fundamentals || null;
+  const flat = (label, text, hint = null) => ({ label, text, lean: "flat", hint });
+  const moved = (label, value) => ({ label, text: signedPct(value), lean: leanOf(value), hint: null });
+  const place = rangePlace(price);
+  const groups = [
+    {
+      title: t("价格"),
+      items: [
+        flat(t("收盘价"), usd(price.close)), moved(t("1 日"), price.change_1d_pct), moved(t("5 日"), price.return_5d_pct),
+        moved(t("1 月"), price.return_1mo_pct), moved(t("3 月"), price.return_3mo_pct), moved(t("1 年"), price.return_1y_pct),
+        flat(t("52 周高点"), usd(price.high_52w)), flat(t("52 周低点"), usd(price.low_52w)),
+        flat(t("52 周区间位置"), place === null ? "—" : `${Math.round(place * 100)}%`),
+      ],
+    },
+    {
+      title: t("指标"),
+      items: [
+        flat("MA20", usd(tech.sma20), t("20 日均线")), flat("MA50", usd(tech.sma50), t("50 日均线")),
+        flat("MA200", usd(tech.sma200), t("200 日均线")), flat("RSI 14", num(tech.rsi14, 1)),
+        flat("MACD", !given(tech.macd) ? "—" : given(tech.macd_signal) ? t`${num(tech.macd, 2)}（信号线 ${num(tech.macd_signal, 2)}）` : num(tech.macd, 2)),
+        flat(t("布林带"), given(tech.bollinger_lower) && given(tech.bollinger_upper) ? `${usd(tech.bollinger_lower)} – ${usd(tech.bollinger_upper)}` : "—"),
+        flat(t("日均波幅 ATR"), !given(tech.atr14) ? (given(tech.atr14_pct) ? pct(tech.atr14_pct) : "—")
+          : given(tech.atr14_pct) ? t`${usd(tech.atr14)}（${pct(tech.atr14_pct)}）` : usd(tech.atr14)),
+      ],
+    },
+  ];
+  if (firm) {
+    groups.push({
+      title: t("公司"),
+      items: [
+        flat(t("公司市值"), worth(firm.market_cap)), flat(t("市盈率"), num(firm.trailing_pe, 1)), flat(t("预期市盈率"), num(firm.forward_pe, 1)),
+        flat("Beta", num(firm.beta, 2)), flat(t("下次财报"), item.next_earnings || "—"),
+      ],
+    });
+  }
+  return groups;
 }
 
 /** How a ticker has moved since the session, from the bars later sessions recorded. Null when there are none. */

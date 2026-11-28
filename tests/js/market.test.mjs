@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 import { buildTrail } from "../../dashboard/static/js/decisions.js";
 import {
-  citationText, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, rangePlace, readings,
+  citationText, facts, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, rangePlace, readings,
   readouts, sectors, sinceText, sinceThen, sparkOf, sparkPath, tape, yieldCurve, trendOf, trendPlot,
 } from "../../dashboard/static/js/market.js";
 
@@ -285,4 +285,35 @@ test("a figure an analyst cited is shown beside what the snapshot holds when the
   assert.equal(citationText({ metric: "close", value: 100, actual: 100.004, matches: true }), "收盘价 100.00");      // the same to the cent
   assert.equal(citationText({ metric: "beta", value: 1.1, actual: null, matches: false }), "Beta 1.10（快照里没有这项）");
   assert.equal(citationText({ metric: "a_new_metric", value: 2, actual: 2, matches: true }), "a_new_metric 2.00");
+});
+
+test("the figures under an enlarged chart are the snapshot's own, in groups, with a dash where it has none", () => {
+  const told = (item) => facts(item).map((group) => [group.title, group.items.map((fact) => `${fact.label} ${fact.text}`)]);
+  assert.deepEqual(told(MARKET.tickers.TMO), [
+    ["价格", ["收盘价 $100.00", "1 日 −2.55%", "5 日 +1.50%", "1 月 0.00%", "3 月 —", "1 年 —", "52 周高点 $120.00", "52 周低点 $80.00",
+      "52 周区间位置 50%"]],
+    ["指标", ["MA20 $98.00", "MA50 —", "MA200 $90.00", "RSI 14 44.4", "MACD —", "布林带 $92.00 – $108.00", "日均波幅 ATR $3.00（3.00%）"]],
+  ]);
+  // Which way a move went is told as on the screen; a level or an indicator leans neither way.
+  assert.deepEqual(facts(MARKET.tickers.TMO)[0].items.map((fact) => fact.lean), ["flat", "down", "up", "flat", "flat", "flat", "flat", "flat", "flat"]);
+  assert.ok(facts(MARKET.tickers.TMO)[1].items.every((fact) => fact.lean === "flat"));
+  // An average is named as on the chart, and says in full what it is to whoever points at it.
+  assert.deepEqual(facts(MARKET.tickers.TMO)[1].items.slice(0, 3).map((fact) => fact.hint), ["20 日均线", "50 日均线", "200 日均线"]);
+
+  // The company's figures only where the snapshot recorded any, and the day its next results are due.
+  const firm = {
+    ...MARKET.tickers.TMO, price: { ...MARKET.tickers.TMO.price, return_1y_pct: 12.3 },
+    technicals: { ...MARKET.tickers.TMO.technicals, macd: 1.234, macd_signal: -0.5 },
+    fundamentals: { market_cap: 2.1e11, trailing_pe: 30.123, forward_pe: null, beta: 0.8 }, next_earnings: "2027-01-28",
+  };
+  assert.deepEqual(told(firm)[2], ["公司", ["公司市值 2,100 亿美元", "市盈率 30.1", "预期市盈率 —", "Beta 0.80", "下次财报 2027-01-28"]]);
+  assert.equal(told(firm)[0][1][5], "1 年 +12.30%");
+  assert.equal(told(firm)[1][1][4], "MACD 1.23（信号线 −0.50）");
+  assert.deepEqual(told({ ...firm, fundamentals: { market_cap: null }, next_earnings: null })[2],
+    ["公司", ["公司市值 —", "市盈率 —", "预期市盈率 —", "Beta —", "下次财报 —"]]);
+  // Nothing recorded at all: dashes for the price and the indicators, and no word of a company.
+  assert.deepEqual(told(MARKET.tickers.ABBV), [
+    ["价格", ["收盘价 $294.45", "1 日 0.00%", "5 日 —", "1 月 —", "3 月 —", "1 年 —", "52 周高点 —", "52 周低点 —", "52 周区间位置 —"]],
+    ["指标", ["MA20 —", "MA50 —", "MA200 —", "RSI 14 —", "MACD —", "布林带 —", "日均波幅 ATR —"]],
+  ]);
 });

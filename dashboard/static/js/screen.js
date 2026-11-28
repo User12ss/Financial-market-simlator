@@ -11,16 +11,26 @@ import { el, svg, clear, fill, showTip, hideTip, usd, num, signedPct } from "./d
 import { ticks } from "./charts.js";
 import { STEPS, lean, reached, stepText } from "./decisions.js";
 import {
-  BARS_ON_SCREEN, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, readings, readouts,
+  BARS_ON_SCREEN, facts, fanOf, fanText, focusOf, gauges, headline, lastBars, levelText, levelsOf, plot, readings, readouts,
   sectors, sinceText, sinceThen, sparkOf, sparkPath, trendPlot, yieldCurve,
 } from "./market.js";
 import { replay } from "./motion.js";
+import { chartZoom } from "./zoom.js";
 import { english, t } from "./i18n.js";
 
 const STEP = { view: t("观点"), debate: t("辩论"), ruling: t("裁决"), proposal: t("提案"), check: t("检查"), risk: t("风控"), order: t("下单") };
 const ARROW = { up: "▲ ", down: "▼ ", stop: "✕ ", flat: "" };
 const SIZE = { width: 440, height: 150 };
-const GUTTER = 50;                    // room at the right of a chart for its prices
+const BIG = { width: 1100, height: 520 };                 // an enlarged chart, where the page cannot be measured
+// How a chart is set out at the two sizes it is drawn at: on the screen in the room, and enlarged.
+//  - gutter: room at the right for its prices;  axis: room along the bottom for its days (the screen has none);
+//  - letter: how wide a Chinese and a Latin letter of its labels are taken to be.
+const LOOK = {
+  small: { big: false, gutter: 50, axis: 0, ticks: 4, average: 46, tag: 16, letter: [10, 6.1], drop: 3.5, ring: 6, dot: 2.6, top: 10 },
+  big: { big: true, gutter: 72, axis: 24, ticks: 8, average: 120, tag: 20, letter: [12.5, 7.6], drop: 4.3, ring: 8, dot: 3.4, top: 14 },
+};
+const DAY_APART = 64;                 // the days written under an enlarged chart stand at least this far apart
+const DAY_TAG = 92;                   // how wide the mark is that names the day pointed at
 const AFTER_ON_SCREEN = 30;
 const STEPS_ON_SCREEN = 4;
 const WHY = {
@@ -44,15 +54,16 @@ export function shares(count) {
 /**
  * One session of a chart in a line, as a terminal's legend gives it: the day, its open, high, low and close, the
  * change from the close before, and the volume. `bars` are the chart's sessions in order and `at` the one meant.
+ * `whole` writes the day with its year, where there is room for it.
  */
-export function legendOf(bars, at) {
+export function legendOf(bars, at, whole = false) {
   const bar = bars[at], before = at > 0 ? bars[at - 1] : null;
   const change = before ? bar.close - before.close : null;
   const lean = change === null || change === 0 ? "flat" : change > 0 ? "up" : "down";
   const tone = lean === "flat" ? null : lean;
   const sign = change > 0 ? "+" : change < 0 ? "−" : "";
   return [
-    el("span", { class: "legend-day", text: `${bar.date.slice(5)}${bar.after ? t(" · 之后") : ""}` }),
+    el("span", { class: "legend-day", text: `${whole ? bar.date : bar.date.slice(5)}${bar.after ? t(" · 之后") : ""}` }),
     ...[[t("开"), bar.open], [t("高"), bar.high], [t("低"), bar.low], [t("收"), bar.close]].map(([label, value]) =>
       el("span", {}, el("small", { text: label }), el("b", { class: tone, text: num(value, 2) }))),
     change === null ? null : el("b", { class: tone, text: `${ARROW[lean]}${sign}${num(Math.abs(change), 2)} (${signedPct((change / before.close) * 100)})` }),
@@ -142,42 +153,58 @@ function curveChart(market) {
 }
 
 export function marketScreen({ personas }) {
-  const state = { market: null, shown: null, size: { ...SIZE }, context: null };
+  // `more`: an enlarged chart shows every session the snapshot sent, not only as many as the screen does.
+  const state = { market: null, shown: null, size: { ...SIZE }, context: null, more: false };
   const head = el("div", { class: "holo-head" });
   const body = el("div", { class: "holo-body" });
   const foot = el("div", { class: "holo-foot" });
   const node = el("section", { class: "holo", "aria-label": t("行情屏") }, head, body, foot);
+  // The screen's chart of a ticker, brought up large while the pointer rests on it (zoom.js).
+  const zoom = chartZoom({ draw: enlarged });
 
   /**
    * A ticker's bars as candles. `levels` are the prices the record has put on it so far; `after` joins on what
-   * came later; `fan` is the quant engineer's forecast, once its line has been reached.
+   * came later; `fan` is the quant engineer's forecast, once its line has been reached. `look` is how it is set
+   * out: as on the screen, or enlarged, which adds the days along the bottom and a hair across with its price.
    */
-  function candleChart(ticker, before, later, levels, marks, { width, height }, fan = null, onBar = null) {
-    const inner = Math.max(120, width - GUTTER);
-    const drawn = plot(before, later, levels, { width: inner, height, fan });
+  function candleChart(ticker, before, later, levels, marks, { width, height }, fan = null, onBar = null, look = LOOK.small) {
+    const inner = Math.max(120, width - look.gutter);
+    const tall = height - look.axis;                       // the plot itself: under it an enlarged chart writes its days
+    const drawn = plot(before, later, levels, { width: inner, height: tall, fan });
     const inside = (price) => price <= drawn.high && price >= drawn.low;
     const today = drawn.candles[before.length - 1];
     const frame = svg("svg", {
-      class: "candles", viewBox: `0 0 ${width} ${height}`, role: "img",
+      class: look.big ? "candles big" : "candles", viewBox: `0 0 ${width} ${height}`, role: "img",
       "aria-label": t`${ticker} 最近 ${before.length} 个交易日的日 K 线，这一场的收盘价 ${usd(today.close)}`
         + (later.length ? t`，后面接着之后 ${later.length} 个交易日` : "")
         + (drawn.fan ? t`。右侧是预测的分布：${fanText(drawn.fan.points[drawn.fan.points.length - 1])}` : ""),
     });
-    for (const price of ticks(drawn.low, drawn.high, 4).filter(inside)) {
+    for (const price of ticks(drawn.low, drawn.high, look.ticks).filter(inside)) {
       frame.append(svg("line", { class: "grid-line", x1: 0, x2: inner, y1: drawn.y(price), y2: drawn.y(price) }),
-        svg("text", { class: "price", x: inner + 6, y: drawn.y(price) + 3.5, text: num(price, 2) }));
+        svg("text", { class: "price", x: inner + 6, y: drawn.y(price) + look.drop, text: num(price, 2) }));
     }
     // The months along the bottom: a mark where each begins, as on any terminal's time axis.
     drawn.candles.forEach((bar, at) => {
       const month = bar.date.slice(0, 7);
       if (at === 0 || drawn.candles[at - 1].date.slice(0, 7) === month) return;
-      frame.append(svg("line", { class: "month-line", x1: bar.x, x2: bar.x, y1: 0, y2: height }),
-        svg("text", { class: "month", x: bar.x + 3, y: height - 2, text: english ? MONTHS[Number(bar.date.slice(5, 7)) - 1] : t`${Number(bar.date.slice(5, 7))}月` }));
+      frame.append(svg("line", { class: "month-line", x1: bar.x, x2: bar.x, y1: 0, y2: tall }));
+      if (look.big) return;                                // an enlarged chart writes its days, which name their month
+      frame.append(svg("text", { class: "month", x: bar.x + 3, y: height - 2, text: english ? MONTHS[Number(bar.date.slice(5, 7)) - 1] : t`${Number(bar.date.slice(5, 7))}月` }));
     });
+    // Enlarged, the days are written under the plot: as many as fit without running into each other, counted
+    // back from the latest so that it is always among them.
+    if (look.big) {
+      frame.append(svg("line", { class: "axis-line", x1: 0, x2: inner, y1: tall, y2: tall }));
+      const every = Math.max(1, Math.ceil(DAY_APART / drawn.step));
+      drawn.candles.forEach((bar, at) => {
+        if ((drawn.candles.length - 1 - at) % every !== 0 || bar.x < 20) return;
+        frame.append(svg("text", { class: "day", x: bar.x, y: height - 7, "text-anchor": "middle", text: bar.date.slice(5) }));
+      });
+    }
     if (drawn.cut !== null) {
-      frame.append(svg("rect", { class: "after-zone", x: drawn.cut, y: 0, width: inner - drawn.cut, height }),
-        svg("line", { class: "cut", x1: drawn.cut, x2: drawn.cut, y1: 0, y2: height }),
-        svg("text", { class: "cut-label", x: drawn.cut + 4, y: 10, text: t("之后的实际走势（当时看不到）") }));
+      frame.append(svg("rect", { class: "after-zone", x: drawn.cut, y: 0, width: inner - drawn.cut, height: tall }),
+        svg("line", { class: "cut", x1: drawn.cut, x2: drawn.cut, y1: 0, y2: tall }),
+        svg("text", { class: "cut-label", x: drawn.cut + 4, y: look.top, text: t("之后的实际走势（当时看不到）") }));
     }
     // The forecast, under the candles: what was recorded afterwards is drawn over it, so the two can be compared.
     if (drawn.fan) {
@@ -205,43 +232,87 @@ export function marketScreen({ personas }) {
         class: "swing", x: today.x, y: top, width: Math.max(0, (drawn.cut ?? inner) - today.x), height: Math.max(0, base - top),
       }));
     }
+    // A recorded average is one level, the session's: a short line ending at the session, never a curve through
+    // the days before it, which the snapshot does not hold. Enlarged, its value is written beside its name.
+    const named = [];
     for (const line of marks.lines.filter((average) => inside(average.price))) {
-      frame.append(svg("line", { class: `avg ${line.key}`, x1: Math.max(0, today.x - 46), x2: today.x, y1: drawn.y(line.price), y2: drawn.y(line.price) }),
-        svg("text", { class: "avg-label", x: Math.max(0, today.x - 46), y: drawn.y(line.price) - 3, text: line.key.replace("sma", "MA") }));
+      const from = Math.max(0, today.x - look.average), name = line.key.replace("sma", "MA");
+      const label = svg("text", { class: "avg-label", x: from, y: drawn.y(line.price) - 3, text: look.big ? `${name} ${num(line.price, 2)}` : name });
+      frame.append(svg("line", { class: `avg ${line.key}`, x1: from, x2: today.x, y1: drawn.y(line.price), y2: drawn.y(line.price) }));
+      // Enlarged, the name is long enough to lie across candles: it is written over them, not under.
+      if (look.big) named.push(label);
+      else frame.append(label);
     }
     drawn.candles.forEach((bar, at) => {
       const kind = `${bar.up ? "up" : "down"}${bar.after ? " after" : ""}`;
       const top = Math.min(bar.yOpen, bar.yClose);
       frame.append(svg("g", { class: `candle ${kind}`, style: `--i: ${at}` },
-        svg("rect", { class: "vol", x: bar.x - bar.w / 2, y: bar.yVolume, width: bar.w, height: Math.max(0, height - bar.yVolume) }),
+        svg("rect", { class: "vol", x: bar.x - bar.w / 2, y: bar.yVolume, width: bar.w, height: Math.max(0, tall - bar.yVolume) }),
         svg("line", { class: "wick", x1: bar.x, x2: bar.x, y1: bar.yHigh, y2: bar.yLow }),
         svg("rect", { class: "body", x: bar.x - bar.w / 2, y: top, width: bar.w, height: Math.max(1, Math.abs(bar.yOpen - bar.yClose)) })));
     });
+    frame.append(...named);
     // Two levels at nearly the same price (the analyst's stop and the one the order carries, say) would be written
     // one over the other: the later one is written after the earlier, on the same line.
     const written = [];
     for (const level of drawn.levels.filter((placed) => !placed.off)) {
       const text = levelText(level);
-      const x = 4 + written.filter((other) => Math.abs(other.y - level.y) < 11).reduce((sum, other) => sum + other.width + 12, 0);
-      written.push({ y: level.y, width: Array.from(text).reduce((sum, letter) => sum + (letter.charCodeAt(0) > 255 ? 10 : 6.1), 0) });
+      const [han, latin] = look.letter;
+      const x = 4 + written.filter((other) => Math.abs(other.y - level.y) < han + 1).reduce((sum, other) => sum + other.width + 12, 0);
+      written.push({ y: level.y, width: Array.from(text).reduce((sum, letter) => sum + (letter.charCodeAt(0) > 255 ? han : latin), 0) });
       frame.append(svg("line", { class: `level ${level.kind}`, x1: 0, x2: inner, y1: level.y, y2: level.y }),
         svg("text", { class: `level-label ${level.kind}`, x, y: level.y - 4, text }));
     }
-    frame.append(svg("circle", { class: "last-ring", cx: today.x, cy: today.yClose, r: 6 }),
-      svg("circle", { class: "last-dot", cx: today.x, cy: today.yClose, r: 2.6 }),
-      svg("rect", { class: "last-tag", x: inner + 2, y: today.yClose - 8, width: GUTTER - 4, height: 16, rx: 3 }),
-      svg("text", { class: "last-price", x: inner + 6, y: today.yClose + 3.8, text: num(today.close, 2) }));
+    frame.append(svg("circle", { class: "last-ring", cx: today.x, cy: today.yClose, r: look.ring }),
+      svg("circle", { class: "last-dot", cx: today.x, cy: today.yClose, r: look.dot }),
+      svg("rect", { class: "last-tag", x: inner + 2, y: today.yClose - look.tag / 2, width: look.gutter - 4, height: look.tag, rx: 3 }),
+      svg("text", { class: "last-price", x: inner + 6, y: today.yClose + look.drop + 0.3, text: num(today.close, 2) }));
     // One strip per session to point at: the day and its open, high, low, close and volume.
-    const hair = svg("line", { class: "hair", y1: 0, y2: height, visibility: "hidden" });
+    const hair = svg("line", { class: "hair", y1: 0, y2: tall, visibility: "hidden" });
     frame.append(hair);
+    // Enlarged, a second hair runs across, with the price it lies at written on the scale at the right, and the
+    // day pointed at is written on the lower edge. That price is read off the scale where the pointer is: it is a
+    // place on the chart, not a figure of the record, and is written nowhere else.
+    const cross = look.big ? {
+      line: svg("line", { class: "cross", x1: 0, x2: inner, visibility: "hidden" }),
+      tag: svg("rect", { class: "cross-tag", x: inner + 2, width: look.gutter - 4, height: look.tag, rx: 3, visibility: "hidden" }),
+      price: svg("text", { class: "cross-price", x: inner + 6, visibility: "hidden" }),
+      dayTag: svg("rect", { class: "day-tag", y: tall + 2, width: DAY_TAG, height: look.axis - 4, rx: 3, visibility: "hidden" }),
+      day: svg("text", { class: "day-text", y: height - 7, "text-anchor": "middle", visibility: "hidden" }),
+    } : null;
+    if (cross) frame.append(cross.line, cross.tag, cross.price, cross.dayTag, cross.day);
+    const mark = (parts, on) => parts.forEach((part) => part.setAttribute("visibility", on ? "visible" : "hidden"));
+    function aim(bar, pointer) {
+      const box = frame.getBoundingClientRect();
+      const y = box.height ? (pointer.clientY - box.top) * (height / box.height) : NaN;
+      const priced = y >= 0 && y <= drawn.bottom;            // among the candles: below them are the volume bars
+      if (priced) {
+        cross.line.setAttribute("y1", y);
+        cross.line.setAttribute("y2", y);
+        cross.tag.setAttribute("y", y - look.tag / 2);
+        cross.price.setAttribute("y", y + look.drop + 0.3);
+        cross.price.textContent = num(drawn.high - (y / drawn.bottom) * (drawn.high - drawn.low), 2);
+      }
+      mark([cross.line, cross.tag, cross.price], priced);
+      const x = Math.min(inner - DAY_TAG / 2, Math.max(DAY_TAG / 2, bar.x));
+      cross.dayTag.setAttribute("x", x - DAY_TAG / 2);
+      cross.day.setAttribute("x", x);
+      cross.day.textContent = bar.date;
+      mark([cross.dayTag, cross.day], true);
+    }
     drawn.candles.forEach((bar, at) => {
-      const strip = svg("rect", { class: "hit", x: bar.x - drawn.step / 2, y: 0, width: drawn.step, height });
+      const strip = svg("rect", { class: "hit", x: bar.x - drawn.step / 2, y: 0, width: drawn.step, height: tall });
       strip.addEventListener("pointermove", (pointer) => {
-        showTip(pointer.clientX, pointer.clientY,
-          `${ticker} · ${bar.date}${bar.after ? t(" · 这一场之后") : ""}`, [
-            { value: usd(bar.open), name: t("开盘") }, { value: usd(bar.high), name: t("最高") }, { value: usd(bar.low), name: t("最低") },
-            { value: usd(bar.close), name: t("收盘") }, { value: num(bar.volume), name: t("成交量（股）") },
-          ]);
+        // On the screen a box by the pointer says the session's figures. Enlarged, the line along the top does
+        // (`onBar`), and nothing is laid over the candles being read.
+        if (cross) aim(bar, pointer);
+        else {
+          showTip(pointer.clientX, pointer.clientY,
+            `${ticker} · ${bar.date}${bar.after ? t(" · 这一场之后") : ""}`, [
+              { value: usd(bar.open), name: t("开盘") }, { value: usd(bar.high), name: t("最高") }, { value: usd(bar.low), name: t("最低") },
+              { value: usd(bar.close), name: t("收盘") }, { value: num(bar.volume), name: t("成交量（股）") },
+            ]);
+        }
         hair.setAttribute("x1", bar.x);
         hair.setAttribute("x2", bar.x);
         hair.setAttribute("visibility", "visible");
@@ -250,6 +321,7 @@ export function marketScreen({ personas }) {
       strip.addEventListener("pointerleave", () => {
         hideTip();
         hair.setAttribute("visibility", "hidden");
+        if (cross) mark(Object.values(cross), false);
         if (onBar) onBar(drawn.candles, before.length - 1);            // back to the session of the meeting
       });
       frame.append(strip);
@@ -275,53 +347,132 @@ export function marketScreen({ personas }) {
     return frame;
   }
 
-  function showTicker(ticker, context) {
+  /** The snapshot's own record of a ticker, when it holds a price and bars to draw. */
+  const charted = (ticker) => {
     const item = state.market.tickers[ticker];
-    if (!item || !item.price || item.bars.dates.length === 0) {
+    return item && item.price && item.bars.dates.length > 0 ? item : null;
+  };
+
+  /**
+   * What the record has put on a ticker's chart by the line being played, and what came after it: the same for
+   * the screen and for the chart enlarged, so that neither is ever ahead of the other, or of the record.
+   */
+  function drawnSoFar(ticker, item, context) {
+    const row = context.rows.get(ticker) || null;
+    const since = context.ended ? sinceThen(item) : null;
+    return {
+      row, since, levels: levelsOf(row, context.events, context.index), fan: fanOf(ticker, context.events, context.index),
+      after: since && item.after ? lastBars(item.after, Infinity) : [],
+      // How far this ticker's decision has got, step by step.
+      steps: row ? STEPS.filter((name) => reached(row[name], context.index)) : [],
+    };
+  }
+
+  const stepRow = (row, steps, context) => el("div", { class: "holo-steps" }, steps.map((name) => {
+    const way = lean(name, row[name]);
+    return el("span", { class: "holo-step", "data-lean": way },
+      el("small", { text: STEP[name] }), `${ARROW[way]}${stepText(name, row[name], { brief: true, upTo: context.index })}`);
+  }));
+
+  /** What is said under a chart: levels too far off to be drawn, what a fan is, and what the price did afterwards. */
+  const notesUnder = (far, fan, since, context) => el("div", { class: "holo-notes" },
+    far.map((level) => el("span", { class: `note-level ${level.kind}`, text: levelText(level) })),
+    fan ? el("span", { class: "note-fan", text: t("扇形是量化工程师（代码）记录的预测：一种分布，不是会走出来的路线。") }) : null,
+    since ? el("span", { class: `note-since ${since.lean}`, text: sinceText(since) }) : null,
+    context.ended && !since ? el("span", { class: "muted", text: t("这一场之后还没有新的交易日记录。") }) : null);
+
+  /** A ticker on the screen. Returns its chart's box when there is a chart, for the zoom to watch. */
+  function showTicker(ticker, context) {
+    const item = charted(ticker);
+    if (!item) {
       head.append(el("span", { class: "holo-tag", text: ticker }), el("span", { class: "holo-name", text: t("这只股票不在这一场的行情快照里") }));
       body.append(el("p", { class: "holo-empty", text: t("这一场的候选和持仓里没有它（多半是之前的订单在今天成交或撤回），所以没有它的 K 线可看。") }));
-      return;
+      return null;
     }
     const day = readouts(item)[1];
     head.append(
       el("span", { class: "holo-tag", text: ticker }),
       el("span", { class: "holo-name", text: [item.name, item.sector].filter(Boolean).join(" · ") }),
       el("span", { class: "holo-price" }, el("b", { text: usd(item.price.close) }), move(day)));
-    const row = context.rows.get(ticker) || null;
-    const levels = levelsOf(row, context.events, context.index);
-    const since = context.ended ? sinceThen(item) : null;
-    // How far this ticker's decision has got by the line being played, beside its price: the latest few steps
-    // (the trail under the room has all of them).
-    const steps = row ? STEPS.filter((name) => reached(row[name], context.index)).slice(-STEPS_ON_SCREEN) : [];
-    if (steps.length) {
-      body.append(el("div", { class: "holo-steps" }, steps.map((name) => {
-        const way = lean(name, row[name]);
-        return el("span", { class: "holo-step", "data-lean": way },
-          el("small", { text: STEP[name] }), `${ARROW[way]}${stepText(name, row[name], { brief: true, upTo: context.index })}`);
-      })));
-    }
-    const later = since && item.after ? lastBars(item.after, Infinity).slice(0, AFTER_ON_SCREEN) : [];
-    const fan = fanOf(ticker, context.events, context.index);
+    const { row, since, levels, fan, after, steps } = drawnSoFar(ticker, item, context);
+    // Beside its price, the latest few steps of its decision (the trail under the room has all of them).
+    if (steps.length) body.append(stepRow(row, steps.slice(-STEPS_ON_SCREEN), context));
+    const later = after.slice(0, AFTER_ON_SCREEN);
     const ahead = fan ? fan.bands[fan.bands.length - 1].sessions : 0;
     const before = lastBars(item.bars, BARS_ON_SCREEN - Math.max(later.length, ahead));
     // A level too far from the candles to be drawn among them is named under the chart instead.
     const far = plot(before, later, levels, SIZE).levels.filter((level) => level.off);
     const plotBox = el("div", { class: "holo-plot" });
-    // Over the chart's upper edge, the session in figures: the meeting's own until a day is pointed at.
+    // Over the chart's upper edge, the session in figures: the meeting's own until a day is pointed at. Beside
+    // it, the button that enlarges the chart, for a reader with no pointer to rest on it.
     const legend = el("div", { class: "holo-legend" });
-    body.append(legend, plotBox);
+    const larger = el("button", {
+      type: "button", class: "holo-zoom", title: t("放大这张图。鼠标在图上停一下也会放大。"), onclick: (pointer) => zoom.open(pointer, larger),
+    }, "⤢ ", t("放大"));
+    body.append(el("div", { class: "holo-top" }, legend, larger), plotBox);
     foot.append(
       el("div", { class: "reads" }, readouts(item).slice(2).map((part) =>
         el("span", { class: "read" }, el("small", { text: part.label }), el("b", { class: part.lean === "flat" ? null : part.lean, text: part.text })))),
-      el("div", { class: "holo-notes" },
-        far.map((level) => el("span", { class: `note-level ${level.kind}`, text: levelText(level) })),
-        fan ? el("span", { class: "note-fan", text: t("扇形是量化工程师（代码）记录的预测：一种分布，不是会走出来的路线。") }) : null,
-        since ? el("span", { class: `note-since ${since.lean}`, text: sinceText(since) }) : null,
-        context.ended && !since ? el("span", { class: "muted", text: t("这一场之后还没有新的交易日记录。") }) : null));
+      notesUnder(far, fan, since, context));
     // Drawn last, at the size the screen leaves for it once everything round it is in place.
     const wide = plotBox.clientWidth, tall = plotBox.clientHeight;
     plotBox.append(candleChart(ticker, before, later, levels, gauges(item), wide > 40 && tall > 40 ? { width: wide, height: tall } : SIZE, fan,
       (bars, at) => fill(legend, ...legendOf(bars, at))));
+    return plotBox;
+  }
+
+  /**
+   * The chart on the screen, enlarged (zoom.js asks for it): the same ticker at the same line of the record, with
+   * room for larger candles, every step of its decision, and all the snapshot's figures for it. Returns the
+   * ticker's name, or null when the screen is not showing one ticker's chart.
+   */
+  function enlarged(panel) {
+    const context = state.context;
+    if (!context || !state.market || !state.market.available) return null;
+    const focus = focusOf(context.event, personas);
+    const ticker = focus.kind === "ticker" ? focus.ticker : null;
+    const item = ticker ? charted(ticker) : null;
+    if (!item) return null;
+    const { row, since, levels, fan, after, steps } = drawnSoFar(ticker, item, context);
+    // As many sessions as the screen shows, or every one the snapshot sent: the reader's choice, kept. The days
+    // after the session go by the same choice: no more of them than the screen joins on, or all that were sent.
+    const sent = item.bars.dates.length, few = Math.min(BARS_ON_SCREEN, sent);
+    const before = lastBars(item.bars, state.more ? sent : few);
+    const later = state.more ? after : after.slice(0, AFTER_ON_SCREEN);
+    // (Which levels lie too far off to draw depends on the prices alone, not on the size the chart is drawn at.)
+    const far = plot(before, later, levels, BIG).levels.filter((level) => level.off);
+    const legend = el("div", { class: "zoom-legend" });
+    const plotBox = el("div", { class: "zoom-plot" });
+    const spans = sent > few ? [[few, false], [sent, true]].map(([count, more]) => el("button", {
+      type: "button", class: "zoom-span", "aria-pressed": String(state.more === more), text: t`近 ${count} 个交易日`,
+      onclick: () => {
+        state.more = more;
+        zoom.redraw();
+      },
+    })) : [];
+    panel.append(...[
+      el("div", { class: "zoom-head" },
+        el("span", { class: "holo-tag", text: ticker }),
+        el("span", { class: "holo-name", text: [item.name, item.sector, item.industry].filter(Boolean).join(" · ") }),
+        el("span", { class: "holo-price" }, el("b", { text: usd(item.price.close) }), move(readouts(item)[1])),
+        spans,
+        el("button", { type: "button", class: "zoom-close", text: t("收起"), onclick: () => zoom.close() })),
+      legend,
+      steps.length ? stepRow(row, steps, context) : null,
+      plotBox,
+      el("div", { class: "zoom-foot" },
+        el("div", { class: "zoom-facts" }, facts(item).map((group) => el("div", { class: "fact-group" },
+          el("h4", { text: group.title }),
+          group.items.map((fact) => el("span", { class: "fact", title: fact.hint },
+            el("small", { text: fact.label }), el("b", { class: fact.lean === "flat" ? null : fact.lean, text: fact.text })))))),
+        notesUnder(far, fan, since, context),
+        el("div", { class: "holo-asof", text: t`截至 ${state.market.session} 收盘 · 日线` })),
+    ].filter(Boolean));
+    // Drawn last, at the size the page leaves for it. The line along the top says the session pointed at.
+    const wide = plotBox.clientWidth, tall = plotBox.clientHeight;
+    plotBox.append(candleChart(ticker, before, later, levels, gauges(item), wide > 200 && tall > 120 ? { width: wide, height: tall } : BIG, fan,
+      (bars, at) => fill(legend, ...legendOf(bars, at, true)), LOOK.big));
+    return ticker;
   }
 
   /** The tickers on the portfolio manager's list, side by side, each with what was proposed for it. */
@@ -377,15 +528,23 @@ export function marketScreen({ personas }) {
     if (!state.market || !state.market.available) {
       head.append(el("span", { class: "holo-tag", text: t("行情") }));
       body.append(el("p", { class: "holo-empty", text: state.market ? WHY[state.market.reason] || WHY.no_snapshot : t("正在读这一场的行情快照。") }));
+      zoom.forget();
       return;
     }
     // Put in first and shown last (the style sheet orders it), so a chart is measured with everything round it in place.
     foot.append(el("div", { class: "holo-asof", text: t`截至 ${state.market.session} 收盘 · 日线` }));
     const focus = focusOf(context.event, personas);
-    if (focus.kind === "ticker") showTicker(focus.ticker, context);
+    let chart = null;
+    if (focus.kind === "ticker") chart = showTicker(focus.ticker, context);
     else if (focus.kind === "list") showList(focus.tickers, context);
     else if (focus.kind === "desk") showDesk(personas.get(focus.persona));
     else showOverview();
+    // The chart enlarged goes with the one on the screen: drawn again when that is, and gone when the screen
+    // turns to something that is not one ticker's chart.
+    if (chart) {
+      zoom.watch(chart);
+      zoom.redraw();
+    } else zoom.forget();
   }
 
   /** What the screen would show for this context, as a short text: it is drawn again only when this changes. */
@@ -440,5 +599,8 @@ export function marketScreen({ personas }) {
     }).observe(node);
   }
 
-  return { node, load, show };
+  /** The room is being left: an enlarged chart is not left standing over the next page. */
+  const destroy = () => zoom.forget();
+
+  return { node, load, show, destroy };
 }

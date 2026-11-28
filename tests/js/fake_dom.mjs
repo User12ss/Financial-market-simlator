@@ -91,6 +91,7 @@ export function install() {
     createElementNS: (space, tag) => new FakeNode(tag),
     createTextNode: (text) => Object.assign(new FakeNode("#text"), { textContent: text }),
     getElementById: () => tooltip,
+    body: new FakeNode("body"),
   };
   // Work a page asks to have done again and again is only noted, with whether it was called off: `intervals`.
   const intervals = [];

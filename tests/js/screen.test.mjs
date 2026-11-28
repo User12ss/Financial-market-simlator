@@ -313,3 +313,156 @@ test("the tape runs the tickers and then the market series, twice over so that i
   tape.load(null);
   assert.equal(tape.node.hidden, true);
 });
+
+// ── The chart enlarged ────────────────────────────────────────────────────────
+
+const zoomed = () => globalThis.document.body.children.filter((node) => node.attributes.class === "zoom").pop() || null;
+const enlarge = (screen) => wearing(screen.node, "holo-zoom")[0].listeners.click();
+
+test("a ticker's chart can be enlarged: the same sessions and levels as on the screen, and nothing ahead of the record", () => {
+  const screen = screenOn();
+  screen.show(at(1));
+  const button = wearing(screen.node, "holo-zoom")[0];
+  assert.deepEqual([button.tag, words(button)], ["button", "⤢ 放大"]);
+  // Resting the pointer on the chart does what the button does (the wait itself is the zoom's own test).
+  assert.equal(typeof wearing(screen.node, "holo-plot")[0].listeners.pointermove, "function");
+  assert.equal(zoomed(), null);
+  enlarge(screen);
+  const big = zoomed();
+  assert.equal(big.attributes["aria-label"], "TMO 的 K 线图，放大");
+  assert.deepEqual(wearing(big, "zoom-head")[0].children.slice(0, 3).map(words), ["TMO", "Thermo Fisher · Healthcare", "$100.00▼ −2.55%"]);
+  assert.equal(wearing(big, "candles")[0].attributes.class, "candles big");
+  assert.deepEqual(candles(big).map((bar) => bar.attributes.class), ["candle up", "candle down", "candle down"]);
+  assert.deepEqual(texts(big, "level-label"), ["分析师建议止损 $92.50"]);
+  assert.deepEqual(texts(big, "holo-step"), ["观点▲ 看多 0.80"]);
+  // Along the top, the meeting's own session in figures, with its whole date.
+  assert.equal(words(wearing(big, "zoom-legend")[0]), "2026-11-12开102.00高104.00低90.00收100.00▼ −2.00 (−1.96%)量25");
+  // The recorded averages are named with their values, and the days run along the bottom.
+  assert.deepEqual(texts(big, "avg-label"), ["MA20 98.00", "MA200 90.00"]);
+  assert.deepEqual(texts(big, "day"), ["11-10", "11-11", "11-12"]);
+  assert.deepEqual(texts(big, "holo-asof"), ["截至 2026-11-12 收盘 · 日线"]);
+  // Under it, the snapshot's figures for the ticker.
+  assert.deepEqual(wearing(big, "fact-group").map((group) => words(group.children[0])), ["价格", "指标"]);
+  assert.deepEqual(texts(big, "fact").slice(0, 4), ["收盘价$100.00", "1 日−2.55%", "5 日+1.50%", "1 月0.00%"]);
+  const page = everything(big).join(" | ");
+  for (const later of ["辩论", "裁决", "提案", "买入", "订单止损", "限价", "之后"]) assert.equal(page.includes(later), false, later);
+  // (Figures are looked for in what is written, not among the places things are drawn at, which are numbers too.)
+  const written = words(big) + wearing(big, "candles")[0].attributes["aria-label"];
+  for (const later of ["101.5", "93.00"]) assert.equal(written.includes(later), false, later);
+  assert.deepEqual([texts(big, "note-since"), texts(big, "cut-label"), wearing(big, "after-zone")], [[], [], []]);
+
+  // It follows the record like the screen it came from: one more line, one more level.
+  screen.show(at(6));
+  assert.equal(zoomed(), big);
+  assert.deepEqual(texts(big, "level-label"), ["分析师建议止损 $92.50", "订单止损 $93.00", "限价 $101.50"]);
+  // There is room for every step the decision has taken, not only the latest few.
+  assert.deepEqual(texts(big, "holo-step"), ["观点▲ 看多 0.80", "辩论1 轮", "裁决▲ 持有 0.70", "提案▲ 买入 0.80", "检查接受", "风控批准 10 股"]);
+  assert.equal(candles(big).length, 3);
+  // What came afterwards is joined on only once the record is over, there as on the screen.
+  screen.show(at(7, true));
+  assert.deepEqual(candles(big).map((bar) => bar.attributes.class), ["candle up", "candle down", "candle down", "candle up after", "candle up after"]);
+  assert.deepEqual(texts(big, "note-since"), ["之后 2 个交易日（到 2026-11-16）：$100.00 → $105.00，+5.00%"]);
+  // When the screen turns to something that is not one ticker's chart, the large chart goes.
+  screen.show(at(4));
+  assert.equal(zoomed(), null);
+  assert.deepEqual(wearing(screen.node, "holo-zoom"), []);
+  // And leaving the room takes it away too.
+  screen.show(at(1));
+  enlarge(screen);
+  assert.notEqual(zoomed(), null);
+  screen.destroy();
+  assert.equal(zoomed(), null);
+});
+
+test("pointing at a session of the large chart reads it out along the top and marks its day and price on the axes", () => {
+  const screen = screenOn();
+  screen.show(at(1));
+  enlarge(screen);
+  const big = zoomed();
+  const frame = wearing(big, "candles")[0];
+  const [, , width, height] = frame.attributes.viewBox.split(" ").map(Number);
+  frame.getBoundingClientRect = () => ({ left: 0, top: 0, right: width, bottom: height, width, height });
+  const part = (name) => wearing(frame, name)[0];
+  assert.deepEqual(["hair", "cross", "cross-tag", "cross-price", "day-tag", "day-text"].map((name) => part(name).attributes.visibility),
+    Array(6).fill("hidden"));
+
+  // The level drawn at $92.50 says where that price lies: pointing there reads the same price off the scale.
+  const stop = Number(wearing(frame, "level")[0].attributes.y1);
+  wearing(frame, "hit")[0].listeners.pointermove({ clientX: 40, clientY: stop });
+  assert.equal(words(wearing(big, "zoom-legend")[0]), "2026-11-10开96.00高106.00低94.00收104.00量50");
+  assert.deepEqual([words(part("cross-price")), words(part("day-text"))], ["92.50", "2026-11-10"]);
+  assert.deepEqual(["hair", "cross", "cross-tag", "cross-price", "day-tag", "day-text"].map((name) => part(name).attributes.visibility),
+    Array(6).fill("visible"));
+  assert.equal(Number(part("cross").attributes.y1), stop);
+  assert.equal(tooltip.hidden, true);                         // no floating box over a chart this size: the top line says it
+
+  // Down among the volume bars there is no price to read: the day is still marked.
+  wearing(frame, "hit")[1].listeners.pointermove({ clientX: 400, clientY: height - 40 });
+  assert.deepEqual(["cross", "cross-tag", "cross-price"].map((name) => part(name).attributes.visibility), Array(3).fill("hidden"));
+  assert.deepEqual([part("hair").attributes.visibility, words(part("day-text"))], ["visible", "2026-11-11"]);
+  assert.match(words(wearing(big, "zoom-legend")[0]), /^2026-11-11开104\.00.*▼ −2\.00 \(−1\.92%\)量100$/);
+
+  wearing(frame, "hit")[1].listeners.pointerleave();
+  assert.deepEqual(["hair", "cross", "day-tag", "day-text"].map((name) => part(name).attributes.visibility), Array(4).fill("hidden"));
+  assert.match(words(wearing(big, "zoom-legend")[0]), /^2026-11-12开102\.00/);            // back to the meeting's session
+  screen.destroy();
+});
+
+test("the large chart can show every session the snapshot sent, and keeps that choice as the record moves on", () => {
+  const day = (at) => new Date(Date.UTC(2026, 6, 1 + at)).toISOString().slice(0, 10);
+  const count = 100, flat = Array(count).fill(100);
+  const long = { dates: flat.map((_, at) => day(at)), open: flat, high: flat.map(() => 101), low: flat.map(() => 99), close: flat, volume: flat };
+  const screen = screenOn({ ...MARKET, tickers: { ...MARKET.tickers, TMO: { ...MARKET.tickers.TMO, bars: long, after: null } } });
+  screen.show(at(1));
+  assert.equal(candles(screen.node).length, 60);
+  enlarge(screen);
+  const big = zoomed();
+  const spans = () => wearing(big, "zoom-span");
+  assert.deepEqual(spans().map((chip) => [chip.tag, words(chip), chip.attributes["aria-pressed"]]),
+    [["button", "近 60 个交易日", "true"], ["button", "近 100 个交易日", "false"]]);
+  assert.equal(candles(big).length, 60);
+  spans()[1].listeners.click();
+  assert.equal(candles(big).length, 100);
+  assert.deepEqual(spans().map((chip) => chip.attributes["aria-pressed"]), ["false", "true"]);
+  assert.equal(candles(screen.node).length, 60);               // the screen in the room is as it was
+  screen.show(at(2));
+  assert.equal(candles(big).length, 100);
+  // The days along the bottom are thinned so that they do not run into each other.
+  const days = texts(big, "day");
+  assert.ok(days.length >= 5 && days.length <= 20, String(days.length));
+  // The mark that names the day pointed at stays on the plot at its two ends, where a session lies at the very edge.
+  const frame = wearing(big, "candles")[0], hits = wearing(frame, "hit");
+  const inner = Number(wearing(frame, "axis-line")[0].attributes.x2);
+  const tag = () => {
+    const box = wearing(frame, "day-tag")[0].attributes;
+    return [Number(box.x), Number(box.x) + Number(box.width), words(wearing(frame, "day-text")[0])];
+  };
+  // (This stand-in page has no sizes, so there is no telling how high the pointer is: the day is marked, and no price.)
+  hits[0].listeners.pointermove({ clientX: 1, clientY: 50 });
+  assert.deepEqual([tag(), wearing(frame, "cross")[0].attributes.visibility], [[0, 92, day(0)], "hidden"]);
+  hits[99].listeners.pointermove({ clientX: 1000, clientY: 50 });
+  assert.deepEqual(tag(), [inner - 92, inner, day(99)]);
+  hits[99].listeners.pointerleave();
+  screen.destroy();
+
+  // Once the record is over, the days that followed are joined on: as many as the screen shows of them, or, with
+  // every session chosen, all that were sent.
+  const followed = { through: day(139), dates: flat.slice(0, 40).map((_, at) => day(100 + at)), open: flat.slice(0, 40), high: flat.slice(0, 40),
+    low: flat.slice(0, 40), close: flat.slice(0, 40), volume: flat.slice(0, 40) };
+  const over = screenOn({ ...MARKET, tickers: { ...MARKET.tickers, TMO: { ...MARKET.tickers.TMO, bars: long, after: followed } } });
+  over.show(at(7, true));
+  const tally = (node) => [candles(node).length, candles(node).filter((bar) => bar.attributes.class.includes("after")).length];
+  assert.deepEqual(tally(over.node), [60, 30]);
+  enlarge(over);
+  assert.deepEqual(tally(zoomed()), [90, 30]);                 // the screen's sixty sessions in full, and its thirty days after
+  wearing(zoomed(), "zoom-span")[1].listeners.click();
+  assert.deepEqual(tally(zoomed()), [140, 40]);
+  over.destroy();
+
+  // With no more sessions on record than the screen already shows, there is nothing to choose.
+  const short = screenOn();
+  short.show(at(1));
+  enlarge(short);
+  assert.deepEqual(wearing(zoomed(), "zoom-span"), []);
+  short.destroy();
+});

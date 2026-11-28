@@ -839,6 +839,7 @@ export function meetingRoom({ roster }) {
     window.clearTimeout(state.timer);
     typed.finish();
     hideTip();
+    screen.destroy();
     if (keyed) document.removeEventListener("keydown", onKey);
   }
 

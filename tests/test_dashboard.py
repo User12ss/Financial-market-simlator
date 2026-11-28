@@ -203,7 +203,7 @@ def test_the_page_has_nothing_that_could_send_a_change(client):
     assert set(scripts) == {
         "app.js", "backdrop.js", "brief.js", "charts.js", "day.js", "decisions.js", "dom.js", "emblems.js", "en.js", "figures.js", "i18n.js", "links.js",
         "live.js", "market.js", "meeting.js", "motion.js", "network.js", "pages.js", "plans.js", "playback.js", "screen.js",
-        "tape.js", "team.js", "trail.js"}
+        "tape.js", "team.js", "trail.js", "zoom.js"}
     everything = "\n".join(scripts.values())
     # One place asks the server for anything, and it only reads.
     assert [name for name, text in scripts.items() if "fetch(" in text] == ["dom.js"]
@@ -220,13 +220,14 @@ def test_the_pages_own_logic_passes_its_tests():
     """Playback, keeping a room in step with a live run, how a decision came about, how the trail shows it line
     by line, which run the 决策 page reads, what the market screens show and when, each figure's panel, text
     kept as text and revealed unchanged, number formats, seats, a check-in of the desk read off its record, the
-    strip of the day's meetings, and the meeting at a glance with the links between its seats: tests/js, run by
-    node."""
+    strip of the day's meetings, the meeting at a glance with the links between its seats, and a chart enlarged
+    while the pointer rests on it: tests/js, run by node."""
     files = sorted(path.name for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     assert files == ["checkin.test.mjs", "day.test.mjs", "decisions.test.mjs", "decisions_page.test.mjs",
                      "dom.test.mjs", "english.test.mjs", "forecasts_page.test.mjs", "format.test.mjs", "links.test.mjs", "live.test.mjs",
                      "market.test.mjs", "motion.test.mjs", "plans_page.test.mjs",
-                     "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "team.test.mjs", "trail.test.mjs"]
+                     "playback.test.mjs", "room.test.mjs", "screen.test.mjs", "team.test.mjs", "trail.test.mjs",
+                     "zoom.test.mjs"]
     result = subprocess.run([NODE, "--test", *(f"tests/js/{name}" for name in files)],
                             cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
