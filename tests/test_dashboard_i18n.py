@@ -172,14 +172,13 @@ def test_the_names_the_server_sends_have_their_english_too():
     from dashboard import personas
 
     table = english()
-    sent = {personas.NARRATOR["title"], personas.NEWS_DESK["title"], personas.QUANT["title"], personas.SCENARIO["title"],
-            personas.EVERYONE["title"]} | {title for _, title in personas.STAGES}
+    sent = {personas.NARRATOR["title"], personas.EVERYONE["title"]} | {title for _, title in personas.STAGES}
     for seat in personas.ROSTER:
         sent |= {seat.title, seat.group, seat.does, *seat.craft}
     assert sorted(sent - set(table)) == []
     # Two seats never share an English name: a reader must be able to tell them apart.
     names = [table[seat.title] for seat in personas.ROSTER]
-    assert len(set(names)) == len(names) == 14
+    assert len(set(names)) == len(names) == 17
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed, so the page's own logic cannot be run here")
@@ -195,6 +194,8 @@ def test_the_sentences_the_server_composes_come_out_in_english(tmp_path):
         "10 条提案：买入 2，卖出 0，减仓 0，持有 8", "提案：接受 10，拒绝 0；订单：批准 0，削减 2，拒绝 0",
         "成交 2 笔，下单 2 张", "3 条更新：不变 2，加强 1，削弱 0，不成立 0", "3 条决定：保留 3，减仓 0，卖出 0，撤回买单 0",
         "留给收盘会 1 条，撤回买单 0 张，下单 0 张", "账本读不了：database is locked", "账本里没有这套模型配置的记录。",
+        "2 只股票有新情况，数据缺口 1 处，计划条件成立 1 条", "预测 10 只，倒推 3 只，推演 1 只",
+        "看了 7 只股票，提出事件 2 个，另有 1 个被退回",
         "还没有账本：每日流程还没有运行过。",
     ]
     script = tmp_path / "say.mjs"

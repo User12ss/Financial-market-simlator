@@ -112,3 +112,76 @@ test("fourteen people stand evenly round the room, the first at the top, opposit
   assert.ok(places[0].scale < places[3].scale && places[3].scale < places[7].scale);
   assert.deepEqual(places.map((place) => place.side), [0, 0, 1, 1, 1, 1, 0, 0, 0, -1, -1, -1, -1, 0]);
 });
+
+// The meeting room says how much room one figure needs, and seats are then spaced by need, not evenly.
+const ROOM = { cx: 500, cy: 352, rx: 400, ry: 232, person: { wide: 100, tall: 125 } };
+
+test("seventeen figures fit in the room at full size: closer along the top and bottom, further apart at the two ends", () => {
+  const places = seats(17, ROOM);
+  const near = (a, b, within = 1) => Math.abs(a - b) <= within;
+  assert.equal(places.length, 17);
+  assert.ok(near(places[0].x, 500) && near(places[0].y, 352 - 232));              // seat 0: still the top
+
+  // Seat n and seat 17 - n stand at the same height on the two sides of the room.
+  for (let seat = 1; seat <= 8; seat += 1) {
+    const [right, left] = [places[seat], places[17 - seat]];
+    assert.ok(right.x > 500 && near(right.x + left.x, 1000, 2) && near(right.y, left.y, 2), `seat ${seat}`);
+    assert.ok(near(right.scale, left.scale, 0.01) && right.side === -left.side, `seat ${seat}`);
+  }
+  // Nobody stands at the very front, where the reader's own desk is: the two nearest stand either side of it.
+  assert.ok(places[8].y > 570 && places[9].y > 570 && places[8].x - places[9].x > 100);
+
+  // Nobody is drawn smaller for it: the room holds seventeen at the size it held fourteen.
+  const fourteen = seats(14, { cx: 500, cy: 352, rx: 400, ry: 232 });
+  assert.ok(near(places[0].scale, fourteen[0].scale, 0.001) && near(places[8].scale, 1.24, 0.01));
+
+  // A figure is a hundred units tall at scale 1, with a sign over its head. Where one stands over another, the
+  // lower one's head is clear of the upper one's feet; side by side, there is room for a name under each.
+  let over = 0;
+  places.forEach((place, seat) => {
+    const next = places[(seat + 1) % 17];
+    const [upper, lower] = place.y <= next.y ? [place, next] : [next, place];
+    const apart = Math.abs(next.x - place.x);
+    if (apart < 45) {                                                              // one over the other
+      over += 1;
+      assert.ok(lower.y - upper.y - 100 * lower.scale >= 15, `seats ${seat} and ${seat + 1} stand on each other`);
+    } else if (!place.side && !next.side && Math.abs(next.y - place.y) < 20) {     // side by side, names on one line
+      assert.ok(apart >= 100, `seats ${seat} and ${seat + 1} are only ${apart.toFixed(0)} apart`);
+    }
+  });
+  assert.equal(over, 2);                                                           // one pair at each end of the room
+
+  // A name goes under its figure unless the next one towards the front stands there: only the two at each
+  // end of the room carry theirs beside them, on the outer side.
+  assert.deepEqual(places.map((place) => place.side), [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0]);
+});
+
+test("spaced evenly, seventeen would stand on each other at the two ends of the room", () => {
+  // What the room's own spacing is for. Evenly round the same edge, the pair at each end overlap.
+  const places = seats(17, { cx: 500, cy: 352, rx: 400, ry: 232 });
+  const [upper, lower] = [places[4], places[5]];
+  assert.ok(Math.abs(upper.x - lower.x) < 45 && lower.y - upper.y - 100 * lower.scale < 0);
+});
+
+test("more figures than the room holds at full size are all drawn smaller by the same share", () => {
+  const [fits, crowded] = [seats(17, ROOM), seats(24, ROOM)];
+  const share = crowded[0].scale / fits[0].scale;
+  assert.ok(share > 0.7 && share < 0.85, `drawn at ${share.toFixed(3)}`);
+  assert.ok(Math.abs(crowded[12].scale - 1.24 * share) < 0.01);                    // seat 12 of 24: the very front
+  assert.ok(seats(18, ROOM)[0].scale === fits[0].scale);                           // eighteen still fit
+});
+
+test("a room of one or two is laid out like any other, and no number of people breaks the two sides' symmetry", () => {
+  assert.deepEqual(seats(1, ROOM).map((place) => [Math.round(place.x), Math.round(place.y), place.side]), [[500, 120, 0]]);
+  const two = seats(2, ROOM);
+  assert.ok(Math.abs(two[1].x - 500) < 1 && Math.abs(two[1].y - 584) < 1 && two.every((place) => place.side === 0));
+  for (const count of [7, 17, 24, 30]) {
+    const places = seats(count, ROOM);
+    // The one at the top, in the middle, has no outer side to carry a name on: it stays under, however crowded.
+    assert.equal(places[0].side, 0, `${count} seats`);
+    for (let seat = 1; seat < count; seat += 1) {
+      assert.ok(places[seat].side === -places[count - seat].side || (places[seat].side === 0 && places[count - seat].side === 0),
+        `${count} seats, seat ${seat}`);
+    }
+  }
+});

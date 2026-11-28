@@ -218,3 +218,38 @@ test("each figure in the room carries the mark of its field beside its name", ()
     assert.ok(marks[0].children.length >= 1 && marks[0].children.every((line) => line.tag === "path"));
   }
 });
+
+test("the screen in the middle of the room hides nobody's name", async () => {
+  const { ROOM, SCREEN } = await import("../../dashboard/static/js/meeting.js");
+  const { seats, NAME } = await import("../../dashboard/static/js/figures.js");
+  // A name under a figure is as wide as the room one figure is given, and NAME deep below its feet.
+  const behind = (screen) => seats(17, ROOM).map((place, seat) => ({ ...place, seat }))
+    .filter((place) => !place.side && place.x + ROOM.person.wide / 2 > screen.left && place.x - ROOM.person.wide / 2 < screen.right
+      && place.y + NAME > screen.top && place.y < screen.bottom)
+    .map((place) => place.seat);
+  assert.deepEqual(behind(SCREEN), []);
+  // Where the screen's upper edge was while fourteen stood here, the third from the top on either side lost theirs.
+  assert.deepEqual(behind({ ...SCREEN, top: 0.2425 * ROOM.height }), [2, 15]);
+});
+
+test("a figure that has spoken is never said not to have, whether or not its lines add up to a sign", () => {
+  const roster = [...ROSTER, figure("quant_engineer", "量化工程师", 7, { kind: "rule", group: "量化", emblem: "bell" })];
+  const events = [
+    said("forecast", "quant_engineer", "all", "market_state", null, "Calm 0.28, turbulent 0.72.", { states: ["calm", "turbulent"], now: [0.28, 0.72] }),
+    said("forecast", "quant_engineer", "all", "forecast", "TMO", "TMO: the middle of the band is 101.20 in 5 sessions.", {}),
+  ];
+  const room = meetingRoom({ roster });
+  room.load({ ...MEETING, run: { ...MEETING.run, run_id: "run-q" }, events, today: { quant_engineer: "预测 1 只，倒推 0 只，推演 0 只" } });
+  room.setMarket(MARKET);
+  pick(room, "quant_engineer");
+
+  room.seek(-1);
+  assert.match(words(panel(room)), /到这一句为止，还没有发言。/);
+  room.seek(0);                                                // spoken, with nothing yet that a sign counts
+  assert.doesNotMatch(words(panel(room)), /还没有发言/);
+  assert.match(words(panel(room)), /最近一句（原话）Calm 0\.28, turbulent 0\.72\./);
+  room.seek(1);                                                // a sign now, and still its own last line under it
+  assert.match(words(panel(room)), /到这一句为止的结论预测 1最近一句（原话）TMO: the middle of the band is 101\.20 in 5 sessions\./);
+  assert.match(words(panel(room)), /整场合计预测 1 只，倒推 0 只，推演 0 只/);
+  assert.doesNotMatch(words(panel(room)), /这一场里没有发言/);
+});

@@ -331,10 +331,23 @@ export function standings(events, index) {
   let board = null;
   const checks = { accepted: 0, rejected: 0 }, gate = { approved: 0, reduced: 0, rejected: 0 };
   const desk = { fills: 0, orders: 0, noted: 0, withdrawn: 0 };
+  const quant = { forecast: 0, backward: 0, rehearsal: 0 };
   const checkin = events.some((event) => event.kind === "briefing");
   events.slice(0, index + 1).forEach((event) => {
     const said = event.payload || {};
-    if (event.kind === "assessment" && MACRO.has(event.speaker)) {
+    if (event.speaker === "news_desk" && event.kind === "briefing") {
+      // What the news desk said of the book when the check-in opened: how many names have something new.
+      signs.news_desk = { text: t`${(said.affected || []).length} 只有新情况`, lean: "flat" };
+    } else if (event.speaker === "quant_engineer" && Object.hasOwn(quant, event.kind)) {
+      // One line of the quant engineer's per name: forecast, worked back, and rehearsed with the proposed events in.
+      quant[event.kind] += 1;
+      const parts = [quant.forecast ? t`预测 ${quant.forecast}` : null, quant.backward ? t`倒推 ${quant.backward}` : null,
+        quant.rehearsal ? t`推演 ${quant.rehearsal}` : null];
+      signs.quant_engineer = { text: parts.filter(Boolean).join(" · "), lean: "flat" };
+    } else if (event.speaker === "scenario_analyst" && event.kind === "proposed_events") {
+      // The events that passed the checks for the name in hand; none is the usual answer.
+      signs.scenario_analyst = { text: t`${event.ticker} 事件 ${(said.events || []).length}`, lean: "flat" };
+    } else if (event.kind === "assessment" && MACRO.has(event.speaker)) {
       signs[event.speaker] = {
         text: `${word("stance", said.stance)} ${two(said.confidence)}`.trim(),
         lean: { supportive: "up", restrictive: "down" }[said.stance] || "flat",

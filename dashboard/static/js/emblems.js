@@ -1,6 +1,7 @@
 // The mark of each figure's field, drawn by code as a few lines: a bank for the
 // central-bank analyst, a yield curve for the bond analyst, scales for the
-// judge, a shield for the risk officer. Decoration only: they carry no data.
+// judge, a shield for the risk officer, a bell curve for the quant engineer.
+// Decoration only: they carry no data.
 
 import { svg } from "./dom.js";
 
@@ -21,6 +22,13 @@ const MARKS = {
   pulse: ["M3 12 H7.5 L9.8 6.5 L13 17.5 L15.4 12 H21"],
   shield: ["M12 3 L19.5 6 V11.5 C19.5 16 16.4 19.3 12 21 C7.6 19.3 4.5 16 4.5 11.5 V6 Z", "M8.8 11.9 L11.2 14.3 L15.4 9.7"],
   ticket: ["M6 5 H18 A2 2 0 0 1 20 7 V17 A2 2 0 0 1 18 19 H6 A2 2 0 0 1 4 17 V7 A2 2 0 0 1 6 5 Z", "M4 10 H20", "M8 13.6 H12 M8 16.2 H15"],
+  // The news desk: a mast sending out what has come in.
+  wire: ["M12 10.2 A1.4 1.4 0 1 0 12 13 A1.4 1.4 0 1 0 12 10.2 Z", "M12 13 V20.5",
+    "M8.3 7.9 A5.2 5.2 0 0 0 8.3 15.3 M15.7 7.9 A5.2 5.2 0 0 1 15.7 15.3", "M5.6 5.2 A9 9 0 0 0 5.6 18 M18.4 5.2 A9 9 0 0 1 18.4 18"],
+  // The quant engineer: a distribution, with its middle marked.
+  bell: ["M3 18.5 C8 18.5 8.6 5.5 12 5.5 C15.4 5.5 16 18.5 21 18.5", "M12 5.5 V18.5", "M3 20.5 H21"],
+  // The scenario analyst: one path that could go three ways.
+  fork: ["M3.5 12 H20.5", "M9 12 C12.5 12 12.5 6 16 6 H20.5", "M9 12 C12.5 12 12.5 18 16 18 H20.5"],
 };
 
 const lines = (id) => (MARKS[id] || []).map((d) => svg("path", { d }));

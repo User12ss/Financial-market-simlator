@@ -92,6 +92,7 @@ def test_with_no_meeting_named_the_page_gets_what_the_desk_is_at_now(tuesday, cl
         "情报", "news_desk", "情报员", False, "所有人")
     assert [e["stage_title"] for e in body["events"]] == ["情报"] * 3 + ["观点"] * 2 + ["提案"] + ["检查"] * 2 + ["下单"]
     assert body["today"] == {
+        "news_desk": "2 只股票有新情况，数据缺口 0 处，计划条件成立 0 条",      # the two names it had a line on, of the three lines it said
         "ticker_analyst": "2 条更新：不变 1，加强 0，削弱 0，不成立 1",
         "portfolio_manager": "2 条决定：保留 1，减仓 0，卖出 1，撤回买单 0",
         "risk_officer": "提案：接受 2，拒绝 0；订单：批准 0，削减 0，拒绝 0",
@@ -360,12 +361,18 @@ def test_each_figures_line_at_a_checkin_is_counted_from_its_own_lines():
         said("trader", "order_withdrawn"), said("trader", "order_placed"),
     ]
     assert today(before_open) == {
+        "news_desk": "0 只股票有新情况，数据缺口 0 处，计划条件成立 0 条",
         "ticker_analyst": "3 条更新：不变 0，加强 1，削弱 2，不成立 0",
         "portfolio_manager": "4 条决定：保留 1，减仓 2，卖出 0，撤回买单 1",
         "risk_officer": "提案：接受 1，拒绝 1；订单：批准 1，削减 0，拒绝 0",
         "trader": "留给收盘会 0 条，撤回买单 1 张，下单 1 张",
     }
-    assert today([said("news_desk", "briefing")]) == {}
+    # The news desk's line: the names it had something new about, what it could not fetch, and the conditions
+    # of a plan it found to hold. Each is one line of its own on the record.
+    assert today([said("news_desk", "briefing")]) == {"news_desk": "0 只股票有新情况，数据缺口 0 处，计划条件成立 0 条"}
+    assert today([said("news_desk", "briefing"), said("news_desk", "data_gap"), said("news_desk", "news"),
+                  said("news_desk", "news"), said("news_desk", "plan_call"), said("news_desk", "no_view")]) == {
+        "news_desk": "2 只股票有新情况，数据缺口 1 处，计划条件成立 1 条"}
     # At a close meeting an order taken back is counted as it always was: the trader's line is not the check-in's.
     assert today([said("trader", "order_withdrawn"), said("trader", "order_placed")]) == {"trader": "成交 0 笔，下单 1 张"}
 

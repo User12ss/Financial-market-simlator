@@ -2,7 +2,7 @@
 // where they stand round the table; a line joins two of them once the record
 // has one of them speaking to the other, heavier the more lines there have
 // been, and the line being played is lit and moving. Speakers with no seat
-// (the pipeline's own voice, the seats that are code) stand in the middle.
+// (the pipeline's own voice) stand in the middle.
 // It is counted off the record up to the line being played, and adds nothing.
 
 import { el, svg, clear, showTip, hideTip } from "./dom.js";

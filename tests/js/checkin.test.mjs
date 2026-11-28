@@ -22,7 +22,7 @@ const sized = (verdict, side, requested, approved) =>
 
 // A check-in before the open: it can act. The number in front of each line is its place in the record.
 const PREMARKET = [
-  /*  0 */ line("briefing", "news_desk", "briefing", null, { book: ["KO", "DIS", "MA", "LLY", "PG"] }),
+  /*  0 */ line("briefing", "news_desk", "briefing", null, { book: ["KO", "DIS", "MA", "LLY", "PG"], affected: ["KO", "DIS", "MA", "LLY"] }),
   /*  1 */ news("KO", null),
   /*  2 */ news("DIS", null),
   /*  3 */ news("MA", null),
@@ -129,7 +129,9 @@ test("only an order that was really placed is counted as placed", () => {
 
 test("the signs over the figures at a check-in", () => {
   const sign = (events, index) => standings(events, index).signs;
-  assert.deepEqual(sign(PREMARKET, 4), {}, "the news desk has no figure, so its lines put up no sign");
+  // The news desk's sign is what it said of the book when the check-in opened; its line on each name leaves it be.
+  assert.deepEqual(sign(PREMARKET, 0), { news_desk: { text: "4 只有新情况", lean: "flat" } });
+  assert.deepEqual(sign(PREMARKET, 4), { news_desk: { text: "4 只有新情况", lean: "flat" } });
   assert.deepEqual(sign(PREMARKET, 5).ticker_analyst, { text: "KO 不成立", lean: "down" });
   assert.deepEqual(sign(PREMARKET, 8).ticker_analyst, { text: "LLY 加强", lean: "up" });
   assert.deepEqual(sign(PREMARKET, 9).portfolio_manager, { text: "保留 1 · 卖出 2 · 撤回买单 1", lean: "flat" });

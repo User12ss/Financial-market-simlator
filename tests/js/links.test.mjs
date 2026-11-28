@@ -12,7 +12,7 @@ const { decisiveLine, exchanges, stagesOf, summaryOf } = await import("../../das
 const { buildTrail } = await import("../../dashboard/static/js/decisions.js");
 const { meetingBrief, stageRail } = await import("../../dashboard/static/js/brief.js");
 const { shortTitle, talkNetwork } = await import("../../dashboard/static/js/network.js");
-const { meetingRoom, throwPath } = await import("../../dashboard/static/js/meeting.js");
+const { meetingRoom, throwPath, SCREEN } = await import("../../dashboard/static/js/meeting.js");
 
 const figure = (id, title, seat, more = {}) => ({
   id, title, kind: "llm", group: "宏观组", seat, does: `${title}的职责。`, tone: seat % 7, hair: "short", extra: "none",
@@ -271,7 +271,9 @@ test("a speaker with no figure speaks through the screen, which says who it is a
   assert.ok(voice().classes.has("speaking") && screen().classes.has("voicing"));
   assert.deepEqual(wearing(room.node, "links")[0].children.map((child) => child.attributes.class), ["link-wave", "link-wave late"]);
   // The wave leaves from the middle of the screen, since nobody stands anywhere to leave from.
-  assert.deepEqual([wearing(room.node, "link-wave")[0].attributes.cx, wearing(room.node, "link-wave")[0].attributes.cy].map(Number), [500, 312.8]);
+  assert.deepEqual([wearing(room.node, "link-wave")[0].attributes.cx, wearing(room.node, "link-wave")[0].attributes.cy].map(Number),
+    [500, Number(((SCREEN.top + SCREEN.bottom) / 2).toFixed(1))]);
+  assert.deepEqual([SCREEN.left, SCREEN.right, SCREEN.top, SCREEN.bottom].map((edge) => Number(edge.toFixed(1))), [260, 740, 192.1, 460.7]);
 
   room.seek(5);                                               // a figure again: the screen says nothing of its own
   assert.equal(words(voice()), "");
@@ -286,6 +288,6 @@ test("a speaker with no figure speaks through the screen, which says who it is a
   assert.ok(!voice().classes.has("speaking") && !screen().classes.has("voicing"));
   const [trace] = wearing(room.node, "link-trace");
   const [, x, y] = trace.attributes.d.match(/ ([\d.]+),([\d.]+)$/);
-  assert.ok(Number(x) >= 260 && Number(x) <= 740 && Number(y) >= 164.9 && Number(y) <= 460.7);
+  assert.ok(Number(x) >= SCREEN.left && Number(x) <= SCREEN.right && Number(y) >= SCREEN.top - 0.1 && Number(y) <= SCREEN.bottom + 0.1);
   assert.ok(Number(x) === 260 || Number(x) === 740 || Math.abs(Number(y) - 164.9) < 0.01 || Math.abs(Number(y) - 460.7) < 0.01);
 });

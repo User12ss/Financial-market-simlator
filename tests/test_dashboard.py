@@ -235,22 +235,29 @@ def test_the_pages_own_logic_passes_its_tests():
 
 # ── Who is in the room ───────────────────────────────────────────────────────
 
-def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear_face_to_face(client):
+def test_seventeen_figures_stand_in_the_room_four_of_them_code_with_bull_and_bear_face_to_face(client):
     status, body = get(client, "/api/roster")
     roster = body["roster"]
-    assert status == 200 and len(roster) == 14
-    assert sorted(figure["seat"] for figure in roster) == list(range(14))
-    assert {figure["id"] for figure in roster if figure["kind"] == "rule"} == {"risk_officer", "trader"}
+    assert status == 200 and len(roster) == 17
+    assert sorted(figure["seat"] for figure in roster) == list(range(17))
+    assert {figure["id"] for figure in roster if figure["kind"] == "rule"} == {
+        "risk_officer", "trader", "quant_engineer", "news_desk"}
     seat = {figure["id"]: figure["seat"] for figure in roster}
-    assert (seat["bear"] - seat["bull"]) % 14 == 7
-    assert (seat["portfolio_manager"], seat["judge"]) == (0, 7)
+    # The manager stands at the top and the seats run clockwise from there, so seat n and seat 17 - n stand at
+    # the same height on the two sides of the room: the bull and the bear face each other across the table.
+    assert seat["portfolio_manager"] == 0
+    assert seat["bull"] + seat["bear"] == 17 and 2 < seat["bull"] < 7
+    # The two places nearest the reader, either side of the middle: the judge, and the seat that speaks last.
+    assert {seat["judge"], seat["scenario_analyst"]} == {8, 9}
+    # The scenario analyst's lines go to the quant engineer: not a neighbour, so the line is seen crossing the room.
+    assert 3 < (seat["scenario_analyst"] - seat["quant_engineer"]) % 17 < 14
     assert [stage["id"] for stage in body["stages"]] == [
         "briefing", "settle", "macro", "views", "forecast", "debate", "proposals", "checks", "risk", "plans",
         "scenario", "orders"]
     assert all(figure["title"] and figure["does"] for figure in roster)
     # Each has the mark of its field and what it is a specialist in, and no two share a mark.
     assert all(figure["emblem"] and len(figure["craft"]) >= 3 for figure in roster)
-    assert len({figure["emblem"] for figure in roster}) == 14
+    assert len({figure["emblem"] for figure in roster}) == 17
     # The series sorted under a macro analyst's field are ones the snapshot really records.
     recorded = {symbol for _, _, symbol in MARKET_SERIES} | {series[0] for series in MACRO_SERIES} | {"sectors"}
     reads = {figure["id"]: figure["reads"] for figure in roster}
@@ -258,6 +265,37 @@ def test_fourteen_figures_stand_in_the_room_two_of_them_rules_with_bull_and_bear
     assert {name for name, series in reads.items() if series} == {
         figure["id"] for figure in roster if figure["group"] == "宏观组"}
     assert all(len(reads[name]) >= 4 and len(set(reads[name])) == len(reads[name]) for name in reads if reads[name])
+
+
+def test_the_screen_is_drawn_where_the_room_takes_it_to_be():
+    # The stylesheet places the screen; the room's script keeps the names of the figures behind it clear of
+    # its upper edge, and sends the lines of a speaker with no figure from its sides. Both have to say the same.
+    static = Path(dashboard_app.__file__).parent / "static"
+    rule = re.search(r"\.holo \{(.*?)\}", (static / "styles.css").read_text(encoding="utf-8"), re.S).group(1)
+    # The property itself, not one that ends in its name (border-top, min-width, line-height).
+    middle, wide, tall = (float(re.search(rf"(?<![-\w]){name}: ([\d.]+)%", rule).group(1)) for name in ("top", "width", "height"))
+    said = re.search(r"SCREEN = \{ left: (\d+), right: (\d+), top: ([\d.]+) \* 680, bottom: ([\d.]+) \* 680 \}",
+                     (static / "js" / "meeting.js").read_text(encoding="utf-8"))
+    left, right, upper, lower = (float(value) for value in said.groups())
+    assert (left, right) == (10 * (50 - wide / 2), 10 * (50 + wide / 2))
+    assert upper == pytest.approx((middle - tall / 2) / 100) and lower == pytest.approx((middle + tall / 2) / 100)
+
+
+def test_every_seat_the_desk_adds_to_a_meeting_has_a_figure_in_the_room():
+    # They used to speak through the screen in the middle of the room, with a name and no figure.
+    from agents.ticker.scenario import ScenarioAnalyst
+    from pipeline import checkin, quant
+
+    seated = {persona.id: persona for persona in personas.ROSTER}
+    assert {checkin.NEWS_DESK[0], quant.QUANT[0], ScenarioAnalyst.id} <= set(seated)
+    assert seated[ScenarioAnalyst.id].kind == "llm"
+    assert seated[checkin.NEWS_DESK[0]].kind == seated[quant.QUANT[0]].kind == "rule"
+    # Code says so where it is described, as the risk officer and the trader do.
+    assert all("它是代码，不是模型。" in persona.does for persona in personas.ROSTER if persona.kind == "rule")
+    assert [personas.title_of(name) for name in (checkin.NEWS_DESK[0], quant.QUANT[0], ScenarioAnalyst.id)] == [
+        "情报员", "量化工程师", "情景推演师"]
+    # The pipeline's own voice is nobody's: it keeps its name and has no figure.
+    assert personas.NARRATOR["id"] not in seated and personas.title_of(personas.NARRATOR["id"]) == "流程播报"
 
 
 def test_everyone_the_pipeline_records_has_a_place_in_the_room(week):
@@ -312,7 +350,10 @@ def test_each_figures_line_for_the_day_is_counted_from_the_record(client):
     assert first["central_bank"] == "立场：偏多，把握度 0.60" and first["sentiment"] == "立场：偏多，把握度 0.60"
     assert first["portfolio_manager"] == "1 条提案：买入 1，卖出 0，减仓 0，持有 0"
     assert first["trader"] == "成交 0 笔，下单 1 张"
-    assert set(first) == {persona.id for persona in personas.ROSTER}             # on the first day everyone has a line
+    # On the first day everyone the daily pipeline seats has a line. The three seats that only the desk adds to
+    # a meeting stand in the room all the same; in a daily run they say nothing, so they have no line here.
+    desk_only = {"news_desk", "quant_engineer", "scenario_analyst"}
+    assert set(first) == {persona.id for persona in personas.ROSTER} - desk_only
     # The next session forms its own macro view, so the macro analysts speak again and nothing is carried over.
     # (What the narrator says of a view that was reused is in the test below this one.)
     later = get(client, "/api/meeting", arm=ARM, session=session(16).isoformat())[1]["today"]
@@ -345,8 +386,15 @@ def test_a_figures_line_says_what_it_did_and_how_often():
         did("risk_officer", "risk_rejected", "FFF"), did("risk_officer", "risk_rejected", "GGG"),
         did("trader", "fill", "AAA"), did("trader", "order_placed", "AAA"), did("trader", "order_placed", "BBB"),
         did("trader", "order_withdrawn", "CCC"),
+        # The seats the desk adds at its close meeting.
+        did("quant_engineer", "market_state"), did("quant_engineer", "forecast", "AAA"), did("quant_engineer", "forecast", "BBB"),
+        did("quant_engineer", "backward", "AAA"), did("quant_engineer", "rehearsal", "AAA"),
+        did("scenario_analyst", "proposed_events", "AAA", events=[{}, {}], refused=["said twice"]),
+        did("scenario_analyst", "proposed_events", "BBB", events=[], refused=[]),
     ]
     assert today(events) == {
+        "quant_engineer": "预测 2 只，倒推 1 只，推演 1 只",
+        "scenario_analyst": "看了 2 只股票，提出事件 2 个，另有 1 个被退回",
         "central_bank": "立场：偏空，把握度 0.70", "forex": "立场：中性，把握度 0.55", "sentiment": "立场：偏多，把握度 0.60",
         "ticker_analyst": "4 条观点：看多 2，中性 1，看空 1",
         "bull": "在 2 场辩论中发言 3 次", "bear": "在 2 场辩论中发言 2 次",

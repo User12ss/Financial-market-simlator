@@ -1,4 +1,4 @@
-// The meeting room: fourteen figures round a table and one session's record
+// The meeting room: seventeen figures round a table and one session's record
 // played back in the order it was recorded. Above it, where the meeting ended
 // and the stages it went through. In it, a light follows whoever is speaking;
 // each line is thrown across the room to the one it was said to, or goes
@@ -23,11 +23,15 @@ import { marketWall, statusStrip } from "./backdrop.js";
 import { debateBoard, teamBoard } from "./team.js";
 import { t } from "./i18n.js";
 
-const ROOM = { width: 1000, height: 680, cx: 500, cy: 352, rx: 400, ry: 232 };
+// The room, and how much of it one figure needs: a hundred units sideways with its name under it, and, at the
+// back, a hundred and twenty-five up and down with the sign over its head. Seats are spaced by that (figures.js),
+// which is how seventeen stand where fourteen stood without anyone being drawn smaller.
+export const ROOM = { width: 1000, height: 680, cx: 500, cy: 352, rx: 400, ry: 232, person: { wide: 100, tall: 125 } };
 const TABLE = { rx: 292, ry: 150 };
 const RIM = { rx: TABLE.rx + 16, ry: TABLE.ry + 16 };          // where the stream between speakers runs
 // The market screen's place in the room, in the room's own units: a speaker with no figure speaks from its edge.
-const SCREEN = { left: 260, right: 740, top: 0.2425 * 680, bottom: 0.6775 * 680 };
+// Its upper edge is kept below the names of the figures at the back who stand behind it (.holo in styles.css).
+export const SCREEN = { left: 260, right: 740, top: 0.2825 * 680, bottom: 0.6775 * 680 };
 const WALL = { x: 44, y: 30, width: 884, height: 262 };         // the back wall of the room, where the market is drawn
 const LEAD = { x: 500, y: 648 };                                // the reader's own place, at the front of the room
 const SPEEDS = [0.5, 1, 2, 4];
@@ -59,6 +63,8 @@ const FIELDS = {
   at: t("时间"), what: t("取的是什么"), error: t("错误"),
 };
 const HIDDEN = new Set(["remark", "agent_id"]);          // the remark is already in the middle of the room
+// The seats the desk adds to a meeting. Their signs count what they did; their panel shows their last line as well.
+const COUNTED = new Set(["news_desk", "quant_engineer", "scenario_analyst"]);
 
 /** A recorded value, laid out for reading. Text is passed on untouched. */
 function shown(value) {
@@ -131,8 +137,9 @@ export function meetingRoom({ roster }) {
   const flow = svg("g", { class: "flow" });
   // Over everything else in the room, and never in the way of a pointer: the line being said, on its way across.
   const links = svg("svg", { class: "links", viewBox: `0 0 ${ROOM.width} ${ROOM.height}`, "aria-hidden": "true" });
-  // Whoever speaks without a figure of its own (the pipeline's voice, the seats that are code) speaks through the
-  // screen: its name hangs from the screen's upper edge while it does, and its line leaves from the screen's side.
+  // Whoever speaks without a figure of its own (the pipeline's voice, or a speaker the roster does not know) speaks
+  // through the screen: its name hangs from the screen's upper edge while it does, and its line leaves from the
+  // screen's side.
   const voice = el("div", { class: "holo-voice", hidden: true });
   const guests = new Map();
   screen.node.append(voice);
@@ -612,10 +619,13 @@ export function meetingRoom({ roster }) {
   function conclusion(persona) {
     const said = lastSaid(state.events, state.index, persona.id);
     const sign = standings(state.events, state.index).signs[persona.id];
-    if (!said || !sign) return el("span", { class: "muted", text: t("到这一句为止，还没有发言。") });
+    if (!said) return el("span", { class: "muted", text: t("到这一句为止，还没有发言。") });
     const record = said.payload || {};
     const quote = (label, text) => (text
       ? el("div", { class: "quote" }, el("small", { text: t`${label}（原话）` }), el("span", { class: "said", lang: "en", text })) : null);
+    // It has spoken, and nothing it has said so far is something a sign counts (the quant engineer on the
+    // market's state, the risk officer on a plan): its last line stands for it, as it was recorded.
+    if (!sign) return quote(t("最近一句"), said.remark) || el("span", { class: "muted", text: t("已经发言，这一句没有文字。") });
     const found = [el("div", { class: "verdict" },
       el("strong", { class: sign.lean === "flat" ? null : sign.lean, text: sign.text }), gauge(record.confidence))];
     if (said.kind === "assessment") {
@@ -647,6 +657,9 @@ export function meetingRoom({ roster }) {
         (record.data_warnings || []).length ? el("div", { class: "cites" },
           el("small", { text: t("流程核对时标出的问题") }),
           record.data_warnings.map((warning) => el("span", { class: "cite bad", lang: "en", text: `✗ ${warning}` }))) : null);
+    } else if (COUNTED.has(said.speaker)) {
+      // The sign is a count; under it, the line itself.
+      found.push(quote(t("最近一句"), said.remark));
     }
     return found;
   }
@@ -660,7 +673,7 @@ export function meetingRoom({ roster }) {
       person.removeAttribute("style");
       person.append(
         el("h2", { text: t("这些人是谁") }),
-        el("p", { text: t("十四个角色：十二个是语言模型，风控官和交易员是写死的规则，不是模型。播放时这里显示正在发言的人；点一个人，固定看他。") }));
+        el("p", { text: t("十七个角色：十三个是语言模型；风控官、交易员、情报员和量化工程师是代码，不是模型。播放时这里显示正在发言的人；点一个人，固定看他。") }));
       return;
     }
     // Counted over the lines played so far. The whole session's tally is the server's, of every line of

@@ -434,3 +434,33 @@ test("in the grid a sale a plan put in has its own words, not the manager's", ()
   assert.equal(fateText(cell({ verdict: "rejected" })), "按计划卖出，风控拒绝");
   assert.equal(fateText(cell({})), "按计划卖出，没有下单");
 });
+
+test("the seats the desk adds wear a sign too, counted from what they put on record", () => {
+  const line = (speaker, kind, ticker = null, payload = {}) => ({ speaker, to: "all", kind, ticker, remark: "", payload, stage: "x" });
+  const checkin = [
+    line("news_desk", "briefing", null, { book: ["KO", "DIS", "MA"], affected: ["KO", "MA"] }),
+    line("news_desk", "data_gap", "DIS"),
+    line("news_desk", "news", "KO", { new_items: [{}, {}] }),
+  ];
+  assert.deepEqual(standings(checkin, 0).signs.news_desk, { text: "2 只有新情况", lean: "flat" });
+  assert.deepEqual(standings(checkin, 2).signs.news_desk, { text: "2 只有新情况", lean: "flat" });   // what it said of the book stands
+  assert.deepEqual(standings([line("news_desk", "briefing", null, {})], 0).signs.news_desk, { text: "0 只有新情况", lean: "flat" });
+
+  const close = [
+    /* 0 */ line("quant_engineer", "market_state"),
+    /* 1 */ line("quant_engineer", "forecast", "TMO"),
+    /* 2 */ line("quant_engineer", "forecast", "KO"),
+    /* 3 */ line("quant_engineer", "backward", "TMO"),
+    /* 4 */ line("scenario_analyst", "proposed_events", "TMO", { events: [{}, {}], refused: ["said twice"] }),
+    /* 5 */ line("scenario_analyst", "proposed_events", "KO", { events: [], refused: [] }),
+    /* 6 */ line("quant_engineer", "rehearsal", "TMO"),
+  ];
+  assert.equal(standings(close, 0).signs.quant_engineer, undefined);          // the market's state is not a count of anything
+  assert.deepEqual(standings(close, 2).signs.quant_engineer, { text: "预测 2", lean: "flat" });
+  assert.deepEqual(standings(close, 3).signs.quant_engineer, { text: "预测 2 · 倒推 1", lean: "flat" });
+  assert.deepEqual(standings(close, 4).signs.scenario_analyst, { text: "TMO 事件 2", lean: "flat" });
+  assert.deepEqual(standings(close, 5).signs.scenario_analyst, { text: "KO 事件 0", lean: "flat" });
+  assert.deepEqual(standings(close, 6).signs.quant_engineer, { text: "预测 2 · 倒推 1 · 推演 1", lean: "flat" });
+  // Nobody else's sign is touched by them.
+  assert.deepEqual(Object.keys(standings(close, 6).signs).sort(), ["quant_engineer", "scenario_analyst"]);
+});

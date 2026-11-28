@@ -1087,4 +1087,22 @@ def today(events: list[dict]) -> dict[str, str]:
             f"留给收盘会 {len(noted)} 条，撤回买单 {len(taken_back)} 张，"
             f"下单 {sum(1 for event in traded if event['kind'] == 'order_placed')} 张"
         )
+
+    # The seats the desk adds to its meetings. Each of these kinds is one line on the record per name (or per
+    # thing that could not be fetched, or per condition of a plan found to hold), so the lines are what is counted.
+    if of("news_desk"):
+        lines["news_desk"] = (
+            f"{len(of('news_desk', 'news'))} 只股票有新情况，数据缺口 {len(of('news_desk', 'data_gap'))} 处，"
+            f"计划条件成立 {len(of('news_desk', 'plan_call'))} 条"
+        )
+    if of("quant_engineer"):
+        lines["quant_engineer"] = (
+            f"预测 {len(of('quant_engineer', 'forecast'))} 只，倒推 {len(of('quant_engineer', 'backward'))} 只，"
+            f"推演 {len(of('quant_engineer', 'rehearsal'))} 只"
+        )
+    asked = of("scenario_analyst", "proposed_events")
+    if asked:
+        kept = sum(len(event["payload"].get("events") or []) for event in asked)
+        refused = sum(len(event["payload"].get("refused") or []) for event in asked)
+        lines["scenario_analyst"] = f"看了 {len(asked)} 只股票，提出事件 {kept} 个，另有 {refused} 个被退回"
     return lines

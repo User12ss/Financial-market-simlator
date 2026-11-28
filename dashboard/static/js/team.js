@@ -8,7 +8,7 @@ import { exchanges } from "./links.js";
 import { t } from "./i18n.js";
 
 const ARROW = { up: "▲", down: "▼", flat: "" };
-const GROUPS = [t("决策"), t("标的组"), t("宏观组"), t("辩论"), t("执行")];
+const GROUPS = [t("决策"), t("情报"), t("标的组"), t("量化"), t("宏观组"), t("辩论"), t("执行")];
 
 /**
  * The seats as a table. `update(events, index)` shows where each stands by that line; `onPick(id)` is called

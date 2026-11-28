@@ -6,33 +6,64 @@ import { svg } from "./dom.js";
 import { emblemAt } from "./emblems.js";
 import { t } from "./i18n.js";
 
+// A name under a figure takes this much below its feet: two lines, the title and what kind of seat it is.
+export const NAME = 34;
+
 /**
- * Seats around an ellipse, evenly spaced along its edge (not by angle, which
- * would crowd the two ends), clockwise from the top. Figures further back are
+ * Seats around an ellipse, clockwise from the top. Figures further back are
  * drawn a little smaller.
+ *
+ * With nothing more said, they are evenly spaced along the edge (not by angle,
+ * which would crowd the two ends). That suits marks on a map.
+ *
+ * A room of figures says how much room one `person` needs: `wide` sideways,
+ * with its name under it, and `tall` up and down, with the sign over its head
+ * (both for a figure at the back). A figure is taller than it is wide, so
+ * seats are then spaced by need: closer along the top and the bottom, where
+ * neighbours stand side by side, and further apart at the two ends, where one
+ * stands above the other. Should there be more people than the room holds at
+ * full size, the figures are all drawn smaller by the same share. Their names
+ * are not, and would then run into each other: a room that full needs to be a
+ * bigger room.
  */
-export function seats(count, { cx, cy, rx, ry }) {
+export function seats(count, { cx, cy, rx, ry, person = null }) {
   const steps = 3600;
   const along = [0];
   const at = (step) => {
     const angle = -Math.PI / 2 + (step / steps) * 2 * Math.PI;
     return [cx + rx * Math.cos(angle), cy + ry * Math.sin(angle)];
   };
+  const depth = (y) => 1.0 + 0.24 * ((y - (cy - ry)) / (2 * ry));
   for (let step = 1; step <= steps; step += 1) {
     const [x0, y0] = at(step - 1);
     const [x1, y1] = at(step);
-    along.push(along[step - 1] + Math.hypot(x1 - x0, y1 - y0));
+    // What a step along the edge is worth: its length, or the share of one person's room it gives.
+    along.push(along[step - 1] + (person
+      ? Math.hypot((x1 - x0) / person.wide, (y1 - y0) / (person.tall * depth((y0 + y1) / 2)))
+      : Math.hypot(x1 - x0, y1 - y0)));
   }
+  const crowd = person ? Math.min(1, along[steps] / count) : 1;
   const found = [];
   let step = 0;
   for (let seat = 0; seat < count; seat += 1) {
     const wanted = (seat / count) * along[steps];
     while (along[step] < wanted) step += 1;
     const [x, y] = at(step);
-    // Away from the middle of the room a name goes beside its figure, on the outer side, not below it: at the two
-    // ends people stand one above the other, and nearer the middle the space under them belongs to the table.
-    const side = Math.abs(x - cx) > 0.6 * rx ? Math.sign(x - cx) : 0;
-    found.push({ x, y, side, scale: 1.0 + 0.24 * ((y - (cy - ry)) / (2 * ry)) });
+    // Away from the middle of the map a name goes beside its mark, on the outer side, not below it.
+    const side = !person && Math.abs(x - cx) > 0.6 * rx ? Math.sign(x - cx) : 0;
+    found.push({ x, y, side, scale: depth(y) * crowd });
+  }
+  if (person) {
+    // In a room a name goes under its figure, unless a neighbour nearer the front stands where it would be: its
+    // head, and the sign over it, reach up past this one's feet. Then it goes beside the figure, on the outer side.
+    const inTheWay = (place, other) => other.y > place.y + 1 && Math.abs(other.x - place.x) < 0.9 * person.wide
+      && other.y - person.tall * other.scale < place.y + NAME;
+    found.forEach((place, seat) => {
+      const beside = [found[(seat + 1) % count], found[(seat + count - 1) % count]];
+      // In the middle there is no outer side, so there the name stays under its figure even with a neighbour in
+      // the way. That only happens in a room fuller than this one holds at full size.
+      if (count > 1 && beside.some((other) => inTheWay(place, other))) place.side = Math.sign(Math.round(place.x - cx));
+    });
   }
   return found;
 }
@@ -141,13 +172,18 @@ function parts(persona) {
 /** One figure in its seat. The pose group is what moves when it speaks or listens; the scale stays on the body. */
 export function drawFigure(persona, seat) {
   const kind = persona.kind === "rule" ? t("规则") : t("模型");
+  // Beside a figure the name stands at its chest, high enough that its second line is clear of the sign over the
+  // head of whoever stands next towards the front.
   const plate = seat.side
-    ? { x: seat.side * (27 * seat.scale + 4), y: -52 * seat.scale, anchor: seat.side > 0 ? "start" : "end" }
+    ? { x: seat.side * (27 * seat.scale + 4), y: -57 * seat.scale, anchor: seat.side > 0 ? "start" : "end" }
     : { x: 0, y: 17, anchor: "middle" };
-  // The mark of its field goes in front of its title. A title is about 13 units a character.
-  // (A Chinese character is about 13 units wide at this size, a Latin letter about half that.)
-  const wide = Array.from(persona.title).reduce((sum, letter) => sum + (letter.charCodeAt(0) > 255 ? 13 : 6.7), 0);
+  // The mark of its field goes in front of its title. A Chinese character is about 13 units wide at this size;
+  // a Latin letter, on the English page where names are set smaller, a little under 6 (measured: 5.8 on average).
+  const wide = Array.from(persona.title).reduce((sum, letter) => sum + (letter.charCodeAt(0) > 255 ? 13 : 5.8), 0);
   const mark = { size: 13, x: plate.anchor === "middle" ? -wide / 2 - 9 : plate.anchor === "start" ? plate.x : plate.x - wide - 17 };
+  // The second line starts under the mark where the name stands to the right of its figure: at the right-hand
+  // end of the room there is no width to spare.
+  const second = plate.anchor === "start" ? plate.x : plate.x + (plate.anchor === "middle" ? 8 : 0);
   if (plate.anchor !== "end") plate.x += plate.anchor === "start" ? 17 : 8;
   return svg("g", {
     class: `figure ${persona.kind}`, transform: `translate(${seat.x.toFixed(1)},${seat.y.toFixed(1)})`,
@@ -160,7 +196,7 @@ export function drawFigure(persona, seat) {
     svg("g", { class: "pose" }, svg("g", { class: "body", transform: `scale(${seat.scale.toFixed(3)})` }, parts(persona))),
     persona.emblem ? emblemAt(persona.emblem, mark.x, plate.y - 11.5, mark.size) : null,
     svg("text", { class: "plate", x: plate.x, y: plate.y, "text-anchor": plate.anchor, text: persona.title }),
-    svg("text", { class: "role", x: plate.x, y: plate.y + 14, "text-anchor": plate.anchor, text: `${kind} · ${persona.group}` }));
+    svg("text", { class: "role", x: second, y: plate.y + 14, "text-anchor": plate.anchor, text: `${kind} · ${persona.group}` }));
 }
 
 /** The same figure's head and shoulders, small, for beside its words. */
